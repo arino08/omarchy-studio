@@ -309,24 +309,26 @@ pub fn keybind(paths: &OmarchyPaths) -> Option<ConfigBind> {
 /// Bind `mods+key` to launch Nice Launcher (replacing any previous bind),
 /// through the shared keybinds override block — sourced last, so it wins over
 /// the Omarchy default on the same chord (e.g. SUPER+SPACE's Walker). Reloads
-/// Hyprland. Caller snapshots `keybinds::user_bindings_path` first.
+/// Hyprland through the apply pipeline, which snapshots and rolls back.
 pub fn install_keybind(
     paths: &OmarchyPaths,
     mods: &str,
     key: &str,
     exec: &str,
+    store: &crate::snapshot::SnapshotStore,
     runner: &dyn crate::cmd::CommandRunner,
 ) -> Result<ConfigBind> {
-    keybinds::install_marked(paths, BIND_DESC, mods, key, exec, runner)
+    keybinds::install_marked(paths, BIND_DESC, mods, key, exec, store, runner)
 }
 
 /// Remove the Nice Launcher bind from the override block (other overrides
-/// survive). Returns false when none was installed. Caller snapshots first.
+/// survive). Returns false when none was installed. The pipeline snapshots.
 pub fn remove_keybind(
     paths: &OmarchyPaths,
+    store: &crate::snapshot::SnapshotStore,
     runner: &dyn crate::cmd::CommandRunner,
 ) -> Result<bool> {
-    keybinds::remove_marked(paths, BIND_DESC, runner)
+    keybinds::remove_marked(paths, BIND_DESC, store, runner)
 }
 
 #[cfg(test)]
@@ -412,9 +414,15 @@ mod tests {
     fn keybind_installs_updates_and_removes() {
         let paths = fake_paths("bind");
         let runner = StubRunner::default().with_ok("hyprctl reload", "");
+        // The pipeline snapshots with real git; the stub covers hyprctl.
+        let store = crate::snapshot::SnapshotStore::open_or_init(
+            paths.config.join("history"),
+            Box::new(crate::cmd::RealRunner),
+        )
+        .unwrap();
 
         assert!(keybind(&paths).is_none());
-        let bind = install_keybind(&paths, "SUPER", "SPACE", "/x/nova", &runner).unwrap();
+        let bind = install_keybind(&paths, "SUPER", "SPACE", "/x/nova", &store, &runner).unwrap();
         assert_eq!(
             bind.render_line(),
             "bindd = SUPER, SPACE, Nice Launcher, exec, /x/nova"
@@ -424,7 +432,7 @@ mod tests {
         assert_eq!(found.arg, "/x/nova");
 
         // reinstall with a new chord replaces, not duplicates
-        install_keybind(&paths, "SUPER SHIFT", "N", "/x/nova", &runner).unwrap();
+        install_keybind(&paths, "SUPER SHIFT", "N", "/x/nova", &store, &runner).unwrap();
         let binds: Vec<_> = keybinds::read_overrides(&paths);
         let nova_binds = binds
             .iter()
@@ -435,8 +443,8 @@ mod tests {
         assert_eq!(nova_binds, 1);
         assert_eq!(keybind(&paths).unwrap().key, "N");
 
-        assert!(remove_keybind(&paths, &runner).unwrap());
+        assert!(remove_keybind(&paths, &store, &runner).unwrap());
         assert!(keybind(&paths).is_none());
-        assert!(!remove_keybind(&paths, &runner).unwrap());
+        assert!(!remove_keybind(&paths, &store, &runner).unwrap());
     }
 }

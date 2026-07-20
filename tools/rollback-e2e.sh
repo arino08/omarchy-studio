@@ -129,6 +129,28 @@ else
     fail "the rejected value survived (now '$(gaps)', was '$before')"
 fi
 
+echo "==> keybinds roll back too (E1)"
+BINDS="$HOME_DIR/.config/hypr/bindings.conf"
+"$BIN" keybind add "SUPER+SHIFT+T" exec kitty >/dev/null 2>&1
+if grep -q "SUPER SHIFT, T" "$BINDS" 2>/dev/null; then
+    ok "the bind is on disk"
+else
+    fail "the bind was not written"
+fi
+HYPRCTL_ERRORS="error: invalid bind at bindings.conf:1" \
+    "$BIN" keybind add "SUPER+SHIFT+Y" exec firefox >/dev/null 2>&1
+if grep -q "SUPER SHIFT, Y" "$BINDS" 2>/dev/null; then
+    fail "the rejected bind survived"
+    sed 's/^/  | /' "$BINDS"
+else
+    ok "the rejected bind was rolled back"
+fi
+if grep -q "SUPER SHIFT, T" "$BINDS" 2>/dev/null; then
+    ok "the earlier bind survived the rollback"
+else
+    fail "the rollback lost the earlier bind"
+fi
+
 echo
 if [ "$fails" -gt 0 ]; then
     echo "rollback-e2e: $fails check(s) failed"

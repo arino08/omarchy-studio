@@ -459,19 +459,54 @@ pub fn load_effective(
 
 /// Persist overrides and reload Hyprland so they take effect. Returns the
 /// bindings file that changed. Caller snapshots before, for undo.
+/// Plan the override block as a pipeline edit, writing nothing. `None` when
+/// the block already says exactly this — an apply that changes nothing should
+/// not snapshot or reload.
+pub fn plan_overrides(
+    paths: &OmarchyPaths,
+    overrides: &[Override],
+) -> Option<crate::engine::FileEdit> {
+    let path = user_bindings_path(paths);
+    // `None` for a file that doesn't exist yet: the pipeline's hash guard
+    // reads it the same way, and treating absent as empty would make the
+    // guard reject the write.
+    let on_disk = std::fs::read_to_string(&path).ok();
+    let existing = on_disk.clone().unwrap_or_default();
+    let block = override_block();
+    let updated = if overrides.is_empty() {
+        block.remove(&existing)
+    } else {
+        let header = "# Managed by Omarchy Studio — your keybind changes live here.";
+        let body = format!("{header}\n{}", render_override_block(overrides));
+        block.upsert(&existing, &body)
+    };
+    (updated != existing).then(|| crate::engine::FileEdit::new(path, on_disk.as_deref(), updated))
+}
+
+/// Apply through the pipeline: drift-check → pre-snapshot → hash-guarded write
+/// → `hyprctl reload` → verify → post, rolling back if the binds we wrote stop
+/// Hyprland's config loading. The caller must not snapshot — the pipeline does.
 pub fn apply_overrides(
     paths: &OmarchyPaths,
     overrides: &[Override],
+    store: &crate::snapshot::SnapshotStore,
     runner: &dyn crate::cmd::CommandRunner,
+    summary: &str,
 ) -> Result<std::path::PathBuf> {
-    let path = write_overrides(paths, overrides)?;
-    let out = runner.run(&crate::omarchy::cmds::hypr_reload())?;
-    if !out.ok() {
-        return Err(StudioError::External {
-            cmd: "hyprctl reload".into(),
-            detail: out.stderr.trim().to_string(),
-        });
-    }
+    let path = user_bindings_path(paths);
+    let Some(edit) = plan_overrides(paths, overrides) else {
+        return Ok(path); // nothing to do
+    };
+    let plan = crate::engine::ApplyPlan {
+        summary: summary.to_string(),
+        module: "keybinds".into(),
+        edits: vec![edit],
+        reload: vec![crate::engine::ReloadStep::HyprReload],
+        verify: crate::engine::hypr_verification(runner),
+        risk: crate::engine::Risk::Risky,
+        trailers: Vec::new(),
+    };
+    crate::engine::Pipeline::new(store, runner).apply(&plan, false)?;
     Ok(path)
 }
 
@@ -502,6 +537,7 @@ pub fn install_marked(
     mods: &str,
     key: &str,
     exec: &str,
+    store: &crate::snapshot::SnapshotStore,
     runner: &dyn crate::cmd::CommandRunner,
 ) -> Result<ConfigBind> {
     let bind = ConfigBind {
@@ -517,15 +553,16 @@ pub fn install_marked(
         .filter(|o| !is_marked(o, desc))
         .collect();
     overrides.push(Override::Set(bind.clone()));
-    apply_overrides(paths, &overrides, runner)?;
+    apply_overrides(paths, &overrides, store, runner, &format!("bind {desc}"))?;
     Ok(bind)
 }
 
 /// Remove the `desc`-marked bind (other overrides survive). Returns false
-/// when none was installed. Caller snapshots first.
+/// when none was installed. The pipeline snapshots.
 pub fn remove_marked(
     paths: &OmarchyPaths,
     desc: &str,
+    store: &crate::snapshot::SnapshotStore,
     runner: &dyn crate::cmd::CommandRunner,
 ) -> Result<bool> {
     let all = read_overrides(paths);
@@ -537,7 +574,7 @@ pub fn remove_marked(
     if kept.len() == all.len() {
         return Ok(false);
     }
-    apply_overrides(paths, &kept, runner)?;
+    apply_overrides(paths, &kept, store, runner, &format!("unbind {desc}"))?;
     Ok(true)
 }
 

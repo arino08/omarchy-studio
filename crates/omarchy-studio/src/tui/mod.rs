@@ -830,35 +830,39 @@ impl App {
     fn nova_toggle_bind(&mut self) {
         use studio_core::modules::keybinds;
         use studio_core::modules::nova as nova_mod;
-        let files = [keybinds::user_bindings_path(&self.paths)];
-        let store = SnapshotStore::open_or_init(
+        // The pipeline snapshots; recording here too would double the entry.
+        let store = match SnapshotStore::open_or_init(
             studio_core::studio_state_dir().join("history"),
             Box::new(RealRunner),
-        )
-        .ok();
-        if let Some(s) = &store {
-            let _ = s.record(
-                SnapshotKind::Pre,
-                "before Nice Launcher keybind change",
-                &files,
-                "nova",
-                &[],
-            );
-        }
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                self.toast = Some(Toast {
+                    text: format!("no change history, not applying: {}", brief(e)),
+                    ok: false,
+                });
+                return;
+            }
+        };
         let result = if nova_mod::keybind(&self.paths).is_some() {
-            nova_mod::remove_keybind(&self.paths, &RealRunner)
+            nova_mod::remove_keybind(&self.paths, &store, &RealRunner)
                 .map(|_| "Nice Launcher keybind removed".to_string())
         } else {
             match nova_mod::launch_command(&RealRunner) {
-                Some(exec) => {
-                    nova_mod::install_keybind(&self.paths, "SUPER", "SPACE", &exec, &RealRunner)
-                        .map(|b| {
-                            format!(
-                                "{} launches Nice Launcher",
-                                keybinds::render_chord(b.modmask, &b.key)
-                            )
-                        })
-                }
+                Some(exec) => nova_mod::install_keybind(
+                    &self.paths,
+                    "SUPER",
+                    "SPACE",
+                    &exec,
+                    &store,
+                    &RealRunner,
+                )
+                .map(|b| {
+                    format!(
+                        "{} launches Nice Launcher",
+                        keybinds::render_chord(b.modmask, &b.key)
+                    )
+                }),
                 None => Err(studio_core::error::StudioError::External {
                     cmd: "nice-launcher".into(),
                     detail: "Nice Launcher is not installed".into(),
@@ -867,15 +871,6 @@ impl App {
         };
         match result {
             Ok(text) => {
-                if let Some(s) = &store {
-                    let _ = s.record(
-                        SnapshotKind::Post,
-                        "Nice Launcher keybind change",
-                        &files,
-                        "nova",
-                        &[],
-                    );
-                }
                 self.nova.reload(&self.paths);
                 self.toast = Some(Toast { text, ok: true });
             }
@@ -1885,35 +1880,44 @@ impl App {
     /// Snapshot the bindings file, persist the override block, live-reload, and
     /// refresh the screen — the full undoable apply for a keybind change.
     fn commit_keybinds(&mut self, summary: String) {
-        let file = studio_core::modules::keybinds::user_bindings_path(&self.paths);
-        let store = SnapshotStore::open_or_init(
+        // The pipeline snapshots pre/drift/post itself — recording here too
+        // would double every entry in the timeline.
+        let store = match SnapshotStore::open_or_init(
             studio_core::studio_state_dir().join("history"),
             Box::new(RealRunner),
-        );
-        if let Ok(s) = &store {
-            let _ = s.record(
-                SnapshotKind::Pre,
-                &format!("before: {summary}"),
-                std::slice::from_ref(&file),
-                "keybinds",
-                &[],
-            );
-        }
-        match self.keybinds.commit(&self.paths, &RealRunner) {
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                self.toast = Some(Toast {
+                    text: format!("no change history, not applying: {}", brief(e)),
+                    ok: false,
+                });
+                return;
+            }
+        };
+        match self
+            .keybinds
+            .commit(&self.paths, &store, &RealRunner, &summary)
+        {
             Ok(()) => {
-                if let Ok(s) = &store {
-                    let _ = s.record(
-                        SnapshotKind::Post,
-                        &summary,
-                        std::slice::from_ref(&file),
-                        "keybinds",
-                        &[],
-                    );
-                }
                 self.keybinds.reload(&self.paths, &RealRunner);
                 self.toast = Some(Toast {
                     text: format!("{summary} · undo with u on Snapshots"),
                     ok: true,
+                });
+            }
+            // Hyprland refused the binds; the pipeline already restored the
+            // previous block, so the keymap on screen is stale — reload it.
+            Err(studio_core::StudioError::VerifyFailed { rolled_back, .. }) => {
+                self.keybinds.reload(&self.paths, &RealRunner);
+                self.toast = Some(Toast {
+                    text: if rolled_back {
+                        "Hyprland rejected those binds — your previous ones are back".into()
+                    } else {
+                        "Hyprland rejected those binds AND the rollback failed — see Snapshots"
+                            .into()
+                    },
+                    ok: false,
                 });
             }
             Err(e) => {

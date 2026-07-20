@@ -677,34 +677,26 @@ fn theme(args: &[&str]) -> i32 {
             0
         }
         ["keybind", verb @ ("install" | "remove"), chord @ ..] => {
-            use studio_core::modules::keybinds::{
-                self, install_marked, remove_marked, render_chord,
-            };
+            use studio_core::modules::keybinds::{install_marked, remove_marked, render_chord};
             use studio_core::modules::wizard::BIND_DESC;
-            let files = [keybinds::user_bindings_path(&paths)];
-            let snap = history().ok();
+            // The pipeline snapshots and rolls back; this must not also record.
+            let store = match history() {
+                Ok(s) => s,
+                Err(code) => return code,
+            };
             let action = if *verb == "remove" {
                 if !chord.is_empty() {
                     eprintln!("usage: theme keybind remove");
                     return 2;
                 }
-                if let Some(s) = &snap {
-                    let _ = s.record(
-                        SnapshotKind::Pre,
-                        "before theme keybind remove",
-                        &files,
-                        "themes",
-                        &[],
-                    );
-                }
-                match remove_marked(&paths, BIND_DESC, &RealRunner) {
+                match remove_marked(&paths, BIND_DESC, &store, &RealRunner) {
                     Ok(true) => "instant-theme keybind removed".to_string(),
                     Ok(false) => {
                         println!("no instant-theme keybind installed");
                         return 0;
                     }
                     Err(e) => {
-                        eprintln!("remove failed: {e:?}");
+                        eprintln!("remove failed: {}", brief(e));
                         return 1;
                     }
                 }
@@ -719,30 +711,18 @@ fn theme(args: &[&str]) -> i32 {
                         return 2;
                     }
                 };
-                if let Some(s) = &snap {
-                    let _ = s.record(
-                        SnapshotKind::Pre,
-                        "before theme keybind install",
-                        &files,
-                        "themes",
-                        &[],
-                    );
-                }
                 let exec = "omarchy-studio theme new --from-current-wallpaper --apply";
-                match install_marked(&paths, BIND_DESC, mods, key, exec, &RealRunner) {
+                match install_marked(&paths, BIND_DESC, mods, key, exec, &store, &RealRunner) {
                     Ok(b) => format!(
                         "{} crafts + applies a theme from the current wallpaper",
                         render_chord(b.modmask, &b.key)
                     ),
                     Err(e) => {
-                        eprintln!("install failed: {e:?}");
+                        eprintln!("install failed: {}", brief(e));
                         return 1;
                     }
                 }
             };
-            if let Some(s) = &snap {
-                let _ = s.record(SnapshotKind::Post, &action, &files, "themes", &[]);
-            }
             println!("{action} · undo with `omarchy-studio snapshot undo`");
             0
         }
@@ -1844,41 +1824,42 @@ fn keybind_check(paths: &OmarchyPaths) -> i32 {
     1
 }
 
-/// Persist a new override set: snapshot, write the managed block, reload.
+/// Persist a new override set through the apply pipeline.
 ///
-/// Mirrors the TUI's commit path (same module name and snapshot pair) so a
-/// change made here is undoable exactly like one made in the screen.
+/// Mirrors the TUI's commit path exactly, so a change made here is undoable —
+/// and now auto-reverted — the same way as one made in the screen.
 fn keybind_write(
     paths: &OmarchyPaths,
     overrides: &[studio_core::modules::keybinds::Override],
     summary: &str,
 ) -> i32 {
     use studio_core::modules::keybinds;
-    let file = keybinds::user_bindings_path(paths);
-    let store = history().ok();
-    if let Some(s) = &store {
-        let _ = s.record(
-            SnapshotKind::Pre,
-            &format!("before: {summary}"),
-            std::slice::from_ref(&file),
-            "keybinds",
-            &[],
-        );
-    }
-    match keybinds::apply_overrides(paths, overrides, &RealRunner) {
+    // Without a store there is no rollback, so refuse rather than apply
+    // unprotected. `history()` already explains why it failed.
+    let store = match history() {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    match keybinds::apply_overrides(paths, overrides, &store, &RealRunner, summary) {
         Ok(_) => {
-            if let Some(s) = &store {
-                let _ = s.record(
-                    SnapshotKind::Post,
-                    summary,
-                    std::slice::from_ref(&file),
-                    "keybinds",
-                    &[],
-                );
-            }
             println!("{summary}");
             println!("undo with: omarchy-studio snapshot undo");
             0
+        }
+        // Binds that stop Hyprland's config loading are reverted for you.
+        Err(studio_core::StudioError::VerifyFailed {
+            step,
+            stderr,
+            rolled_back,
+            ..
+        }) => {
+            eprintln!("{step} rejected the change: {}", stderr.trim());
+            if rolled_back {
+                eprintln!("your previous binds were restored.");
+            } else {
+                eprintln!("WARNING: the rollback did not finish — check `snapshot log`.");
+            }
+            1
         }
         Err(e) => {
             eprintln!("keybind change failed: {}", brief(e));
@@ -2009,7 +1990,7 @@ fn keybind_reset(paths: &OmarchyPaths) -> i32 {
 // ── nova ────────────────────────────────────────────────────────────────────
 
 fn nova(args: &[&str]) -> i32 {
-    use studio_core::modules::keybinds::{self, render_chord};
+    use studio_core::modules::keybinds::render_chord;
     use studio_core::modules::nova::{self as nova_mod, Nova, KNOWN_PROVIDERS, MODES};
     let Some(paths) = omarchy() else { return 4 };
 
@@ -2042,30 +2023,24 @@ fn nova(args: &[&str]) -> i32 {
             return 0;
         }
         ["keybind", rest @ ("install" | "remove"), chord @ ..] => {
-            let files = [keybinds::user_bindings_path(&paths)];
-            let store = history().ok();
+            // The pipeline snapshots and rolls back; don't also record here.
+            let store = match history() {
+                Ok(s) => s,
+                Err(code) => return code,
+            };
             let action = if *rest == "remove" {
                 if !chord.is_empty() {
                     eprintln!("usage: nova keybind remove");
                     return 2;
                 }
-                if let Some(s) = &store {
-                    let _ = s.record(
-                        SnapshotKind::Pre,
-                        "before nova keybind remove",
-                        &files,
-                        "nova",
-                        &[],
-                    );
-                }
-                match nova_mod::remove_keybind(&paths, &RealRunner) {
+                match nova_mod::remove_keybind(&paths, &store, &RealRunner) {
                     Ok(true) => "nova keybind removed".to_string(),
                     Ok(false) => {
                         println!("no Nice Launcher keybind installed");
                         return 0;
                     }
                     Err(e) => {
-                        eprintln!("remove failed: {e:?}");
+                        eprintln!("remove failed: {}", brief(e));
                         return 1;
                     }
                 }
@@ -2084,26 +2059,14 @@ fn nova(args: &[&str]) -> i32 {
                     eprintln!("Nice Launcher is not installed");
                     return 1;
                 };
-                if let Some(s) = &store {
-                    let _ = s.record(
-                        SnapshotKind::Pre,
-                        "before nova keybind install",
-                        &files,
-                        "nova",
-                        &[],
-                    );
-                }
-                match nova_mod::install_keybind(&paths, mods, key, &exec, &RealRunner) {
+                match nova_mod::install_keybind(&paths, mods, key, &exec, &store, &RealRunner) {
                     Ok(b) => format!("{} launches Nice Launcher", render_chord(b.modmask, &b.key)),
                     Err(e) => {
-                        eprintln!("install failed: {e:?}");
+                        eprintln!("install failed: {}", brief(e));
                         return 1;
                     }
                 }
             };
-            if let Some(s) = &store {
-                let _ = s.record(SnapshotKind::Post, &action, &files, "nova", &[]);
-            }
             println!("{action} · undo with `omarchy-studio snapshot undo`");
             return 0;
         }

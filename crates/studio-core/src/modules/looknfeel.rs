@@ -1011,29 +1011,11 @@ impl LookFeel {
             module: "looknfeel".into(),
             edits: self.plan(paths),
             reload: vec![crate::engine::ReloadStep::HyprReload],
-            verify: config_verification(runner),
+            verify: crate::engine::hypr_verification(runner),
             risk: crate::engine::Risk::Risky,
             trailers: Vec::new(),
         };
         crate::engine::Pipeline::new(store, runner).apply(&plan, false)
-    }
-}
-
-/// The post-apply check, when this machine can actually run it.
-///
-/// `hyprctl configerrors` is gated (spec 01 §3): where it isn't available the
-/// pipeline would treat the failed *probe* as a failed verification and roll
-/// back a perfectly good change, so an unverifiable box gets no check rather
-/// than a wrong one.
-fn config_verification(runner: &dyn crate::cmd::CommandRunner) -> Vec<crate::engine::Verification> {
-    let usable = runner
-        .run(&crate::omarchy::cmds::hypr_configerrors())
-        .map(|o| o.ok())
-        .unwrap_or(false);
-    if usable {
-        vec![crate::engine::Verification::HyprctlConfigErrorsEmpty]
-    } else {
-        Vec::new()
     }
 }
 

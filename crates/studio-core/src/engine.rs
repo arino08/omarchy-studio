@@ -77,6 +77,24 @@ pub enum Verification {
     CommandOk(crate::cmd::Cmd),
 }
 
+/// The Hyprland config check, when this machine can actually run it.
+///
+/// `hyprctl configerrors` is gated (spec 01 §3): where it isn't available the
+/// pipeline would treat the failed *probe* as a failed verification and roll
+/// back a perfectly good change, so an unverifiable box gets no check rather
+/// than a wrong one. Every module that reloads Hyprland uses this.
+pub fn hypr_verification(runner: &dyn CommandRunner) -> Vec<Verification> {
+    let usable = runner
+        .run(&cmds::hypr_configerrors())
+        .map(|o| o.ok())
+        .unwrap_or(false);
+    if usable {
+        vec![Verification::HyprctlConfigErrorsEmpty]
+    } else {
+        Vec::new()
+    }
+}
+
 #[derive(Debug)]
 pub struct ApplyPlan {
     /// Human summary, becomes the snapshot subject: `blur.size 8→12`.

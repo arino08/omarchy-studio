@@ -154,13 +154,17 @@ impl KeybindsScreen {
         }
     }
 
-    /// Commit the current overrides via the core (snapshot done by the App).
+    /// Commit the current overrides through the apply pipeline, which
+    /// snapshots and rolls back a config Hyprland refuses. The store is the
+    /// App's — screens report intent, the App owns side effects.
     pub fn commit(
         &self,
         paths: &OmarchyPaths,
+        store: &studio_core::snapshot::SnapshotStore,
         runner: &dyn CommandRunner,
+        summary: &str,
     ) -> studio_core::error::Result<()> {
-        apply_overrides(paths, &self.overrides, runner).map(|_| ())
+        apply_overrides(paths, &self.overrides, store, runner, summary).map(|_| ())
     }
 
     pub fn render(&mut self, f: &mut Frame, area: Rect, skin: &Skin) {
