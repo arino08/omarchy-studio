@@ -1208,40 +1208,22 @@ fn waybar(args: &[&str]) -> i32 {
             eprintln!("{e:?}");
             return 2;
         }
-        let file = cfg.path().to_path_buf();
-        let store = history().ok();
-        if let Some(s) = &store {
-            let _ = s.record(
-                SnapshotKind::Pre,
-                &format!("before {summary}"),
-                std::slice::from_ref(&file),
-                "waybar",
-                &[],
-            );
-        }
+        // The pipeline snapshots and reverts; don't also record here.
+        let store = match history() {
+            Ok(s) => s,
+            Err(code) => return code,
+        };
         use studio_core::modules::waybar::ApplyOutcome;
-        match cfg.apply_watched(&RealRunner, std::time::Duration::from_millis(900)) {
+        match cfg.apply_watched(&store, &RealRunner, std::time::Duration::from_millis(900)) {
             Ok(ApplyOutcome::Reverted) => {
                 eprintln!("{summary}: that change stopped Waybar, so it was reverted.");
                 1
             }
             Ok(_) => {
-                if let Some(s) = &store {
-                    let _ = s.record(
-                        SnapshotKind::Post,
-                        &summary,
-                        std::slice::from_ref(&file),
-                        "waybar",
-                        &[],
-                    );
-                }
                 println!("{summary} · undo with `omarchy-studio snapshot undo`");
                 0
             }
-            Err(e) => {
-                eprintln!("apply failed: {e:?}");
-                1
-            }
+            Err(e) => report_apply_error(e, "bar config was"),
         }
     }
 }

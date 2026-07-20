@@ -266,39 +266,59 @@ impl WaybarConfig {
     /// The safety net only arms when Waybar was confirmed running beforehand: if
     /// we can't even check (no `pgrep`, headless session), we apply without
     /// reverting rather than risk clobbering a good change on a false negative.
+    /// Plan this config as a pipeline edit, writing nothing.
+    pub fn plan(&self) -> crate::engine::FileEdit {
+        // `None` for a file that doesn't exist yet — the pipeline's hash guard
+        // reads it the same way.
+        let on_disk = std::fs::read_to_string(&self.path).ok();
+        crate::engine::FileEdit::new(self.path.clone(), on_disk.as_deref(), self.doc.to_string())
+    }
+
+    /// Apply through the pipeline, watching that Waybar survives the change.
+    ///
+    /// This used to hand-roll save → restart → settle → check → restore, which
+    /// is precisely what the pipeline does; the one rule it can't express is
+    /// Omarchy-specific and preserved here: **never spawn a bar the user isn't
+    /// running.** If Waybar wasn't up (they run a Quickshell shell), the edit
+    /// is still snapshotted and written, but nothing restarts and there is
+    /// nothing to watch — so no reload and no verification go in the plan.
     pub fn apply_watched(
         &self,
+        store: &crate::snapshot::SnapshotStore,
         runner: &dyn crate::cmd::CommandRunner,
         settle: std::time::Duration,
     ) -> Result<ApplyOutcome> {
         let was_alive = waybar_alive(runner);
-        let original = std::fs::read_to_string(&self.path).ok();
-        self.save()?;
-        // Never spawn a bar the user isn't running: if Waybar wasn't up (e.g.
-        // they run a Quickshell shell), the edit is saved and we stand down —
-        // no restart, so nothing lands on top of their real bar.
-        if !was_alive {
-            return Ok(ApplyOutcome::AppliedUnwatched);
+        let (reload, verify) = if was_alive {
+            (
+                vec![crate::engine::ReloadStep::Restart(Component::Waybar)],
+                vec![crate::engine::Verification::ProcessAlive {
+                    name: "waybar",
+                    grace: settle,
+                }],
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let plan = crate::engine::ApplyPlan {
+            summary: "waybar config".into(),
+            module: "waybar".into(),
+            edits: vec![self.plan()],
+            reload,
+            verify,
+            risk: crate::engine::Risk::Restarty,
+            trailers: Vec::new(),
+        };
+        match crate::engine::Pipeline::new(store, runner).apply(&plan, false) {
+            Ok(_) if was_alive => Ok(ApplyOutcome::Applied),
+            Ok(_) => Ok(ApplyOutcome::AppliedUnwatched),
+            // The bar died on the new config: the pipeline restored the old one
+            // and re-ran the restart, so Waybar is back on the previous config.
+            Err(StudioError::VerifyFailed {
+                rolled_back: true, ..
+            }) => Ok(ApplyOutcome::Reverted),
+            Err(e) => Err(e),
         }
-        let out = runner.run(&crate::omarchy::cmds::restart(Component::Waybar))?;
-        if !out.ok() {
-            return Err(StudioError::External {
-                cmd: "omarchy-restart-waybar".into(),
-                detail: out.stderr.trim().to_string(),
-            });
-        }
-        if !settle.is_zero() {
-            std::thread::sleep(settle);
-        }
-        if waybar_alive(runner) {
-            return Ok(ApplyOutcome::Applied);
-        }
-        // Waybar died on the new config — restore the previous one and revive it.
-        if let Some(orig) = original {
-            crate::configfs::atomic_write(&self.path, &orig)?;
-            let _ = runner.run(&crate::omarchy::cmds::restart(Component::Waybar));
-        }
-        Ok(ApplyOutcome::Reverted)
     }
 }
 
@@ -635,6 +655,13 @@ mod tests {
             ..Default::default()
         };
 
+        // The pipeline snapshots with real git; the stubs cover pgrep/restart.
+        let store = crate::snapshot::SnapshotStore::open_or_init(
+            paths.config.join("history"),
+            Box::new(crate::cmd::RealRunner),
+        )
+        .unwrap();
+
         // Case 1: Waybar alive before, alive after → Applied, edit persists.
         let mut wb = WaybarConfig::load(&paths).unwrap();
         wb.add("modules-center", "cpu").unwrap();
@@ -642,7 +669,7 @@ mod tests {
             .with(&alive, up.clone())
             .with(&restart, up.clone());
         assert_eq!(
-            wb.apply_watched(&runner, Duration::ZERO).unwrap(),
+            wb.apply_watched(&store, &runner, Duration::ZERO).unwrap(),
             ApplyOutcome::Applied
         );
         assert!(std::fs::read_to_string(config_path(&paths))
@@ -656,7 +683,7 @@ mod tests {
         // first `pgrep` (before) = up, restart ok, second `pgrep` (after) = dead
         let runner = Recorder::new(vec![up.clone(), up.clone(), dead.clone()]);
         assert_eq!(
-            wb.apply_watched(&runner, Duration::ZERO).unwrap(),
+            wb.apply_watched(&store, &runner, Duration::ZERO).unwrap(),
             ApplyOutcome::Reverted
         );
         assert_eq!(
@@ -672,7 +699,7 @@ mod tests {
             .with(&alive, dead.clone())
             .with(&restart, up.clone());
         assert_eq!(
-            wb.apply_watched(&runner, Duration::ZERO).unwrap(),
+            wb.apply_watched(&store, &runner, Duration::ZERO).unwrap(),
             ApplyOutcome::AppliedUnwatched
         );
         assert!(std::fs::read_to_string(config_path(&paths))

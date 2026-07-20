@@ -1136,34 +1136,27 @@ impl App {
     }
 
     fn apply_waybar(&mut self) {
-        let Some(file) = self.waybar.config_path() else {
+        if self.waybar.config_path().is_none() {
             return;
-        };
-        let store = SnapshotStore::open_or_init(
+        }
+        // The pipeline snapshots pre/drift/post itself — recording here too
+        // would double every entry in the timeline.
+        let store = match SnapshotStore::open_or_init(
             studio_core::studio_state_dir().join("history"),
             Box::new(RealRunner),
-        );
-        if let Ok(s) = &store {
-            let _ = s.record(
-                SnapshotKind::Pre,
-                "before: waybar layout change",
-                std::slice::from_ref(&file),
-                "waybar",
-                &[],
-            );
-        }
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                self.toast = Some(Toast {
+                    text: format!("no change history, not applying: {}", brief(e)),
+                    ok: false,
+                });
+                return;
+            }
+        };
         use studio_core::modules::waybar::ApplyOutcome;
-        match self.waybar.commit(&RealRunner) {
+        match self.waybar.commit(&store, &RealRunner) {
             Ok(outcome) => {
-                if let Ok(s) = &store {
-                    let _ = s.record(
-                        SnapshotKind::Post,
-                        "waybar layout change",
-                        std::slice::from_ref(&file),
-                        "waybar",
-                        &[],
-                    );
-                }
                 self.waybar.reload(&self.paths);
                 self.toast = Some(match outcome {
                     ApplyOutcome::Reverted => Toast {
