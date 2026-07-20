@@ -22,6 +22,7 @@ pub mod battery;
 pub mod cheatsheet;
 pub mod color;
 pub mod community;
+pub mod coverage;
 pub mod dispatchers;
 pub mod extraction;
 pub mod keybinds;

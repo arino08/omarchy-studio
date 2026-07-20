@@ -41,6 +41,8 @@ pub struct DoctorScreen {
     /// TUI-side probe result (kitty/sixel/half-blocks) — set by the App,
     /// which owns the [`crate::tui::imagecell::ImageCell`].
     graphics: Option<String>,
+    /// What the active theme does and doesn't cover.
+    coverage: Vec<studio_core::modules::coverage::Row>,
 }
 
 impl DoctorScreen {
@@ -60,6 +62,9 @@ impl DoctorScreen {
             }
             Err(_) => (Vec::new(), Vec::new(), false),
         };
+        // Read the live theme dir rather than resolve the slug: that's what
+        // Omarchy's symlinks actually point at.
+        let coverage = studio_core::modules::coverage::report(paths, &paths.current_theme_dir());
         Self {
             caps,
             theme,
@@ -69,6 +74,7 @@ impl DoctorScreen {
             clobbers,
             store_ok,
             graphics: None,
+            coverage,
         }
     }
 
@@ -133,6 +139,18 @@ impl DoctorScreen {
         };
         lines.push(fact("hyprland", hypr, skin));
         lines.push(fact("theme", self.theme.clone(), skin));
+        // A theme that doesn't ship a non-templated file leaves Omarchy's
+        // symlink dangling, and the app fails with an error that never
+        // mentions themes (nvim is the loud one). Most community themes are
+        // colours-only, so name the casualties here rather than let someone
+        // debug it from the app's side.
+        for row in self.coverage.iter().filter(|r| r.is_breakage()) {
+            lines.push(Line::from(vec![
+                Span::styled("    ! ", skin.warn()),
+                Span::styled(format!("{:<14} ", row.app), skin.body()),
+                Span::styled(row.consequence.to_string(), skin.dim()),
+            ]));
+        }
         if let Some(g) = &self.graphics {
             lines.push(fact("previews", g.clone(), skin));
         }

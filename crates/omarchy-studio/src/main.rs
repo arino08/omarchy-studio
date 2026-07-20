@@ -61,7 +61,7 @@ fn cli() -> Command {
         .subcommand(group("doctor", "Check the install, capabilities and update survival", "usage: omarchy-studio doctor [--deps] [--quiet]"))
         .subcommand(group("theme", "List, apply, fork, extract and install themes",
             "usage:\n  \
-             theme list | current | apply <name> | fork <src> <new>\n  \
+             theme list | current | coverage [name] | apply <name> | fork <src> <new>\n  \
              theme new <name> --from-image <path> [--mode normal|muted|material] [--bias auto|dark|light] [--apply]\n  \
              theme new [name] --from-current-wallpaper [--apply]\n  \
              theme extract <image> [normal|muted|material] [auto|dark|light]\n  \
@@ -461,6 +461,7 @@ fn theme(args: &[&str]) -> i32 {
                 1
             }
         },
+        ["coverage", rest @ ..] => theme_coverage(&paths, rest.first().copied()),
         ["apply", name] => {
             let slug = slugify(name);
             if store.get(&slug).is_none() {
@@ -1686,6 +1687,59 @@ fn keybind_cli(args: &[&str]) -> i32 {
             2
         }
     }
+}
+
+/// Show which apps a theme covers, and what breaks where it doesn't.
+///
+/// Omarchy renders most app configs from the palette, so a colours-only theme
+/// still themes them — but files with no template (`neovim.lua`, `icons.theme`)
+/// must be shipped by the theme, and when they aren't, Omarchy's symlink
+/// dangles and the app fails with an error that never mentions themes.
+fn theme_coverage(paths: &OmarchyPaths, slug: Option<&str>) -> i32 {
+    use studio_core::modules::coverage::{self, Status};
+
+    // No slug means the live theme dir, which is what Omarchy's symlinks
+    // actually resolve through.
+    let (label, dir) = match slug {
+        Some(s) => match coverage::theme_dir(paths, s) {
+            Some(d) => (s.to_string(), d),
+            None => {
+                eprintln!("no theme called '{s}'");
+                return 1;
+            }
+        },
+        None => (
+            paths
+                .current_theme_name()
+                .unwrap_or_else(|_| "current".into()),
+            paths.current_theme_dir(),
+        ),
+    };
+
+    println!("{label}\n");
+    let rows = coverage::report(paths, &dir);
+    for r in &rows {
+        let (mark, note) = match r.status {
+            Status::Shipped => ("✓", "shipped by the theme"),
+            Status::Templated => ("·", "rendered from the palette"),
+            Status::Missing => ("✗", r.consequence),
+        };
+        println!("{mark} {:<16} {:<14} {note}", r.file, r.app);
+    }
+
+    let broken: Vec<_> = rows.iter().filter(|r| r.is_breakage()).collect();
+    if broken.is_empty() {
+        println!("\nEverything Omarchy themes is covered.");
+        return 0;
+    }
+    println!(
+        "\n{} gap(s) — these files have no template, so the theme must ship them.",
+        broken.len()
+    );
+    if broken.iter().any(|r| r.required) {
+        return 1;
+    }
+    0
 }
 
 /// Parse `SUPER+SHIFT+T` (or `"SUPER SHIFT T"`) into a modmask and key.

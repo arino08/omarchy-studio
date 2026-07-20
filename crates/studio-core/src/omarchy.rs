@@ -68,6 +68,30 @@ impl OmarchyPaths {
         self.config.join("current/theme/colors.toml")
     }
 
+    /// The live theme directory itself (`current/theme`).
+    pub fn current_theme_dir(&self) -> PathBuf {
+        self.config.join("current/theme")
+    }
+
+    /// Omarchy's built-in templates (`default/themed/*.tpl`). A theme that
+    /// doesn't ship one of these files still gets it, rendered from the
+    /// palette — which is what makes a *missing* non-templated file a real
+    /// breakage rather than a cosmetic gap.
+    pub fn default_templates(&self) -> PathBuf {
+        self.system.join("default/themed")
+    }
+
+    /// The user's own template overrides/additions (`~/.config/omarchy/themed`).
+    pub fn user_templates(&self) -> PathBuf {
+        self.config.join("themed")
+    }
+
+    /// Where themes live: Omarchy's own, then the user's (which overlay by
+    /// name — a community install lands in the user dir).
+    pub fn theme_dirs(&self) -> [PathBuf; 2] {
+        [self.system.join("themes"), self.config.join("themes")]
+    }
+
     /// Omarchy's own version, from the `version` file it ships. Empty when
     /// it can't be read — callers warn, never block, since an unknown
     /// version is exactly the case where guessing hurts.
