@@ -1737,31 +1737,22 @@ impl App {
         let Some(preset) = animations::preset(name) else {
             return;
         };
-        let file = self.paths.hypr_config().join("looknfeel.conf");
-        let store = SnapshotStore::open_or_init(
+        // The pipeline snapshots; recording here too would double the entry.
+        let store = match SnapshotStore::open_or_init(
             studio_core::studio_state_dir().join("history"),
             Box::new(RealRunner),
-        );
-        if let Ok(s) = &store {
-            let _ = s.record(
-                SnapshotKind::Pre,
-                &format!("before animations: {name}"),
-                std::slice::from_ref(&file),
-                "animations",
-                &[],
-            );
-        }
-        match animations::apply(&self.paths, preset, &RealRunner) {
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                self.toast = Some(Toast {
+                    text: format!("no change history, not applying: {}", brief(e)),
+                    ok: false,
+                });
+                return;
+            }
+        };
+        match animations::apply(&self.paths, preset, &store, &RealRunner) {
             Ok(_) => {
-                if let Ok(s) = &store {
-                    let _ = s.record(
-                        SnapshotKind::Post,
-                        &format!("animations: {name}"),
-                        std::slice::from_ref(&file),
-                        "animations",
-                        &[],
-                    );
-                }
                 self.animations.reload(&self.paths);
                 self.toast = Some(Toast {
                     text: format!("Animations: {name} · undo from Snapshots"),

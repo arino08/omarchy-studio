@@ -8,8 +8,8 @@
 
 use std::path::PathBuf;
 
-use crate::configfs::{atomic_write, CommentStyle, ManagedBlock};
-use crate::error::{Result, StudioError};
+use crate::configfs::{CommentStyle, ManagedBlock};
+use crate::error::Result;
 use crate::omarchy::OmarchyPaths;
 
 /// A named animation feel. `body` is the full `animations { … }` block, or
@@ -106,10 +106,14 @@ pub fn current(paths: &OmarchyPaths) -> &'static str {
 pub fn apply(
     paths: &OmarchyPaths,
     preset: &AnimPreset,
+    store: &crate::snapshot::SnapshotStore,
     runner: &dyn crate::cmd::CommandRunner,
 ) -> Result<PathBuf> {
     let path = user_path(paths);
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    // `None` for a file that doesn't exist yet — the pipeline's hash guard
+    // reads it the same way, and treating absent as empty makes it reject.
+    let on_disk = std::fs::read_to_string(&path).ok();
+    let existing = on_disk.clone().unwrap_or_default();
     let updated = if preset.body.trim().is_empty() {
         block().remove(&existing)
     } else {
@@ -119,14 +123,23 @@ pub fn apply(
         );
         block().upsert(&existing, &body)
     };
-    atomic_write(&path, &updated)?;
-    let out = runner.run(&crate::omarchy::cmds::hypr_reload())?;
-    if !out.ok() {
-        return Err(StudioError::External {
-            cmd: "hyprctl reload".into(),
-            detail: out.stderr.trim().to_string(),
-        });
+    if updated == existing {
+        return Ok(path); // already this preset — nothing to snapshot or reload
     }
+    let plan = crate::engine::ApplyPlan {
+        summary: format!("animations: {}", preset.name),
+        module: "animations".into(),
+        edits: vec![crate::engine::FileEdit::new(
+            path.clone(),
+            on_disk.as_deref(),
+            updated,
+        )],
+        reload: vec![crate::engine::ReloadStep::HyprReload],
+        verify: crate::engine::hypr_verification(runner),
+        risk: crate::engine::Risk::Safe,
+        trailers: Vec::new(),
+    };
+    crate::engine::Pipeline::new(store, runner).apply(&plan, false)?;
     Ok(path)
 }
 
@@ -183,19 +196,25 @@ mod tests {
         )
         .unwrap();
         let runner = StubRunner::default().with_ok("hyprctl reload", "ok");
+        // The pipeline snapshots with real git; the stub covers hyprctl.
+        let store = crate::snapshot::SnapshotStore::open_or_init(
+            paths.config.join("history"),
+            Box::new(crate::cmd::RealRunner),
+        )
+        .unwrap();
 
         assert_eq!(current(&paths), "Default");
-        apply(&paths, preset("Fast").unwrap(), &runner).unwrap();
+        apply(&paths, preset("Fast").unwrap(), &store, &runner).unwrap();
         assert_eq!(current(&paths), "Fast");
         let on_disk = std::fs::read_to_string(user_path(&paths)).unwrap();
         assert!(on_disk.contains("border_size = 2")); // user's own untouched
         assert!(on_disk.contains("bezier = snappy"));
 
         // switching preset replaces cleanly
-        apply(&paths, preset("Off").unwrap(), &runner).unwrap();
+        apply(&paths, preset("Off").unwrap(), &store, &runner).unwrap();
         assert_eq!(current(&paths), "Off");
         // Default removes the block, restoring the file
-        apply(&paths, preset("Default").unwrap(), &runner).unwrap();
+        apply(&paths, preset("Default").unwrap(), &store, &runner).unwrap();
         assert_eq!(current(&paths), "Default");
         let after = std::fs::read_to_string(user_path(&paths)).unwrap();
         assert!(!after.contains("omarchy-studio:animations"));

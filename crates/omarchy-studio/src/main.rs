@@ -254,6 +254,29 @@ fn omarchy() -> Option<OmarchyPaths> {
     }
 }
 
+/// Report a failed apply the way a person reads it: what refused the change,
+/// and whether their previous config is back. A rollback that didn't finish is
+/// the one case that must shout (spec 01 §3).
+fn report_apply_error(e: studio_core::StudioError, what: &str) -> i32 {
+    match e {
+        studio_core::StudioError::VerifyFailed {
+            step,
+            stderr,
+            rolled_back,
+            ..
+        } => {
+            eprintln!("{step} rejected the change: {}", stderr.trim());
+            if rolled_back {
+                eprintln!("your previous {what} restored.");
+            } else {
+                eprintln!("WARNING: the rollback did not finish — check `snapshot log`.");
+            }
+        }
+        other => eprintln!("apply failed: {}", brief(other)),
+    }
+    1
+}
+
 fn history() -> Result<SnapshotStore, i32> {
     let state = studio_core::studio_state_dir();
     SnapshotStore::open_or_init(state.join("history"), Box::new(RealRunner)).map_err(|e| {
@@ -1014,26 +1037,7 @@ fn apply_looknfeel(
             println!("{summary} · undo with `omarchy-studio snapshot undo`");
             0
         }
-        // A config Hyprland won't load is reverted for you; say so plainly,
-        // and louder still if the revert itself couldn't finish.
-        Err(studio_core::StudioError::VerifyFailed {
-            step,
-            stderr,
-            rolled_back,
-            ..
-        }) => {
-            eprintln!("{step} rejected the change: {}", stderr.trim());
-            if rolled_back {
-                eprintln!("your previous settings were restored.");
-            } else {
-                eprintln!("WARNING: the rollback did not finish — check `snapshot log`.");
-            }
-            1
-        }
-        Err(e) => {
-            eprintln!("apply failed: {}", brief(e));
-            1
-        }
+        Err(e) => report_apply_error(e, "settings were"),
     }
 }
 
@@ -1059,38 +1063,20 @@ fn animations(args: &[&str]) -> i32 {
                 eprintln!("unknown animation preset `{joined}` — see `animations list`");
                 return 2;
             };
-            let file = paths.hypr_config().join("looknfeel.conf");
-            let store = history().ok();
-            if let Some(s) = &store {
-                let _ = s.record(
-                    SnapshotKind::Pre,
-                    &format!("before animations {}", p.name),
-                    std::slice::from_ref(&file),
-                    "animations",
-                    &[],
-                );
-            }
-            match apply(&paths, p, &RealRunner) {
+            // The pipeline snapshots and rolls back; don't also record.
+            let store = match history() {
+                Ok(s) => s,
+                Err(code) => return code,
+            };
+            match apply(&paths, p, &store, &RealRunner) {
                 Ok(_) => {
-                    if let Some(s) = &store {
-                        let _ = s.record(
-                            SnapshotKind::Post,
-                            &format!("animations {}", p.name),
-                            std::slice::from_ref(&file),
-                            "animations",
-                            &[],
-                        );
-                    }
                     println!(
                         "Animations: {} · undo with `omarchy-studio snapshot undo`",
                         p.name
                     );
                     0
                 }
-                Err(e) => {
-                    eprintln!("apply failed: {e:?}");
-                    1
-                }
+                Err(e) => report_apply_error(e, "animations were"),
             }
         }
         _ => {
@@ -1846,25 +1832,7 @@ fn keybind_write(
             println!("undo with: omarchy-studio snapshot undo");
             0
         }
-        // Binds that stop Hyprland's config loading are reverted for you.
-        Err(studio_core::StudioError::VerifyFailed {
-            step,
-            stderr,
-            rolled_back,
-            ..
-        }) => {
-            eprintln!("{step} rejected the change: {}", stderr.trim());
-            if rolled_back {
-                eprintln!("your previous binds were restored.");
-            } else {
-                eprintln!("WARNING: the rollback did not finish — check `snapshot log`.");
-            }
-            1
-        }
-        Err(e) => {
-            eprintln!("keybind change failed: {}", brief(e));
-            1
-        }
+        Err(e) => report_apply_error(e, "binds were"),
     }
 }
 
