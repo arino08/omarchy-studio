@@ -269,12 +269,16 @@ impl LookFeelScreen {
         self.model.preview_all(runner)
     }
 
+    /// Persist through the apply pipeline — the store is the App's, since it
+    /// owns every side effect. `summary` becomes the snapshot subject.
     pub fn commit(
         &self,
         paths: &OmarchyPaths,
+        store: &studio_core::snapshot::SnapshotStore,
         runner: &dyn CommandRunner,
+        summary: &str,
     ) -> studio_core::error::Result<()> {
-        self.model.apply(paths, runner).map(|_| ())
+        self.model.apply(paths, store, runner, summary).map(|_| ())
     }
 
     pub fn any_overrides(&self) -> bool {

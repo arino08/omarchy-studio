@@ -1791,31 +1791,26 @@ impl App {
             });
             return;
         }
-        let files = studio_core::modules::looknfeel::LookFeel::managed_paths(&self.paths);
-        let store = SnapshotStore::open_or_init(
+        // The pipeline snapshots pre/drift/post itself — recording here too
+        // would double every entry in the timeline.
+        let store = match SnapshotStore::open_or_init(
             studio_core::studio_state_dir().join("history"),
             Box::new(RealRunner),
-        );
-        if let Ok(s) = &store {
-            let _ = s.record(
-                SnapshotKind::Pre,
-                "before: look & feel change",
-                &files,
-                "looknfeel",
-                &[],
-            );
-        }
-        match self.looknfeel.commit(&self.paths, &RealRunner) {
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                self.toast = Some(Toast {
+                    text: format!("no change history, not applying: {}", brief(e)),
+                    ok: false,
+                });
+                return;
+            }
+        };
+        match self
+            .looknfeel
+            .commit(&self.paths, &store, &RealRunner, "look & feel change")
+        {
             Ok(()) => {
-                if let Ok(s) = &store {
-                    let _ = s.record(
-                        SnapshotKind::Post,
-                        "look & feel change",
-                        &files,
-                        "looknfeel",
-                        &[],
-                    );
-                }
                 studio_core::modules::looknfeel::clear_preview_marker(
                     &studio_core::studio_state_dir(),
                 );
@@ -1823,6 +1818,19 @@ impl App {
                 self.toast = Some(Toast {
                     text: "Saved look & feel · undo from Snapshots".into(),
                     ok: true,
+                });
+            }
+            // Hyprland refused the config; the pipeline already put the old
+            // one back, so the desktop is fine — say what happened.
+            Err(studio_core::StudioError::VerifyFailed { rolled_back, .. }) => {
+                self.looknfeel.reload(&self.paths);
+                self.toast = Some(Toast {
+                    text: if rolled_back {
+                        "Hyprland rejected that — your previous settings are back".into()
+                    } else {
+                        "Hyprland rejected that AND the rollback failed — see Snapshots".into()
+                    },
+                    ok: false,
                 });
             }
             Err(e) => {
@@ -1836,7 +1844,25 @@ impl App {
 
     /// Remove all look & feel overrides and reload Hyprland to the base config.
     fn reset_looknfeel(&mut self) {
-        match self.looknfeel.commit(&self.paths, &RealRunner) {
+        let store = match SnapshotStore::open_or_init(
+            studio_core::studio_state_dir().join("history"),
+            Box::new(RealRunner),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                self.toast = Some(Toast {
+                    text: format!("no change history, not resetting: {}", brief(e)),
+                    ok: false,
+                });
+                return;
+            }
+        };
+        match self.looknfeel.commit(
+            &self.paths,
+            &store,
+            &RealRunner,
+            "reset look & feel to defaults",
+        ) {
             Ok(()) => {
                 studio_core::modules::looknfeel::clear_preview_marker(
                     &studio_core::studio_state_dir(),

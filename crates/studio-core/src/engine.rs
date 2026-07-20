@@ -155,6 +155,17 @@ impl<'a> Pipeline<'a> {
             .store
             .record(SnapshotKind::Pre, &plan.summary, &files, &plan.module, &[])?;
 
+        // A snapshot can only restore files that existed when it was taken, so
+        // "this file did not exist" has to be remembered separately — without
+        // it a failed first-ever apply leaves the rejected file on disk while
+        // reporting a successful rollback.
+        let created: Vec<PathBuf> = plan
+            .edits
+            .iter()
+            .filter(|e| !e.file.exists())
+            .map(|e| e.file.clone())
+            .collect();
+
         for edit in &plan.edits {
             crate::configfs::atomic_write(&edit.file, &edit.new_content)?;
         }
@@ -163,7 +174,11 @@ impl<'a> Pipeline<'a> {
             // Roll back to the pre state and re-run reloads so the live
             // desktop matches the restored files again. Rollback failures
             // must be loud, never silent (spec 01 §3).
-            let rolled_back = self.store.restore(&pre).is_ok() && self.run_reloads(plan).is_ok();
+            let undone = self.store.restore(&pre).is_ok();
+            let removed = created
+                .iter()
+                .all(|f| !f.exists() || std::fs::remove_file(f).is_ok());
+            let rolled_back = undone && removed && self.run_reloads(plan).is_ok();
             let (step, stderr) = match e {
                 StudioError::VerifyFailed { step, stderr, .. } => (step, stderr),
                 other => ("reload".into(), format!("{other:?}")),
@@ -380,6 +395,33 @@ mod tests {
         assert_eq!(
             stub.calls(),
             vec!["hyprctl reload", "hyprctl configerrors", "hyprctl reload"]
+        );
+    }
+
+    #[test]
+    fn a_failed_first_apply_removes_the_file_it_created() {
+        let dir = scratch("rollback-created");
+        let s = store(&dir);
+        // The file does not exist yet — a snapshot can't record "absent", so
+        // restoring the pre state alone would leave the rejected file behind
+        // while we told the user their config was restored.
+        let f = dir.join("looknfeel.conf");
+
+        let stub = StubRunner::default().with_ok("hyprctl reload", "").with_ok(
+            "hyprctl configerrors",
+            "error: invalid value at looknfeel.conf:1\n",
+        );
+        let err = Pipeline::new(&s, &stub)
+            .apply(&plan_for(&f, None, "gaps_in = 6\n"), false)
+            .unwrap_err();
+
+        match err {
+            StudioError::VerifyFailed { rolled_back, .. } => assert!(rolled_back),
+            other => panic!("wrong variant: {other:?}"),
+        }
+        assert!(
+            !f.exists(),
+            "the rejected file should be gone, not left behind"
         );
     }
 

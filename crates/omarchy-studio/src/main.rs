@@ -1021,29 +1021,37 @@ fn apply_looknfeel(
     lf: &studio_core::modules::looknfeel::LookFeel,
     summary: &str,
 ) -> i32 {
-    // Snapshot every file Studio may touch (looknfeel.conf + input.conf) so
-    // undo restores all of them.
-    let files = studio_core::modules::looknfeel::LookFeel::managed_paths(paths);
-    let store = history().ok();
-    if let Some(s) = &store {
-        let _ = s.record(
-            SnapshotKind::Pre,
-            &format!("before {summary}"),
-            &files,
-            "looknfeel",
-            &[],
-        );
-    }
-    match lf.apply(paths, &RealRunner) {
+    // The pipeline owns snapshotting (pre, drift and post), so this must not
+    // record its own or every change lands in the log twice.
+    // Without a store there is no rollback, so this refuses rather than
+    // applying unprotected. `history()` already explains why it failed.
+    let store = match history() {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    match lf.apply(paths, &store, &RealRunner, summary) {
         Ok(_) => {
-            if let Some(s) = &store {
-                let _ = s.record(SnapshotKind::Post, summary, &files, "looknfeel", &[]);
-            }
             println!("{summary} · undo with `omarchy-studio snapshot undo`");
             0
         }
+        // A config Hyprland won't load is reverted for you; say so plainly,
+        // and louder still if the revert itself couldn't finish.
+        Err(studio_core::StudioError::VerifyFailed {
+            step,
+            stderr,
+            rolled_back,
+            ..
+        }) => {
+            eprintln!("{step} rejected the change: {}", stderr.trim());
+            if rolled_back {
+                eprintln!("your previous settings were restored.");
+            } else {
+                eprintln!("WARNING: the rollback did not finish — check `snapshot log`.");
+            }
+            1
+        }
         Err(e) => {
-            eprintln!("apply failed: {e:?}");
+            eprintln!("apply failed: {}", brief(e));
             1
         }
     }

@@ -968,21 +968,72 @@ impl LookFeel {
         Ok(written)
     }
 
-    /// Save and live-reload Hyprland. Caller snapshots first for undo.
+    /// Plan each target's managed block as a pipeline edit, writing nothing.
+    /// Targets whose content wouldn't change are omitted, so an apply that
+    /// changes one file doesn't snapshot the other.
+    pub fn plan(&self, paths: &OmarchyPaths) -> Vec<crate::engine::FileEdit> {
+        let mut edits = Vec::new();
+        for &target in TARGETS {
+            let path = user_path(paths, target);
+            // `None` for a file that doesn't exist yet — the pipeline's hash
+            // guard reads the same way, and treating a missing file as empty
+            // here would make the guard reject the write.
+            let on_disk = std::fs::read_to_string(&path).ok();
+            let existing = on_disk.clone().unwrap_or_default();
+            let updated = match self.render_block_body(target) {
+                Some(body) => block(target).upsert(&existing, &body),
+                None => block(target).remove(&existing),
+            };
+            if updated != existing {
+                edits.push(crate::engine::FileEdit::new(
+                    path,
+                    on_disk.as_deref(),
+                    updated,
+                ));
+            }
+        }
+        edits
+    }
+
+    /// Apply through the pipeline: drift-check → pre-snapshot → hash-guarded
+    /// write → `hyprctl reload` → verify → post, rolling back if the config we
+    /// produced doesn't load. The caller does *not* snapshot; the pipeline
+    /// owns that, and doing both would double every entry in the log.
     pub fn apply(
         &self,
         paths: &OmarchyPaths,
+        store: &crate::snapshot::SnapshotStore,
         runner: &dyn crate::cmd::CommandRunner,
-    ) -> Result<Vec<PathBuf>> {
-        let written = self.save(paths)?;
-        let out = runner.run(&crate::omarchy::cmds::hypr_reload())?;
-        if !out.ok() {
-            return Err(StudioError::External {
-                cmd: "hyprctl reload".into(),
-                detail: out.stderr.trim().to_string(),
-            });
-        }
-        Ok(written)
+        summary: &str,
+    ) -> Result<crate::engine::ApplyReport> {
+        let plan = crate::engine::ApplyPlan {
+            summary: summary.to_string(),
+            module: "looknfeel".into(),
+            edits: self.plan(paths),
+            reload: vec![crate::engine::ReloadStep::HyprReload],
+            verify: config_verification(runner),
+            risk: crate::engine::Risk::Risky,
+            trailers: Vec::new(),
+        };
+        crate::engine::Pipeline::new(store, runner).apply(&plan, false)
+    }
+}
+
+/// The post-apply check, when this machine can actually run it.
+///
+/// `hyprctl configerrors` is gated (spec 01 §3): where it isn't available the
+/// pipeline would treat the failed *probe* as a failed verification and roll
+/// back a perfectly good change, so an unverifiable box gets no check rather
+/// than a wrong one.
+fn config_verification(runner: &dyn crate::cmd::CommandRunner) -> Vec<crate::engine::Verification> {
+    let usable = runner
+        .run(&crate::omarchy::cmds::hypr_configerrors())
+        .map(|o| o.ok())
+        .unwrap_or(false);
+    if usable {
+        vec![crate::engine::Verification::HyprctlConfigErrorsEmpty]
+    } else {
+        Vec::new()
     }
 }
 
