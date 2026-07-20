@@ -267,8 +267,19 @@ pub fn export(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or_default();
-    let stage =
-        crate::studio_cache_dir().join(format!("rice-export-{}-{stamp}", std::process::id()));
+    // Stage beside the bundle we're writing, not in the shared cache dir.
+    // The cache dir is process-wide, so exports from tests (or two users on
+    // one machine) landed in the same place regardless of the paths they were
+    // handed — which is also what made the export tests non-hermetic. Staging
+    // here keeps it on the destination's filesystem too, so the tar reads
+    // across no device boundary.
+    let stage_root = out.parent().filter(|p| !p.as_os_str().is_empty());
+    if let Some(parent) = stage_root {
+        std::fs::create_dir_all(parent)?;
+    }
+    let stage = stage_root
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(".rice-export-{}-{stamp}", std::process::id()));
     let _ = std::fs::remove_dir_all(&stage);
     std::fs::create_dir_all(&stage)?;
 
