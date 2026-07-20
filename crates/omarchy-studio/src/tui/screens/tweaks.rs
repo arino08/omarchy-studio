@@ -18,13 +18,13 @@ use crate::tui::theme::Skin;
 
 pub enum TweaksAction {
     None,
-    /// A tweak was written; `reload` = the App should `hyprctl reload`.
-    Applied {
-        label: String,
+    /// The user asked to flip a tweak. The App performs it — screens report
+    /// intent, the App owns side effects (and the snapshot store the apply
+    /// pipeline needs).
+    Toggle {
+        index: usize,
         on: bool,
-        reload: bool,
     },
-    Failed(String),
 }
 
 pub struct TweaksScreen {
@@ -89,19 +89,33 @@ impl TweaksScreen {
 
     fn toggle(&mut self) -> TweaksAction {
         let i = self.cursor;
-        let want_on = self.states[i] != State::On;
-        let tweak = &self.items[i];
-        match tweak.set(&self.ctx, want_on) {
-            Ok(_) => {
-                let action = TweaksAction::Applied {
-                    label: tweak.label().to_string(),
-                    on: want_on,
-                    reload: tweak.touches_hypr(),
-                };
-                self.refresh();
-                action
-            }
-            Err(e) => TweaksAction::Failed(format!("{}: {e:?}", tweak.label())),
+        TweaksAction::Toggle {
+            index: i,
+            on: self.states[i] != State::On,
+        }
+    }
+
+    /// Apply one tweak on the App's behalf, through the pipeline.
+    pub fn apply(
+        &mut self,
+        index: usize,
+        on: bool,
+        store: &studio_core::snapshot::SnapshotStore,
+        runner: &dyn studio_core::cmd::CommandRunner,
+    ) -> Result<String, String> {
+        let Some(tweak) = self.items.get(index) else {
+            return Err("no such tweak".into());
+        };
+        let label = tweak.label().to_string();
+        let result =
+            studio_core::modules::tweaks::apply(tweak.as_ref(), &self.ctx, on, store, runner);
+        self.refresh();
+        match result {
+            Ok(_) => Ok(format!("{label} {}", if on { "on" } else { "off" })),
+            Err(studio_core::StudioError::VerifyFailed {
+                rolled_back: true, ..
+            }) => Err(format!("{label} broke Hyprland's config — reverted")),
+            Err(e) => Err(format!("{label}: {}", crate::brief(e))),
         }
     }
 

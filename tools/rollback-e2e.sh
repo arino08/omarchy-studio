@@ -151,6 +151,28 @@ else
     fail "the rollback lost the earlier bind"
 fi
 
+echo "==> tweaks roll back too (E1)"
+INPUT="$HOME_DIR/.config/hypr/input.conf"
+"$BIN" tweak caps-escape on >/dev/null 2>&1
+if grep -q "caps:escape" "$INPUT" 2>/dev/null; then
+    ok "the tweak is on disk"
+else
+    fail "the tweak was not written"
+fi
+# A rejected tweak must come back off, leaving no half-applied block.
+HYPRCTL_ERRORS="error: invalid input at input.conf:1" \
+    "$BIN" tweak inactive-transparency on >/dev/null 2>&1
+if grep -q "tweak-transparency" "$HOME_DIR/.config/hypr/looknfeel.conf" 2>/dev/null; then
+    fail "the rejected tweak survived"
+else
+    ok "the rejected tweak was rolled back"
+fi
+if grep -q "caps:escape" "$INPUT" 2>/dev/null; then
+    ok "the earlier tweak survived the rollback"
+else
+    fail "the rollback lost the earlier tweak"
+fi
+
 echo
 if [ "$fails" -gt 0 ]; then
     echo "rollback-e2e: $fails check(s) failed"

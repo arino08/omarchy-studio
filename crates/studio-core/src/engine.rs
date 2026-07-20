@@ -192,11 +192,18 @@ impl<'a> Pipeline<'a> {
             // Roll back to the pre state and re-run reloads so the live
             // desktop matches the restored files again. Rollback failures
             // must be loud, never silent (spec 01 §3).
+            // `rolled_back` answers "is my config back?", so it tracks the
+            // files only. Re-running the reloads is best-effort: when the
+            // failure *was* the reload command, it fails again here, and
+            // reporting that as a failed rollback would tell the user their
+            // config wasn't restored when it was. The reload failure is
+            // already carried in the error's step/stderr.
             let undone = self.store.restore(&pre).is_ok();
             let removed = created
                 .iter()
                 .all(|f| !f.exists() || std::fs::remove_file(f).is_ok());
-            let rolled_back = undone && removed && self.run_reloads(plan).is_ok();
+            let rolled_back = undone && removed;
+            let _ = self.run_reloads(plan);
             let (step, stderr) = match e {
                 StudioError::VerifyFailed { step, stderr, .. } => (step, stderr),
                 other => ("reload".into(), format!("{other:?}")),
@@ -441,6 +448,35 @@ mod tests {
             !f.exists(),
             "the rejected file should be gone, not left behind"
         );
+    }
+
+    #[test]
+    fn a_reload_that_keeps_failing_still_reports_the_files_restored() {
+        let dir = scratch("rollback-reload-fails");
+        let s = store(&dir);
+        let f = dir.join("looknfeel.conf");
+        std::fs::write(&f, "blur = 8\n").unwrap();
+
+        // The reload itself is what's broken, so it fails again while rolling
+        // back. The files still come back, and saying otherwise would tell the
+        // user their config was lost when it wasn't.
+        let stub = StubRunner::default().with(
+            "hyprctl reload",
+            crate::cmd::CmdOutput {
+                status: 1,
+                stderr: "reload broke".into(),
+                ..Default::default()
+            },
+        );
+        let err = Pipeline::new(&s, &stub)
+            .apply(&plan_for(&f, Some("blur = 8\n"), "blur = 12\n"), false)
+            .unwrap_err();
+
+        match err {
+            StudioError::VerifyFailed { rolled_back, .. } => assert!(rolled_back),
+            other => panic!("wrong variant: {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "blur = 8\n");
     }
 
     #[test]

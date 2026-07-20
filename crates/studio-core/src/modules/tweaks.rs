@@ -58,7 +58,15 @@ pub trait Tweak: Sync {
         true
     }
     fn state(&self, ctx: &Ctx) -> State;
-    /// Apply (`on`) or revert (`!on`). Idempotent. Returns the files written.
+    /// The file edits this change makes, planned but not written, so [`apply`]
+    /// can put them through the pipeline. Empty for a tweak whose effect isn't
+    /// a file edit — creating directories, say — which does its work in
+    /// [`Tweak::set`] instead.
+    fn plan(&self, _ctx: &Ctx, _on: bool) -> Result<Vec<crate::engine::FileEdit>> {
+        Ok(Vec::new())
+    }
+    /// Apply (`on`) or revert (`!on`) directly, without the pipeline.
+    /// Idempotent. Returns the files written.
     fn set(&self, ctx: &Ctx, on: bool) -> Result<Vec<PathBuf>>;
 }
 
@@ -77,24 +85,83 @@ pub fn find(id: &str) -> Option<Box<dyn Tweak>> {
 
 // ---------------------------------------------------------- managed-block help
 
-/// Upsert (`on`) or remove (`!on`) a uniquely-named block carrying `body` in a
-/// user-side hypr file. Returns the file path when it changed.
-fn set_hypr_block(path: PathBuf, section: &str, body: &str, on: bool) -> Result<Vec<PathBuf>> {
+/// Plan an upsert (`on`) or removal (`!on`) of a uniquely-named block carrying
+/// `body` in a user-side hypr file. `None` when the file already says this.
+fn plan_hypr_block(
+    path: PathBuf,
+    section: &str,
+    body: &str,
+    on: bool,
+) -> Option<crate::engine::FileEdit> {
     let block = ManagedBlock::new(section, CommentStyle::Hash);
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    // `None` for a file that doesn't exist yet — the pipeline's hash guard
+    // reads it the same way, and treating absent as empty makes it reject.
+    let on_disk = std::fs::read_to_string(&path).ok();
+    let existing = on_disk.clone().unwrap_or_default();
     let updated = if on {
         block.upsert(&existing, body)
     } else {
         block.remove(&existing)
     };
-    if updated == existing {
-        return Ok(Vec::new());
+    (updated != existing).then(|| crate::engine::FileEdit::new(path, on_disk.as_deref(), updated))
+}
+
+/// Write planned edits directly. This is what [`Tweak::set`] does for the
+/// file-backed tweaks, so the plan stays the single description of the change
+/// whether it goes through the pipeline or not.
+fn write_edits(edits: &[crate::engine::FileEdit]) -> Result<Vec<PathBuf>> {
+    let mut written = Vec::new();
+    for e in edits {
+        if let Some(parent) = e.file.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        crate::configfs::atomic_write(&e.file, &e.new_content)?;
+        written.push(e.file.clone());
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    Ok(written)
+}
+
+/// Apply or revert a tweak through the apply pipeline, so a change that breaks
+/// Hyprland's config is rolled back — and, unlike before, is snapshotted at all.
+///
+/// Tweaks with no file edits (the media directories) can't be expressed as a
+/// plan and are applied directly; there is nothing for a rollback to restore,
+/// and reverting them is exactly what `set(.., false)` already does.
+pub fn apply(
+    tweak: &dyn Tweak,
+    ctx: &Ctx,
+    on: bool,
+    store: &crate::snapshot::SnapshotStore,
+    runner: &dyn crate::cmd::CommandRunner,
+) -> Result<Vec<PathBuf>> {
+    let edits = tweak.plan(ctx, on)?;
+    if edits.is_empty() {
+        return tweak.set(ctx, on);
     }
-    crate::configfs::atomic_write(&path, &updated)?;
-    Ok(vec![path])
+    // One probe decides both: no usable hyprctl means nothing to reload and
+    // nothing that could verify the result.
+    let verify = if tweak.touches_hypr() {
+        crate::engine::hypr_verification(runner)
+    } else {
+        Vec::new()
+    };
+    let reload = if verify.is_empty() {
+        Vec::new()
+    } else {
+        vec![crate::engine::ReloadStep::HyprReload]
+    };
+    let files: Vec<PathBuf> = edits.iter().map(|e| e.file.clone()).collect();
+    let plan = crate::engine::ApplyPlan {
+        summary: format!("tweak {} {}", tweak.id(), if on { "on" } else { "off" }),
+        module: "tweaks".into(),
+        edits,
+        reload,
+        verify,
+        risk: crate::engine::Risk::Safe,
+        trailers: Vec::new(),
+    };
+    crate::engine::Pipeline::new(store, runner).apply(&plan, false)?;
+    Ok(files)
 }
 
 fn hypr_block_present(path: &std::path::Path, section: &str) -> bool {
@@ -134,9 +201,14 @@ impl Tweak for CapsEscape {
             State::Off
         }
     }
-    fn set(&self, ctx: &Ctx, on: bool) -> Result<Vec<PathBuf>> {
+    fn plan(&self, ctx: &Ctx, on: bool) -> Result<Vec<crate::engine::FileEdit>> {
         let body = "input {\n  kb_options = caps:escape\n}";
-        set_hypr_block(Self::path(ctx), Self::SECTION, body, on)
+        Ok(plan_hypr_block(Self::path(ctx), Self::SECTION, body, on)
+            .into_iter()
+            .collect())
+    }
+    fn set(&self, ctx: &Ctx, on: bool) -> Result<Vec<PathBuf>> {
+        write_edits(&self.plan(ctx, on)?)
     }
 }
 
@@ -169,9 +241,14 @@ impl Tweak for InactiveTransparency {
             State::Off
         }
     }
-    fn set(&self, ctx: &Ctx, on: bool) -> Result<Vec<PathBuf>> {
+    fn plan(&self, ctx: &Ctx, on: bool) -> Result<Vec<crate::engine::FileEdit>> {
         let body = "windowrule = opacity 1.0 0.95, match:class .*";
-        set_hypr_block(Self::path(ctx), Self::SECTION, body, on)
+        Ok(plan_hypr_block(Self::path(ctx), Self::SECTION, body, on)
+            .into_iter()
+            .collect())
+    }
+    fn set(&self, ctx: &Ctx, on: bool) -> Result<Vec<PathBuf>> {
+        write_edits(&self.plan(ctx, on)?)
     }
 }
 

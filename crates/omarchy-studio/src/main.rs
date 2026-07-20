@@ -1416,36 +1416,17 @@ fn notif(args: &[&str]) -> i32 {
     };
     let _ = changed;
 
-    // Snapshot the template, apply (write → theme-refresh → reload).
-    let file = b.tpl_path().to_path_buf();
-    let store = history().ok();
-    if let Some(s) = &store {
-        let _ = s.record(
-            SnapshotKind::Pre,
-            &format!("before {summary}"),
-            std::slice::from_ref(&file),
-            "mako",
-            &[],
-        );
-    }
-    match b.apply(&RealRunner) {
+    // The pipeline snapshots and rolls back; don't also record here.
+    let store = match history() {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    match b.apply(&store, &RealRunner) {
         Ok(()) => {
-            if let Some(s) = &store {
-                let _ = s.record(
-                    SnapshotKind::Post,
-                    &summary,
-                    std::slice::from_ref(&file),
-                    "mako",
-                    &[],
-                );
-            }
             println!("{summary} · undo with `omarchy-studio snapshot undo`");
             0
         }
-        Err(e) => {
-            eprintln!("apply failed: {e:?}");
-            1
-        }
+        Err(e) => report_apply_error(e, "notification settings were"),
     }
 }
 
@@ -2877,22 +2858,21 @@ fn tweak(args: &[&str]) -> i32 {
                 return 2;
             };
             let on = *verb == "on";
-            match t.set(&ctx, on) {
+            // The pipeline snapshots, reloads and rolls back.
+            let store = match history() {
+                Ok(s) => s,
+                Err(code) => return code,
+            };
+            match tweaks::apply(t.as_ref(), &ctx, on, &store, &RealRunner) {
                 Ok(changed) => {
                     if changed.is_empty() {
                         println!("{id} already {verb}");
                     } else {
-                        println!("{id} {verb}");
-                        if t.touches_hypr() {
-                            let _ = RealRunner.run(&cmds::hypr_reload());
-                        }
+                        println!("{id} {verb} · undo with `omarchy-studio snapshot undo`");
                     }
                     0
                 }
-                Err(e) => {
-                    eprintln!("couldn't set {id}: {}", brief(e));
-                    1
-                }
+                Err(e) => report_apply_error(e, "tweaks were"),
             }
         }
         _ => {
@@ -3009,46 +2989,26 @@ fn monitor_write(
 ) -> i32 {
     use studio_core::modules::monitors as mon;
     let path = mon::conf_path(paths);
-    let existing = mon::read_conf(paths);
-    let updated = mon::render_conf(&existing, layout);
     if dry_run {
         println!("would write {}:\n", path.display());
         println!("{}", layout.render_body());
         return 0;
     }
-    let store = history().ok();
-    if let Some(s) = &store {
-        let _ = s.record(
-            SnapshotKind::Pre,
-            &format!("before {summary}"),
-            std::slice::from_ref(&path),
-            "monitors",
-            &[],
-        );
-    }
-    if let Err(e) = studio_core::configfs::atomic_write(&path, &updated) {
-        eprintln!("couldn't write {}: {}", path.display(), brief(e));
-        return 1;
-    }
-    let reload = RealRunner.run(&cmds::hypr_reload());
-    if let Some(s) = &store {
-        let _ = s.record(
-            SnapshotKind::Post,
-            summary,
-            std::slice::from_ref(&path),
-            "monitors",
-            &[],
-        );
-    }
-    match reload {
-        Ok(o) if o.ok() => {
+    // The pipeline snapshots and rolls back; don't also record here.
+    let store = match history() {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    match mon::apply(paths, layout, &store, &RealRunner, summary) {
+        Ok(true) => {
             println!("applied · undo from Snapshots");
             0
         }
-        _ => {
-            println!("wrote {} (hyprctl reload unavailable)", path.display());
+        Ok(false) => {
+            println!("your displays already match that layout");
             0
         }
+        Err(e) => report_apply_error(e, "monitor layout was"),
     }
 }
 

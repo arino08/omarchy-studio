@@ -245,6 +245,56 @@ pub fn read_conf(paths: &OmarchyPaths) -> String {
     std::fs::read_to_string(conf_path(paths)).unwrap_or_default()
 }
 
+/// Plan the managed block as a pipeline edit, writing nothing. `None` when the
+/// conf already describes exactly this layout.
+pub fn plan(paths: &OmarchyPaths, layout: &Layout) -> Option<crate::engine::FileEdit> {
+    let path = conf_path(paths);
+    // `None` for a file that doesn't exist yet — the pipeline's hash guard
+    // reads it the same way, and treating absent as empty makes it reject.
+    let on_disk = std::fs::read_to_string(&path).ok();
+    let existing = on_disk.clone().unwrap_or_default();
+    let updated = render_conf(&existing, layout);
+    (updated != existing).then(|| crate::engine::FileEdit::new(path, on_disk.as_deref(), updated))
+}
+
+/// Apply a layout through the pipeline: snapshot, hash-guarded write, reload,
+/// verify, and roll back if the monitor lines stop Hyprland's config loading.
+///
+/// Writing a layout is useful even where Hyprland isn't running — you can set
+/// up displays from a TTY — so when `hyprctl` isn't usable the plan carries
+/// neither a reload nor a check, and the write still happens. That keeps the
+/// old CLI behaviour ("wrote it, reload unavailable") rather than failing.
+pub fn apply(
+    paths: &OmarchyPaths,
+    layout: &Layout,
+    store: &crate::snapshot::SnapshotStore,
+    runner: &dyn CommandRunner,
+    summary: &str,
+) -> Result<bool> {
+    let Some(edit) = plan(paths, layout) else {
+        return Ok(false); // already this layout
+    };
+    // One probe decides both: no usable hyprctl means nothing to reload and
+    // nothing that could verify the result.
+    let verify = crate::engine::hypr_verification(runner);
+    let reload = if verify.is_empty() {
+        Vec::new()
+    } else {
+        vec![crate::engine::ReloadStep::HyprReload]
+    };
+    let plan = crate::engine::ApplyPlan {
+        summary: summary.to_string(),
+        module: "monitors".into(),
+        edits: vec![edit],
+        reload,
+        verify,
+        risk: crate::engine::Risk::Risky,
+        trailers: Vec::new(),
+    };
+    crate::engine::Pipeline::new(store, runner).apply(&plan, false)?;
+    Ok(true)
+}
+
 // ------------------------------------------------------------------ commands
 
 /// `hyprctl notify` to flash a monitor's name on-screen (the identify action).

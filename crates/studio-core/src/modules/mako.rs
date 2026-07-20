@@ -146,17 +146,52 @@ impl MakoTpl {
         atomic_write(&self.path, &self.render(body))
     }
 
-    /// Write + regenerate `mako.ini` from the template + live-reload the daemon.
-    /// `omarchy-theme-refresh` is the upstream pipeline (never ours); a failed
-    /// `makoctl reload` is tolerated (mako may simply not be running yet).
-    pub fn apply(&self, body: &str, runner: &dyn crate::cmd::CommandRunner) -> Result<()> {
-        self.write(body)?;
-        let out = runner.run(&cmds::theme_refresh())?;
-        if !out.ok() {
-            return Err(StudioError::External {
-                cmd: "omarchy-theme-refresh".into(),
-                detail: out.stderr.trim().to_string(),
-            });
+    /// Plan the template as a pipeline edit, writing nothing. `None` when the
+    /// template already renders exactly this.
+    pub fn plan(&self, body: &str) -> Option<crate::engine::FileEdit> {
+        // `None` for a file that doesn't exist yet — the pipeline's hash guard
+        // reads it the same way, and treating absent as empty makes it reject.
+        let on_disk = std::fs::read_to_string(&self.path).ok();
+        let rendered = self.render(body);
+        (on_disk.as_deref() != Some(rendered.as_str()))
+            .then(|| crate::engine::FileEdit::new(self.path.clone(), on_disk.as_deref(), rendered))
+    }
+
+    /// Write + regenerate `mako.ini` from the template + live-reload the daemon,
+    /// through the apply pipeline so a template that breaks the theme refresh is
+    /// rolled back rather than left behind.
+    ///
+    /// `omarchy-theme-refresh` is the upstream pipeline (never ours) and must
+    /// succeed, so it is the plan's reload step. `makoctl reload` deliberately
+    /// stays *outside* the plan: a failure there only means mako isn't running,
+    /// and treating that as a failed apply would roll back a perfectly good
+    /// template on any machine whose notification daemon happens to be down.
+    pub fn apply(
+        &self,
+        body: &str,
+        store: &crate::snapshot::SnapshotStore,
+        runner: &dyn crate::cmd::CommandRunner,
+    ) -> Result<()> {
+        // The pipeline writes atomically but doesn't create parent dirs.
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| StudioError::External {
+                cmd: format!("mkdir {}", parent.display()),
+                detail: e.to_string(),
+            })?;
+        }
+        if let Some(edit) = self.plan(body) {
+            let plan = crate::engine::ApplyPlan {
+                summary: "notification behaviour".into(),
+                module: "mako".into(),
+                edits: vec![edit],
+                reload: vec![crate::engine::ReloadStep::ThemeRefresh],
+                // No config check exists for mako; the safety here is the
+                // snapshot pair plus rollback when the refresh itself fails.
+                verify: Vec::new(),
+                risk: crate::engine::Risk::Restarty,
+                trailers: Vec::new(),
+            };
+            crate::engine::Pipeline::new(store, runner).apply(&plan, false)?;
         }
         let _ = runner.run(&cmds::makoctl_reload());
         Ok(())
@@ -502,9 +537,14 @@ impl MakoBehavior {
         self.tpl.path()
     }
 
-    /// Write the template + regenerate + reload. Caller snapshots first.
-    pub fn apply(&self, runner: &dyn crate::cmd::CommandRunner) -> Result<()> {
-        self.tpl.apply(&self.body(), runner)
+    /// Write the template + regenerate + reload, through the apply pipeline
+    /// (which snapshots and rolls back — the caller must not snapshot).
+    pub fn apply(
+        &self,
+        store: &crate::snapshot::SnapshotStore,
+        runner: &dyn crate::cmd::CommandRunner,
+    ) -> Result<()> {
+        self.tpl.apply(&self.body(), store, runner)
     }
 }
 
@@ -737,8 +777,17 @@ mod tests {
             criteria: vec![("urgency".into(), "critical".into())],
             settings: vec![("default-timeout".into(), "0".into())],
         });
-        b.apply(&crate::cmd::StubRunner::default().with_ok("omarchy-theme-refresh", ""))
-            .unwrap();
+        // The pipeline snapshots with real git; the stub covers theme-refresh.
+        let store = crate::snapshot::SnapshotStore::open_or_init(
+            paths.config.join("history"),
+            Box::new(crate::cmd::RealRunner),
+        )
+        .unwrap();
+        b.apply(
+            &store,
+            &crate::cmd::StubRunner::default().with_ok("omarchy-theme-refresh", ""),
+        )
+        .unwrap();
 
         // reload from disk → overrides + rules survive
         let re = MakoBehavior::load(&paths);

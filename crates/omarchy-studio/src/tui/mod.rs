@@ -699,21 +699,7 @@ impl App {
             },
             Screen::Tweaks => match self.tweaks.handle(key) {
                 TweaksAction::None => {}
-                TweaksAction::Applied { label, on, reload } => {
-                    if reload {
-                        let _ = RealRunner.run(&cmds::hypr_reload());
-                    }
-                    self.toast = Some(Toast {
-                        text: format!("{label} {}", if on { "on" } else { "off" }),
-                        ok: true,
-                    });
-                }
-                TweaksAction::Failed(msg) => {
-                    self.toast = Some(Toast {
-                        text: msg,
-                        ok: false,
-                    });
-                }
+                TweaksAction::Toggle { index, on } => self.apply_tweak(index, on),
             },
             Screen::Battery => match self.battery.handle(key) {
                 BatteryAction::None => {}
@@ -1178,33 +1164,47 @@ impl App {
         }
     }
 
-    /// Snapshot the mako template, write behavior, regenerate + reload, refresh.
-    fn apply_notifications(&mut self) {
-        let file = self.notifications.model().tpl_path().to_path_buf();
-        let store = SnapshotStore::open_or_init(
+    /// Flip one tweak through the apply pipeline (which reloads Hyprland and
+    /// rolls back a config it refuses).
+    fn apply_tweak(&mut self, index: usize, on: bool) {
+        let store = match SnapshotStore::open_or_init(
             studio_core::studio_state_dir().join("history"),
             Box::new(RealRunner),
-        );
-        if let Ok(s) = &store {
-            let _ = s.record(
-                SnapshotKind::Pre,
-                "before: notification behavior",
-                std::slice::from_ref(&file),
-                "mako",
-                &[],
-            );
-        }
-        match self.notifications.model().apply(&RealRunner) {
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                self.toast = Some(Toast {
+                    text: format!("no change history, not applying: {}", brief(e)),
+                    ok: false,
+                });
+                return;
+            }
+        };
+        self.toast = Some(match self.tweaks.apply(index, on, &store, &RealRunner) {
+            Ok(text) => Toast { text, ok: true },
+            Err(text) => Toast { text, ok: false },
+        });
+    }
+
+    /// Write mako behavior through the pipeline, then refresh the screen.
+    fn apply_notifications(&mut self) {
+        // The pipeline snapshots pre/drift/post itself — recording here too
+        // would double every entry in the timeline.
+        let store = match SnapshotStore::open_or_init(
+            studio_core::studio_state_dir().join("history"),
+            Box::new(RealRunner),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                self.toast = Some(Toast {
+                    text: format!("no change history, not applying: {}", brief(e)),
+                    ok: false,
+                });
+                return;
+            }
+        };
+        match self.notifications.model().apply(&store, &RealRunner) {
             Ok(()) => {
-                if let Ok(s) = &store {
-                    let _ = s.record(
-                        SnapshotKind::Post,
-                        "notification behavior",
-                        std::slice::from_ref(&file),
-                        "mako",
-                        &[],
-                    );
-                }
                 self.notifications.reload(&self.paths);
                 self.refresh_dnd();
                 self.toast = Some(Toast {
