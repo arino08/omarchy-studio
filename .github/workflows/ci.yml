@@ -75,6 +75,11 @@ jobs:
           cargo build
           ./tools/e2e.sh ./target/debug/omarchy-studio
 
+      # Drives apply → snapshot → undo with the real binary against a fake
+      # hyprctl, so the recovery path is exercised rather than assumed.
+      - name: recovery journey
+        run: ./tools/rollback-e2e.sh ./target/debug/omarchy-studio
+
   screens:
     name: screenshot grid
     runs-on: ubuntu-latest

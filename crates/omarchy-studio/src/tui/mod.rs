@@ -1561,9 +1561,30 @@ impl App {
         self.themes.reload(&self.paths);
         self.themes.focus(&done.slug);
         self.skin = Skin::from_current(&self.paths);
-        self.toast = Some(Toast {
-            text: format!("{} installed and applied (slug `{}`)", done.name, done.slug),
-            ok: true,
+        // The install script *applies* the theme, so a colours-only one has
+        // already broken whatever it doesn't cover. Say so now, while the
+        // cause is obvious — otherwise the first symptom is an unrelated-
+        // looking error the next time that app starts (nvim is the loud one).
+        let gaps: Vec<&str> =
+            studio_core::modules::coverage::report(&self.paths, &self.paths.current_theme_dir())
+                .into_iter()
+                .filter(|r| r.is_breakage())
+                .map(|r| r.app)
+                .collect();
+        self.toast = Some(if gaps.is_empty() {
+            Toast {
+                text: format!("{} installed and applied (slug `{}`)", done.name, done.slug),
+                ok: true,
+            }
+        } else {
+            Toast {
+                text: format!(
+                    "{} applied, but it doesn't theme {} — see Doctor",
+                    done.name,
+                    gaps.join(", ")
+                ),
+                ok: false,
+            }
         });
     }
 
