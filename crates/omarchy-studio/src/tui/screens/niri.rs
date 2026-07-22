@@ -38,6 +38,8 @@ pub enum NiriAction {
 /// The adjustable rows, in display order.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Row {
+    /// The window layout itself — the actual "niri mode vs hyprland mode".
+    Mode,
     Scale,
     Layout,
     Gap,
@@ -46,12 +48,20 @@ enum Row {
 }
 
 impl Row {
-    const ALL: [Row; 5] = [Row::Scale, Row::Layout, Row::Gap, Row::Blur, Row::Gesture];
+    const ALL: [Row; 6] = [
+        Row::Mode,
+        Row::Scale,
+        Row::Layout,
+        Row::Gap,
+        Row::Blur,
+        Row::Gesture,
+    ];
 
     fn label(self) -> &'static str {
         match self {
+            Row::Mode => "Window layout",
             Row::Scale => "Overview scale",
-            Row::Layout => "Direction",
+            Row::Layout => "Overview direction",
             Row::Gap => "Gap between workspaces",
             Row::Blur => "Blur the backdrop",
             Row::Gesture => "Swipe distance",
@@ -60,6 +70,7 @@ impl Row {
 
     fn detail(self) -> &'static str {
         match self {
+            Row::Mode => "Niri opens windows as columns you scroll through",
             Row::Scale => "How small the workspace cards are drawn",
             Row::Layout => "Which way workspaces stack in the overview",
             Row::Gap => "Space between cards, in pixels",
@@ -71,6 +82,9 @@ impl Row {
 
 pub struct NiriScreen {
     state: State,
+    /// `general.layout` from the config — dwindle/master is "hyprland mode",
+    /// scrolling is "niri mode".
+    mode: String,
     settings: Settings,
     sourced: bool,
     /// The chord bound to the overview, if Studio installed one.
@@ -83,6 +97,7 @@ impl NiriScreen {
     pub fn load(paths: &OmarchyPaths, runner: &dyn CommandRunner) -> Self {
         Self {
             state: sco::state(runner),
+            mode: studio_core::modules::looknfeel::LookFeel::load(paths).value("general.layout"),
             settings: Settings::load(paths),
             sourced: sco::is_sourced(paths),
             bind: current_bind(paths),
@@ -99,6 +114,11 @@ impl NiriScreen {
 
     pub fn settings(&self) -> &Settings {
         &self.settings
+    }
+
+    /// The chosen `general.layout` value, for the App to persist.
+    pub fn mode(&self) -> &str {
+        &self.mode
     }
 
     pub fn hint(&self) -> String {
@@ -133,8 +153,19 @@ impl NiriScreen {
     /// Adjust the selected setting, clamped to the plugin's documented ranges
     /// so an out-of-range value never reaches the config.
     fn nudge(&mut self, dir: i64) {
+        if Row::ALL[self.selected] == Row::Mode {
+            // Only two modes matter here; master is reachable from Look & Feel.
+            self.mode = if self.mode == "scrolling" {
+                "dwindle".into()
+            } else {
+                "scrolling".into()
+            };
+            self.dirty = true;
+            return;
+        }
         let s = &mut self.settings;
         match Row::ALL[self.selected] {
+            Row::Mode => unreachable!("handled above"),
             Row::Scale => {
                 let next = (s.scale + dir as f64 * 0.05).clamp(0.1, 0.9);
                 // Float steps drift; round to the 2dp the file stores.
@@ -157,6 +188,13 @@ impl NiriScreen {
     fn value(&self, row: Row) -> String {
         let s = &self.settings;
         match row {
+            Row::Mode => {
+                if self.mode == "scrolling" {
+                    "Niri".into()
+                } else {
+                    "Hyprland".into()
+                }
+            }
             Row::Scale => format!("{:.2}", s.scale),
             Row::Layout => s.layout.clone(),
             Row::Gap => format!("{} px", s.workspace_gap),
@@ -276,6 +314,7 @@ mod tests {
         let _ = dir;
         NiriScreen {
             state: State::Enabled,
+            mode: "dwindle".into(),
             settings: Settings::default(),
             sourced: true,
             bind: Some("SUPER+GRAVE".into()),
@@ -287,6 +326,7 @@ mod tests {
     #[test]
     fn adjusting_scale_clamps_to_the_plugins_range() {
         let mut s = screen();
+        s.selected = 1; // Overview scale
         for _ in 0..50 {
             s.handle(key(KeyCode::Right));
         }
@@ -301,6 +341,7 @@ mod tests {
     fn scale_steps_stay_on_two_decimals() {
         // Float accumulation would otherwise write 0.6000000000000001.
         let mut s = screen();
+        s.selected = 1; // Overview scale
         s.handle(key(KeyCode::Right));
         s.handle(key(KeyCode::Right));
         assert_eq!(s.settings.scale, 0.6);
@@ -309,13 +350,13 @@ mod tests {
     #[test]
     fn layout_and_blur_toggle_rather_than_count() {
         let mut s = screen();
-        s.selected = 1; // Direction
+        s.selected = 2; // Direction
         s.handle(key(KeyCode::Right));
         assert_eq!(s.settings.layout, "horizontal");
         s.handle(key(KeyCode::Right));
         assert_eq!(s.settings.layout, "vertical");
 
-        s.selected = 3; // Blur
+        s.selected = 4; // Blur
         assert!(!s.settings.blur);
         s.handle(key(KeyCode::Left));
         assert!(s.settings.blur, "either direction flips a toggle");

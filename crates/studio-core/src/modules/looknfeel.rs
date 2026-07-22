@@ -136,7 +136,9 @@ pub const SETTINGS: &[Setting] = &[
         "Tiling layout",
         "Windows",
         Lf,
-        Enum(&["dwindle", "master"]),
+        // `scrolling` is Hyprland 0.56's niri-style layout: new windows open
+        // as columns marching right, focus walks the tape.
+        Enum(&["dwindle", "master", "scrolling"]),
         "dwindle",
         "How new windows are arranged",
     ),

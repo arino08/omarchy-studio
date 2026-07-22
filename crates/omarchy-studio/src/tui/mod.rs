@@ -1183,12 +1183,36 @@ impl App {
         let Some(store) = self.history_or_toast() else {
             return;
         };
+        // The window layout lives in the Look & Feel schema — one writer for
+        // `general.layout`, so the two screens can't fight over it.
+        let mut lf = studio_core::modules::looknfeel::LookFeel::load(&self.paths);
+        let mode = self.niri.mode().to_string();
+        let switching = lf.value("general.layout") != mode;
+        if switching && lf.set("general.layout", &mode).is_err() {
+            self.toast = Some(Toast {
+                text: format!("`{mode}` isn't a layout this Hyprland knows"),
+                ok: false,
+            });
+            return;
+        }
+        if switching {
+            if let Err(e) = lf.apply(&self.paths, &store, &RealRunner, &format!("layout {mode}")) {
+                self.toast = Some(self.apply_toast(e, "layout"));
+                return;
+            }
+        }
         let settings = self.niri.settings().clone();
         match settings.apply(&self.paths, &store, &RealRunner) {
             Ok(()) => {
                 self.niri.reload(&self.paths, &RealRunner);
                 self.toast = Some(Toast {
-                    text: "Saved overview settings · undo from Snapshots".into(),
+                    text: if switching && mode == "scrolling" {
+                        "Niri mode on · SUPER+←/→ scrolls · undo from Snapshots".into()
+                    } else if switching {
+                        "Back to Hyprland tiling · undo from Snapshots".into()
+                    } else {
+                        "Saved overview settings · undo from Snapshots".into()
+                    },
                     ok: true,
                 });
             }
