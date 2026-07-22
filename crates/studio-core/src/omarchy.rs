@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use crate::cmd::{find_in_path, Cmd, CommandRunner};
 
 /// Resolved Omarchy locations (spec 02 §1).
+#[derive(Debug, Clone)]
 pub struct OmarchyPaths {
     /// `~/.local/share/omarchy` — `$OMARCHY_PATH`. READ-ONLY, always.
     pub system: PathBuf,

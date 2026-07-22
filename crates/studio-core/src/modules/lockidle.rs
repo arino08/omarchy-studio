@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use crate::configfs::atomic_write;
 use crate::configfs::hyprlang::HyprDoc;
 use crate::error::{Result, StudioError};
+use crate::expand_tilde;
 use crate::omarchy::{cmds, Component, OmarchyPaths};
 
 fn hypridle_conf(paths: &OmarchyPaths) -> PathBuf {
@@ -318,6 +319,45 @@ impl Hyprlock {
         out
     }
 
+    /// Where imported avatars land — the same directory the picker reads.
+    pub fn avatar_dir(paths: &OmarchyPaths) -> PathBuf {
+        paths.config.join("profile_images")
+    }
+
+    /// Copy an image into the avatar collection so the picker can offer it.
+    ///
+    /// Validates by *content*, not just extension: hyprlock draws nothing at
+    /// all for a file it can't decode, which looks like Studio silently
+    /// failing rather than like a bad image. Returns the path of the copy;
+    /// a name that's already taken gets a `-2`, `-3`, … suffix rather than
+    /// overwriting an avatar the user already had.
+    pub fn import_avatar(paths: &OmarchyPaths, src: &str) -> Result<PathBuf> {
+        let src = expand_tilde(src.trim());
+        if !src.is_file() {
+            return Err(StudioError::External {
+                cmd: format!("read {}", src.display()),
+                detail: "no such file".into(),
+            });
+        }
+        let kind = image_kind(&src)?;
+        let dir = Self::avatar_dir(paths);
+        std::fs::create_dir_all(&dir)?;
+
+        let stem = src
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "avatar".to_string());
+        let mut dest = dir.join(format!("{stem}.{kind}"));
+        let mut n = 2;
+        while dest.exists() {
+            dest = dir.join(format!("{stem}-{n}.{kind}"));
+            n += 1;
+        }
+        std::fs::copy(&src, &dest)?;
+        Ok(dest)
+    }
+
     /// Save the edits, first dropping a one-time backup honoring Omarchy's
     /// `lock-screen-backup.<epoch>/` convention if none exists yet. Returns the
     /// backup directory when one was created. hyprlock reads its config at
@@ -357,6 +397,30 @@ impl Hyprlock {
         })?;
         Ok(Some(dir))
     }
+}
+
+/// Identify an image by its magic bytes, returning the extension to store it
+/// under. Extension alone isn't enough: a `.png` that's really something else
+/// makes hyprlock draw nothing, which reads as Studio having failed.
+fn image_kind(path: &Path) -> Result<&'static str> {
+    use std::io::Read;
+    let mut head = [0u8; 12];
+    let mut f = std::fs::File::open(path)?;
+    let n = f.read(&mut head)?;
+    let head = &head[..n];
+    let kind = if head.starts_with(&[0x89, b'P', b'N', b'G']) {
+        "png"
+    } else if head.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "jpg"
+    } else if head.len() >= 12 && &head[0..4] == b"RIFF" && &head[8..12] == b"WEBP" {
+        "webp"
+    } else {
+        return Err(StudioError::External {
+            cmd: format!("read {}", path.display()),
+            detail: "not a PNG, JPEG or WebP image".into(),
+        });
+    };
+    Ok(kind)
 }
 
 #[cfg(test)]
@@ -505,5 +569,83 @@ label {
         // a second save doesn't make another backup
         let lock2 = Hyprlock::load(&paths).unwrap();
         assert!(lock2.save().unwrap().is_none());
+    }
+    /// Smallest valid files of each kind — enough for the magic-byte check.
+    fn png_bytes() -> Vec<u8> {
+        let mut v = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        v.extend_from_slice(&[0u8; 8]);
+        v
+    }
+
+    #[test]
+    fn importing_an_avatar_copies_it_into_the_picker_directory() {
+        let paths = fake_paths("import");
+        let src = std::env::temp_dir().join(format!("oms-av-{}.png", std::process::id()));
+        std::fs::write(&src, png_bytes()).unwrap();
+
+        let dest = Hyprlock::import_avatar(&paths, src.to_str().unwrap()).unwrap();
+        assert!(dest.starts_with(Hyprlock::avatar_dir(&paths)));
+        assert_eq!(dest.extension().unwrap(), "png");
+        // The picker reads the same directory, so it's offered immediately.
+        assert!(Hyprlock::avatar_choices(&paths).contains(&dest));
+        let _ = std::fs::remove_file(&src);
+    }
+
+    #[test]
+    fn importing_the_same_name_twice_keeps_both() {
+        let paths = fake_paths("import-dup");
+        let src = std::env::temp_dir().join(format!("oms-dup-{}.png", std::process::id()));
+        std::fs::write(&src, png_bytes()).unwrap();
+
+        let a = Hyprlock::import_avatar(&paths, src.to_str().unwrap()).unwrap();
+        let b = Hyprlock::import_avatar(&paths, src.to_str().unwrap()).unwrap();
+        assert_ne!(a, b, "an existing avatar must not be overwritten");
+        assert_eq!(Hyprlock::avatar_choices(&paths).len(), 2);
+        let _ = std::fs::remove_file(&src);
+    }
+
+    #[test]
+    fn a_file_that_is_not_an_image_is_refused() {
+        let paths = fake_paths("import-bad");
+        // Named .png but isn't one — hyprlock would silently draw nothing,
+        // which reads as Studio having failed.
+        let src = std::env::temp_dir().join(format!("oms-bad-{}.png", std::process::id()));
+        std::fs::write(&src, b"just some text").unwrap();
+        assert!(Hyprlock::import_avatar(&paths, src.to_str().unwrap()).is_err());
+        assert!(Hyprlock::avatar_choices(&paths).is_empty());
+        let _ = std::fs::remove_file(&src);
+    }
+
+    #[test]
+    fn a_missing_file_is_a_clear_error() {
+        let paths = fake_paths("import-missing");
+        let err = Hyprlock::import_avatar(&paths, "/nope/nothing.png").unwrap_err();
+        assert!(format!("{err:?}").contains("no such file"), "{err:?}");
+    }
+
+    #[test]
+    fn import_expands_a_leading_tilde() {
+        let paths = fake_paths("import-tilde");
+        let home = std::env::temp_dir().join(format!("oms-home-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("pic.png"), png_bytes()).unwrap();
+        // `~/pic.png` has to resolve, since that's how people type paths.
+        temp_env_home(&home, || {
+            let dest = Hyprlock::import_avatar(&paths, "~/pic.png").unwrap();
+            assert_eq!(dest.file_name().unwrap(), "pic.png");
+        });
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Run `f` with $HOME pointed at `home`. Tests share a process, so this
+    /// restores the previous value rather than leaving it changed.
+    fn temp_env_home(home: &Path, f: impl FnOnce()) {
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", home);
+        f();
+        match prev {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
     }
 }

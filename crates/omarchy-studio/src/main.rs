@@ -110,7 +110,7 @@ fn cli() -> Command {
             "usage:\n  \
              idle timeline\n  \
              idle set <screensaver|lock|screen-off|suspend> <seconds>"))
-        .subcommand(group("lock", "Lock screen appearance", "usage: omarchy-studio lock show | avatar <path> | avatar list | size <px> | blur <n>"))
+        .subcommand(group("lock", "Lock screen appearance", "usage: omarchy-studio lock show | avatar <path> | avatar add <file> | avatar list | size <px> | blur <n>"))
         .subcommand(group("monitor", "Displays: layout, scale, primary, identify",
             "usage:\n  \
              monitor list | identify\n  \
@@ -2289,6 +2289,20 @@ fn lock(args: &[&str]) -> i32 {
     use studio_core::modules::lockidle::Hyprlock;
     let Some(paths) = omarchy() else { return 4 };
 
+    if let ["avatar", "add", src] = args {
+        // Copies into the picker directory so the TUI offers it too.
+        return match Hyprlock::import_avatar(&paths, src) {
+            Ok(dest) => {
+                println!("added {}", dest.display());
+                println!("set it with: omarchy-studio lock avatar {}", dest.display());
+                0
+            }
+            Err(e) => {
+                eprintln!("couldn't import: {}", brief(e));
+                1
+            }
+        };
+    }
     if let ["avatar", "list"] = args {
         let choices = Hyprlock::avatar_choices(&paths);
         if choices.is_empty() {

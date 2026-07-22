@@ -87,6 +87,22 @@ pub fn version_fit(installed: &str) -> VersionFit {
     }
 }
 
+/// Expand a leading `~` against `$HOME`. Anything else is returned as-is, so
+/// absolute and relative paths pass through untouched.
+pub fn expand_tilde(raw: impl AsRef<str>) -> std::path::PathBuf {
+    let raw = raw.as_ref();
+    if raw == "~" {
+        if let Some(home) = std::env::var_os("HOME") {
+            return std::path::PathBuf::from(home);
+        }
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return std::path::PathBuf::from(home).join(rest);
+        }
+    }
+    std::path::PathBuf::from(raw)
+}
+
 fn xdg_dir(var: &str, fallback: &str) -> std::path::PathBuf {
     std::env::var_os(var)
         .map(std::path::PathBuf::from)

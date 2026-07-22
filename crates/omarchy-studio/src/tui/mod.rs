@@ -2535,7 +2535,7 @@ impl CommandPalette {
 }
 
 /// One-line rendering of a core error for a toast (no debug spew).
-fn brief(e: studio_core::StudioError) -> String {
+pub(crate) fn brief(e: studio_core::StudioError) -> String {
     use studio_core::StudioError::*;
     match e {
         External { detail, .. } => detail,

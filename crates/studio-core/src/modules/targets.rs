@@ -22,6 +22,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::{Result, StudioError};
+use crate::expand_tilde;
 use crate::omarchy::OmarchyPaths;
 
 /// Where a resolved target path came from (precedence order, highest first).
@@ -385,19 +386,6 @@ fn flag_arg(args: &[String], i: &mut usize, short: &str, long: &str) -> Option<S
         }
     }
     None
-}
-
-fn expand_tilde(raw: &str) -> PathBuf {
-    if raw == "~" {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home);
-        }
-    } else if let Some(rest) = raw.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
-    }
-    PathBuf::from(raw)
 }
 
 #[cfg(test)]
