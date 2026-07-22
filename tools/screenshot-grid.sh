@@ -37,7 +37,7 @@ studio_fixture "$ROOT"
 SCREENS=(
     "Themes" "Wallpaper" "Keybinds" "Look & Feel" "Animations" "Waybar"
     "Notifs / OSD" "Lock & Idle" "Snapshots" "Integrations" "Apps"
-    "Monitors" "Tweaks" "Power" "Nice Launcher" "Doctor"
+    "Monitors" "Tweaks" "Power" "Nice Launcher" "Niri Mode" "Doctor"
 )
 
 # termshot panics deep in the rasterizer on a missing font; say so up front.
