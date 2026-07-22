@@ -331,6 +331,54 @@ pub fn is_sourced(paths: &OmarchyPaths) -> bool {
         .unwrap_or(false)
 }
 
+/// Plan the `source =` line into the user's `hyprland.conf`.
+///
+/// Hyprland only reads files something sources, so without this the settings
+/// block is inert — it looks like Studio wrote them and nothing happened. The
+/// line goes in its own managed block, appended last so it wins over anything
+/// Omarchy sourced earlier.
+pub fn plan_source(paths: &OmarchyPaths) -> Option<crate::engine::FileEdit> {
+    let path = paths.hypr_config().join("hyprland.conf");
+    let on_disk = std::fs::read_to_string(&path).ok()?;
+    let src = ManagedBlock::new("scrolloverview-source", CommentStyle::Hash);
+    let updated = src.upsert(&on_disk, &source_line(paths));
+    (updated != on_disk)
+        .then(|| crate::engine::FileEdit::new(path, Some(on_disk.as_str()), updated))
+}
+
+/// Ensure the settings file exists *and* is sourced, in one apply.
+///
+/// Both edits go in a single plan on purpose: Hyprland refuses to source a
+/// file that doesn't exist ("source= globbing error: found no match"), so
+/// writing the source line first fails verification and rolls back. Together
+/// they either both land or neither does.
+pub fn ensure_sourced(
+    paths: &OmarchyPaths,
+    store: &crate::snapshot::SnapshotStore,
+    runner: &dyn CommandRunner,
+) -> Result<bool> {
+    let mut edits = Vec::new();
+    // Seed the settings file first if it isn't there yet.
+    if !conf_path(paths).exists() {
+        edits.extend(Settings::load(paths).plan(paths));
+    }
+    edits.extend(plan_source(paths));
+    if edits.is_empty() {
+        return Ok(false);
+    }
+    let plan = crate::engine::ApplyPlan {
+        summary: "source the scroll overview settings".into(),
+        module: PLUGIN.into(),
+        edits,
+        reload: vec![crate::engine::ReloadStep::HyprReload],
+        verify: crate::engine::hypr_verification(runner),
+        risk: crate::engine::Risk::Risky,
+        trailers: Vec::new(),
+    };
+    crate::engine::Pipeline::new(store, runner).apply(&plan, false)?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,6 +487,28 @@ mod tests {
         let msg = format!("{e:?}");
         assert!(msg.contains("password"), "{msg}");
         assert!(msg.contains("terminal"), "{msg}");
+    }
+
+    #[test]
+    fn sourcing_is_idempotent_and_detected() {
+        let dir = tmpdir("source");
+        let p = paths(&dir);
+        let hypr = p.hypr_config().join("hyprland.conf");
+        std::fs::write(
+            &hypr,
+            "source = ~/.config/omarchy/current/theme/hyprland.conf\n",
+        )
+        .unwrap();
+
+        assert!(!is_sourced(&p), "not sourced to begin with");
+        let edit = plan_source(&p).expect("a missing source line is a change");
+        std::fs::write(&edit.file, &edit.new_content).unwrap();
+        // The settings file has to exist too, or Hyprland refuses the source.
+        assert!(is_sourced(&p), "now sourced");
+        // The user's own source lines survive, and re-running is a no-op.
+        let after = std::fs::read_to_string(&hypr).unwrap();
+        assert!(after.contains("current/theme/hyprland.conf"), "{after}");
+        assert!(plan_source(&p).is_none(), "already sourced = no change");
     }
 
     #[test]

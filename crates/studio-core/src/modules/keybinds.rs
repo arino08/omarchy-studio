@@ -626,13 +626,29 @@ pub fn install_marked(
     store: &crate::snapshot::SnapshotStore,
     runner: &dyn crate::cmd::CommandRunner,
 ) -> Result<ConfigBind> {
+    install_marked_dispatch(paths, desc, mods, key, "exec", exec, store, runner)
+}
+
+/// As [`install_marked`], but for a bind that isn't `exec` — a plugin
+/// dispatcher such as `scrolloverview:overview, toggle`.
+#[allow(clippy::too_many_arguments)]
+pub fn install_marked_dispatch(
+    paths: &OmarchyPaths,
+    desc: &str,
+    mods: &str,
+    key: &str,
+    dispatcher: &str,
+    arg: &str,
+    store: &crate::snapshot::SnapshotStore,
+    runner: &dyn crate::cmd::CommandRunner,
+) -> Result<ConfigBind> {
     let bind = ConfigBind {
         flags: "bindd".into(),
         modmask: mods_to_mask(mods),
         key: key.to_string(),
         description: Some(desc.to_string()),
-        dispatcher: "exec".into(),
-        arg: exec.to_string(),
+        dispatcher: dispatcher.to_string(),
+        arg: arg.to_string(),
     };
     let mut overrides: Vec<Override> = read_overrides(paths)
         .into_iter()

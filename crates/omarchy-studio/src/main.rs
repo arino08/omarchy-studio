@@ -129,7 +129,7 @@ fn cli() -> Command {
         .subcommand(group("battery", "Battery status and charge limits", "usage: omarchy-studio battery [status] | limit <start> <stop> [--persist]"))
         .subcommand(group("target", "Point Studio at configs outside the default paths",
             "usage: omarchy-studio target list | set <key> <path> | reset <key>"))
-        .subcommand(group("niri", "Niri-style scrolling overview (ScrollOverview by yayuuu)", "usage: omarchy-studio niri status | install | on | off | set <key> <value> | keybind [MODS KEY]\n   keys: scale layout workspace_gap blur gesture_distance"))
+        .subcommand(group("niri", "Niri-style scrolling overview (ScrollOverview by yayuuu)", "usage: omarchy-studio niri status | install | on | off | source | set <key> <value> | keybind [MODS KEY]\n   keys: scale layout workspace_gap blur gesture_distance"))
         .subcommand(group("nova", "Nice Launcher: config, keybind, install", "usage: omarchy-studio nova show | set <key> <value> | keybind [MODS KEY] | install | uninstall | launch"))
         .subcommand(group("hooks", "Studio's theme-set and post-update hooks", "usage: omarchy-studio hooks install | remove | status"))
         .subcommand(group("update", "Update Studio itself", "usage: omarchy-studio update [--check]"))
@@ -1969,11 +1969,31 @@ fn niri(args: &[&str]) -> i32 {
                 }
             }
         }
+        ["source"] => {
+            let store = match history() {
+                Ok(st) => st,
+                Err(code) => return code,
+            };
+            match sco::ensure_sourced(&paths, &store, &RealRunner) {
+                Ok(true) => {
+                    println!("hyprland.conf now sources the overview settings");
+                    0
+                }
+                Ok(false) => {
+                    println!("already sourced");
+                    0
+                }
+                Err(e) => report_apply_error(e, "hyprland.conf was"),
+            }
+        }
         ["on"] | ["off"] => {
             let on = args[0] == "on";
             match sco::set_enabled(&RealRunner, on) {
                 Ok(msg) => {
                     println!("{msg}");
+                    if on && !sco::is_sourced(&paths) {
+                        println!("tip: run `omarchy-studio niri source` so your settings apply");
+                    }
                     0
                 }
                 Err(e) => {
@@ -2028,7 +2048,7 @@ fn niri(args: &[&str]) -> i32 {
             }
         }
         ["keybind", chord @ ..] => {
-            use studio_core::modules::keybinds::{install_marked, render_chord};
+            use studio_core::modules::keybinds::{install_marked_dispatch, render_chord};
             let (mods, key) = match chord {
                 [] => ("SUPER", "G"),
                 [m, k] => (*m, *k),
@@ -2041,9 +2061,18 @@ fn niri(args: &[&str]) -> i32 {
                 Ok(st) => st,
                 Err(code) => return code,
             };
-            // The plugin's own dispatcher; `overview, toggle` is what its
-            // README binds.
-            match install_marked(&paths, "ScrollOverview", mods, key, "", &store, &RealRunner) {
+            // The plugin's own dispatcher, exactly as its README documents —
+            // not an `exec`, so it needs the dispatch variant.
+            match install_marked_dispatch(
+                &paths,
+                "Toggle overview",
+                mods,
+                key,
+                &format!("{}:overview", sco::PLUGIN),
+                "toggle",
+                &store,
+                &RealRunner,
+            ) {
                 Ok(b) => {
                     println!("{} toggles the overview", render_chord(b.modmask, &b.key));
                     0
