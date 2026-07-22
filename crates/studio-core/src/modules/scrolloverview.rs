@@ -192,6 +192,103 @@ fn build_error(stdout: &str, stderr: &str) -> crate::StudioError {
     }
 }
 
+// ── scrolling-layout navigation ──────────────────────────────────────────────
+
+/// The binds that make Hyprland's `scrolling` layout navigable.
+///
+/// Omarchy binds `SUPER+←/→` to `movefocus`, which **does nothing** in the
+/// scrolling layout — verified on the reference machine: `movefocus r` left
+/// focus where it was, `layoutmsg focus r` scrolled the tape. Studio's
+/// override block is sourced last, so these win over the defaults while niri
+/// mode is on, and removing them restores Omarchy's.
+///
+/// Each entry is (description, mods, key, dispatcher, arg).
+pub fn nav_binds() -> Vec<(
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+)> {
+    vec![
+        ("Scroll left", "SUPER", "LEFT", "layoutmsg", "focus l"),
+        ("Scroll right", "SUPER", "RIGHT", "layoutmsg", "focus r"),
+        (
+            "Narrow column",
+            "SUPER",
+            "MINUS",
+            "layoutmsg",
+            "colresize -0.1",
+        ),
+        (
+            "Widen column",
+            "SUPER",
+            "EQUAL",
+            "layoutmsg",
+            "colresize +0.1",
+        ),
+        (
+            "Fit all columns",
+            "SUPER SHIFT",
+            "EQUAL",
+            "layoutmsg",
+            "fit all",
+        ),
+    ]
+}
+
+/// Are Studio's scrolling-navigation binds installed?
+pub fn nav_binds_installed(paths: &OmarchyPaths) -> bool {
+    let have = crate::modules::keybinds::read_overrides(paths);
+    nav_binds().iter().all(|(desc, ..)| {
+        have.iter().any(|o| {
+            matches!(o, crate::modules::keybinds::Override::Set(cb)
+                if cb.description.as_deref() == Some(*desc))
+        })
+    })
+}
+
+/// Install (or remove) the whole navigation set in one apply, so the keymap
+/// never ends up half-converted.
+pub fn set_nav_binds(
+    paths: &OmarchyPaths,
+    on: bool,
+    store: &crate::snapshot::SnapshotStore,
+    runner: &dyn CommandRunner,
+) -> Result<usize> {
+    use crate::modules::keybinds::{
+        apply_overrides, mods_to_mask, read_overrides, ConfigBind, Override,
+    };
+    let ours: Vec<&str> = nav_binds().iter().map(|(d, ..)| *d).collect();
+    // Drop any previous copy of ours first, so this is idempotent.
+    let mut overrides: Vec<Override> = read_overrides(paths)
+        .into_iter()
+        .filter(|o| {
+            !matches!(o, Override::Set(cb)
+            if cb.description.as_deref().is_some_and(|d| ours.contains(&d)))
+        })
+        .collect();
+    if on {
+        for (desc, mods, key, dispatcher, arg) in nav_binds() {
+            overrides.push(Override::Set(ConfigBind {
+                flags: "bindd".into(),
+                modmask: mods_to_mask(mods),
+                key: key.to_string(),
+                description: Some(desc.to_string()),
+                dispatcher: dispatcher.to_string(),
+                arg: arg.to_string(),
+            }));
+        }
+    }
+    let summary = if on {
+        "niri navigation keybinds"
+    } else {
+        "remove niri navigation keybinds"
+    };
+    apply_overrides(paths, &overrides, store, runner, summary)?;
+    Ok(if on { nav_binds().len() } else { 0 })
+}
+
 // ── settings ─────────────────────────────────────────────────────────────────
 
 /// The plugin settings Studio exposes, with the plugin's own defaults.

@@ -741,6 +741,7 @@ impl App {
                 NiriAction::Save => self.niri_save(),
                 NiriAction::Source => self.niri_source(),
                 NiriAction::Bind => self.niri_bind(),
+                NiriAction::NavBinds(on) => self.niri_nav_binds(on),
             },
             Screen::Nova => match self.nova.handle(key) {
                 NovaAction::None => {}
@@ -1290,6 +1291,32 @@ impl App {
                 self.niri.reload(&self.paths, &RealRunner);
                 self.toast = Some(Toast {
                     text: format!("{} toggles the overview", render_chord(b.modmask, &b.key)),
+                    ok: true,
+                });
+            }
+            Err(e) => self.toast = Some(self.apply_toast(e, "keybinds")),
+        }
+    }
+
+    /// Install or remove the scrolling-navigation binds.
+    fn niri_nav_binds(&mut self, on: bool) {
+        let Some(store) = self.history_or_toast() else {
+            return;
+        };
+        match studio_core::modules::scrolloverview::set_nav_binds(
+            &self.paths,
+            on,
+            &store,
+            &RealRunner,
+        ) {
+            Ok(n) => {
+                self.niri.reload(&self.paths, &RealRunner);
+                self.toast = Some(Toast {
+                    text: if on {
+                        format!("{n} binds installed · SUPER+←/→ now scrolls")
+                    } else {
+                        "Removed — Omarchy's own arrow binds are back".into()
+                    },
                     ok: true,
                 });
             }

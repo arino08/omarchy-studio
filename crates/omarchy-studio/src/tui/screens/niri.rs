@@ -33,6 +33,8 @@ pub enum NiriAction {
     Source,
     /// Install the toggle keybind on the given chord.
     Bind,
+    /// Install (or remove) the scrolling-navigation keybinds.
+    NavBinds(bool),
 }
 
 /// The adjustable rows, in display order.
@@ -89,6 +91,8 @@ pub struct NiriScreen {
     sourced: bool,
     /// The chord bound to the overview, if Studio installed one.
     bind: Option<String>,
+    /// Are the scroll-navigation binds in place?
+    nav: bool,
     selected: usize,
     pub dirty: bool,
 }
@@ -101,6 +105,7 @@ impl NiriScreen {
             settings: Settings::load(paths),
             sourced: sco::is_sourced(paths),
             bind: current_bind(paths),
+            nav: sco::nav_binds_installed(paths),
             selected: 0,
             dirty: false,
         }
@@ -132,6 +137,11 @@ impl NiriScreen {
         if self.bind.is_none() {
             parts.push("b bind");
         }
+        parts.push(if self.nav {
+            "n unbind arrows"
+        } else {
+            "n fix arrows"
+        });
         parts.join(" · ")
     }
 
@@ -145,6 +155,7 @@ impl NiriScreen {
             KeyCode::Char('s') if self.dirty => return NiriAction::Save,
             KeyCode::Char('o') if !self.sourced => return NiriAction::Source,
             KeyCode::Char('b') => return NiriAction::Bind,
+            KeyCode::Char('n') => return NiriAction::NavBinds(!self.nav),
             _ => {}
         }
         NiriAction::None
@@ -273,6 +284,11 @@ impl NiriScreen {
         if !self.sourced {
             v.push("your settings aren't sourced yet — press o".into());
         }
+        // The single most confusing thing about the scrolling layout: the
+        // arrow keys Omarchy binds do nothing in it.
+        if self.mode == "scrolling" && !self.nav {
+            v.push("SUPER+←/→ won't scroll until you press n".into());
+        }
         match &self.bind {
             Some(chord) => v.push(format!("{chord} toggles the overview")),
             None => v.push("no keybind yet — press b to bind one".into()),
@@ -315,6 +331,7 @@ mod tests {
         NiriScreen {
             state: State::Enabled,
             mode: "dwindle".into(),
+            nav: true,
             settings: Settings::default(),
             sourced: true,
             bind: Some("SUPER+GRAVE".into()),
