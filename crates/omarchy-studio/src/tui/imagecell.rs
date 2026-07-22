@@ -14,11 +14,12 @@
 //! sniffing + the `TIOCGWINSZ` pixel size cover the terminals Omarchy users
 //! actually run, with zero stdin reads.
 //!
-//! Decoding happens lazily on the draw after the shown path changes, on the
-//! UI thread — fine for local wallpapers; the wallhaven grid gets a worker
-//! pool when it lands (spec 01 §6).
+//! Decoding happens on a background thread so navigation never blocks.
+//! The UI shows the previous image (or nothing) until the new one is ready.
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
 
 use ratatui::layout::Rect;
 use ratatui::Frame;
@@ -28,15 +29,17 @@ use ratatui_image::{Resize, StatefulImage};
 
 pub struct ImageCell {
     picker: Picker,
-    /// Protocol state for the image currently on screen.
     current: Option<(PathBuf, StatefulProtocol)>,
-    /// Last path that failed to decode — don't retry every frame.
     failed: Option<PathBuf>,
+    pending: Option<PendingDecode>,
+}
+
+struct PendingDecode {
+    path: PathBuf,
+    rx: mpsc::Receiver<Option<image::DynamicImage>>,
 }
 
 /// Graphics protocol from the environment, never from a tty round-trip.
-/// Conservative: inside tmux always half-blocks (passthrough is off by
-/// default and detection would need the racy stdin query).
 fn detect_protocol() -> ProtocolType {
     let var = |k: &str| std::env::var(k).unwrap_or_default();
     let term = var("TERM");
@@ -56,9 +59,6 @@ fn detect_protocol() -> ProtocolType {
 }
 
 impl ImageCell {
-    /// Probe once at startup. Cell pixel size comes from the window-size
-    /// ioctl where the terminal reports it; otherwise a common 8×16 guess —
-    /// only aspect correction depends on it.
     pub fn probe() -> Self {
         let font_size = match ratatui::crossterm::terminal::window_size() {
             Ok(ws) if ws.width > 0 && ws.height > 0 && ws.columns > 0 && ws.rows > 0 => {
@@ -72,10 +72,10 @@ impl ImageCell {
             picker,
             current: None,
             failed: None,
+            pending: None,
         }
     }
 
-    /// Human name for the Doctor screen's capability line.
     pub fn protocol_label(&self) -> &'static str {
         match self.picker.protocol_type() {
             ProtocolType::Kitty => "kitty graphics",
@@ -91,25 +91,74 @@ impl ImageCell {
         if self.failed.as_deref() == Some(path) {
             return false;
         }
-        if self.current.as_ref().map(|(p, _)| p.as_path()) != Some(path) {
-            match image::open(path) {
-                Ok(img) => {
-                    self.current = Some((path.to_path_buf(), self.picker.new_resize_protocol(img)));
-                    self.failed = None;
-                }
-                Err(_) => {
-                    self.failed = Some(path.to_path_buf());
-                    self.current = None;
-                    return false;
+
+        // Already showing this image — just draw it.
+        if self.current.as_ref().map(|(p, _)| p.as_path()) == Some(path) {
+            self.draw(f, area);
+            return true;
+        }
+
+        // Check if a background decode finished.
+        if let Some(pending) = &self.pending {
+            if pending.path == path {
+                match pending.rx.try_recv() {
+                    Ok(Some(img)) => {
+                        let proto = self.picker.new_resize_protocol(img);
+                        self.current = Some((path.to_path_buf(), proto));
+                        self.pending = None;
+                        self.failed = None;
+                        self.draw(f, area);
+                        return true;
+                    }
+                    Ok(None) => {
+                        self.failed = Some(path.to_path_buf());
+                        self.current = None;
+                        self.pending = None;
+                        return false;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {
+                        // Still decoding — show previous image if we have one.
+                        self.draw(f, area);
+                        return self.current.is_some();
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        self.failed = Some(path.to_path_buf());
+                        self.pending = None;
+                        return false;
+                    }
                 }
             }
         }
-        let (_, protocol) = self.current.as_mut().expect("just ensured");
-        f.render_stateful_widget(
-            StatefulImage::default().resize(Resize::Fit(None)),
-            area,
-            protocol,
-        );
-        true
+
+        // New path — kick off a background decode.
+        let (tx, rx) = mpsc::channel();
+        let owned = path.to_path_buf();
+        let decode_path = owned.clone();
+        thread::spawn(move || {
+            let result = image::open(&decode_path).ok();
+            let _ = tx.send(result);
+        });
+        self.pending = Some(PendingDecode {
+            path: owned,
+            rx,
+        });
+
+        // Show previous image (stale but instant) while decoding.
+        self.draw(f, area);
+        self.current.is_some()
+    }
+
+    pub fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    fn draw(&mut self, f: &mut Frame, area: Rect) {
+        if let Some((_, protocol)) = self.current.as_mut() {
+            f.render_stateful_widget(
+                StatefulImage::default().resize(Resize::Fit(None)),
+                area,
+                protocol,
+            );
+        }
     }
 }

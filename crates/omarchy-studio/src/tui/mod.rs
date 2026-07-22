@@ -2673,7 +2673,8 @@ pub fn run() -> i32 {
         // keypress; otherwise this is a blocking read (zero idle wakeups).
         let background_busy = app.update_rx.is_some()
             || app.wallhaven.as_ref().is_some_and(|b| b.busy())
-            || app.community.as_ref().is_some_and(|b| b.busy());
+            || app.community.as_ref().is_some_and(|b| b.busy())
+            || app.images.has_pending();
         if background_busy {
             match event::poll(std::time::Duration::from_millis(250)) {
                 Ok(ready) => {
