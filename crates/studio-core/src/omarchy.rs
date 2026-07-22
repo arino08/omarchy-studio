@@ -275,6 +275,13 @@ pub mod cmds {
         Cmd::new("hyprctl").arg("binds").arg("-j")
     }
 
+    /// Plain-text `hyprctl binds`. Needed because Hyprland 0.56's `-j` writer
+    /// emits malformed JSON (keys and values misaligned, unquoted values), so
+    /// the text form is the only readable keymap on that version.
+    pub fn binds_text() -> Cmd {
+        Cmd::new("hyprctl").arg("binds")
+    }
+
     /// Apply a single setting live, without writing any file — the look & feel
     /// preview primitive. `name` is Hyprland's colon form, e.g.
     /// `decoration:blur:size`. Lost on the next reload (that's the point).

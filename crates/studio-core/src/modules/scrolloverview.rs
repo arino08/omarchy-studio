@@ -170,8 +170,15 @@ fn build_error(stdout: &str, stderr: &str) -> crate::StudioError {
         "Hyprland's plugin headers are missing or out of date. Run `hyprpm update` \
          in a terminal — it needs your password, so Studio can't run it for you."
             .to_string()
-    } else if all.to_lowercase().contains("superuser") {
-        "hyprpm needs your password for this step. Run it in a terminal.".to_string()
+    } else if all.to_lowercase().contains("superuser") || all.contains("failed to create cache dir")
+    {
+        // hyprpm keeps its repos under /var/cache/hyprpm/<user>/, which is
+        // root-owned, so adding a repo escalates. The build itself succeeds
+        // first, which makes this look like a build failure when it isn't.
+        "hyprpm needs your password to install the built plugin \
+         (its cache lives under /var/cache). Run `hyprpm add` in a terminal — \
+         Studio can't answer a sudo prompt."
+            .to_string()
     } else {
         all.lines()
             .map(str::trim)
@@ -419,6 +426,19 @@ mod tests {
         let s = Settings::load(&p);
         assert_eq!(s.scale, 0.8, "the value they set wins");
         assert_eq!(s.layout, "vertical", "the rest fall back to defaults");
+    }
+
+    #[test]
+    fn a_root_owned_cache_says_to_run_it_in_a_terminal() {
+        // The real message from the reference machine: the plugin builds, then
+        // the install step can't write to /var/cache/hyprpm/<user>/.
+        let e = build_error(
+            "✔ built scrolloverview",
+            "[ERR] addNewPluginRepo: failed to create cache dir",
+        );
+        let msg = format!("{e:?}");
+        assert!(msg.contains("password"), "{msg}");
+        assert!(msg.contains("terminal"), "{msg}");
     }
 
     #[test]
