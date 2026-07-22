@@ -2,3 +2,13 @@ target/
 *.log
 .direnv/
 .claude/
+/.aider.conventions.md
+/.github
+/.rtk
+/.serena
+/.tokensave
+/.windsurfrules
+/AGENTS.md
+/CLAUDE.md
+/STACK-SETUP.md
+.whetstone/
