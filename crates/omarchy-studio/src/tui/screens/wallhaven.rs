@@ -95,6 +95,9 @@ pub struct WallhavenBrowser {
     query: Query,
     /// `/`: the search text being edited, replacing `query.q` on Enter.
     input: Option<String>,
+    /// `k`: the API key being typed. Rendered masked — a shoulder-surfable
+    /// credential shouldn't sit on screen in plain text.
+    key_input: Option<String>,
     page: Option<SearchPage>,
     selected: usize,
     ratio_idx: usize,
@@ -144,6 +147,7 @@ impl WallhavenBrowser {
         Self {
             query,
             input: None,
+            key_input: None,
             page: None,
             selected: 0,
             ratio_idx: 0,
@@ -250,6 +254,32 @@ impl WallhavenBrowser {
     }
 
     pub fn handle(&mut self, key: KeyEvent) -> BrowserAction {
+        // API-key entry owns every key while open.
+        if let Some(buf) = self.key_input.as_mut() {
+            match key.code {
+                KeyCode::Enter => {
+                    let entered = self.key_input.take().unwrap_or_default();
+                    match studio_core::modules::wallhaven::save_api_key(&entered) {
+                        Ok(()) => {
+                            self.has_key = !entered.trim().is_empty();
+                            // Re-search so the purity filter takes effect now
+                            // rather than on the next launch.
+                            self.error = None;
+                            self.search();
+                        }
+                        Err(e) => self.error = Some(format!("couldn't save the key: {e:?}")),
+                    }
+                }
+                KeyCode::Esc => self.key_input = None,
+                KeyCode::Backspace => {
+                    buf.pop();
+                }
+                KeyCode::Char(c) => buf.push(c),
+                _ => {}
+            }
+            return BrowserAction::None;
+        }
+
         // Search text entry owns every key while open.
         if let Some(buf) = self.input.as_mut() {
             match key.code {
@@ -275,6 +305,9 @@ impl WallhavenBrowser {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => return BrowserAction::Close,
             KeyCode::Char('/') => self.input = Some(self.query.q.clone()),
+            // Start from empty rather than the stored key: this is a paste
+            // target, and echoing a saved credential back serves no one.
+            KeyCode::Char('k') => self.key_input = Some(String::new()),
             KeyCode::Char('n') => {
                 if let Some(p) = &self.page {
                     if p.meta.current_page < p.meta.last_page {
@@ -409,7 +442,7 @@ impl WallhavenBrowser {
             )
             .title_bottom(
                 Line::from(Span::styled(
-                    " / search · ⏎ set · d save · t theme · s/r/c/P filters · n/p page · esc ",
+                    " / search · ⏎ set · d save · t theme · s/r/c/P filters · k api key · esc ",
                     skin.dim(),
                 ))
                 .right_aligned(),
@@ -428,14 +461,23 @@ impl WallhavenBrowser {
             ])
             .split(inner);
 
-        // Search line: the live input field, or the current query.
-        let q_line = match &self.input {
-            Some(buf) => Line::from(vec![
+        // Search line: key entry while open (same one-line field — showing
+        // both at once would be noise), else the input field or the query.
+        let q_line = match (&self.key_input, &self.input) {
+            (Some(buf), _) => Line::from(vec![
+                Span::styled(" api key ", skin.accent_bold()),
+                // Masked: it's a credential, and this browser is the sort of
+                // thing people screen-share.
+                Span::styled("•".repeat(buf.chars().count()), skin.body()),
+                Span::styled("▏", skin.accent_bold()),
+                Span::styled("  paste, then ⏎ · esc cancels", skin.dim()),
+            ]),
+            (None, Some(buf)) => Line::from(vec![
                 Span::styled(" search ", skin.accent_bold()),
                 Span::styled(buf.clone(), skin.body()),
                 Span::styled("▏", skin.accent_bold()),
             ]),
-            None => Line::from(vec![
+            (None, None) => Line::from(vec![
                 Span::styled(" search ", skin.dim()),
                 Span::styled(
                     if self.query.q.is_empty() {
@@ -657,6 +699,36 @@ mod tests {
         b.has_key = false;
         b.handle(key(KeyCode::Char('P')));
         assert_eq!(b.query.purity, Purity::Sfw);
+    }
+
+    #[test]
+    fn k_opens_key_entry_and_esc_discards_it() {
+        let (mut b, _jobs, _out) = browser();
+        assert!(b.key_input.is_none());
+        b.handle(key(KeyCode::Char('k')));
+        // Starts empty rather than echoing a saved credential back.
+        assert_eq!(b.key_input.as_deref(), Some(""));
+        for c in "abc".chars() {
+            b.handle(key(KeyCode::Char(c)));
+        }
+        assert_eq!(b.key_input.as_deref(), Some("abc"));
+        b.handle(key(KeyCode::Backspace));
+        assert_eq!(b.key_input.as_deref(), Some("ab"));
+        b.handle(key(KeyCode::Esc));
+        assert!(b.key_input.is_none(), "esc must not save");
+    }
+
+    #[test]
+    fn key_entry_swallows_keys_that_would_otherwise_act() {
+        // `d` downloads and `q` closes; while typing a key they're just text.
+        let (mut b, _jobs, _out) = browser();
+        b.handle(key(KeyCode::Char('k')));
+        assert!(matches!(
+            b.handle(key(KeyCode::Char('q'))),
+            BrowserAction::None
+        ));
+        b.handle(key(KeyCode::Char('d')));
+        assert_eq!(b.key_input.as_deref(), Some("qd"));
     }
 
     #[test]
