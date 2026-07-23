@@ -521,6 +521,59 @@ pub fn load_api_key() -> Option<String> {
     api_key_from(&crate::studio_config_dir().join("config.toml"))
 }
 
+/// Write `[wallhaven] api_key` into a Studio `config.toml`, preserving every
+/// other setting in the file (`[targets]`, `[themesync]`, …) — toml_edit keeps
+/// formatting and comments, so hand-written config survives a write from the
+/// TUI. An empty key removes the entry rather than storing `""`.
+pub fn save_api_key_to(config_toml: &Path, key: &str) -> Result<()> {
+    let text = std::fs::read_to_string(config_toml).unwrap_or_default();
+    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| StudioError::ParseFailed {
+        file: config_toml.to_path_buf(),
+        line: None,
+        hint: format!("Studio's own config.toml isn't valid TOML: {e}"),
+    })?;
+    let key = key.trim();
+    if key.is_empty() {
+        // The section may be a `[wallhaven]` table or an inline
+        // `wallhaven = { … }`; clear the key from whichever this file uses.
+        match doc.get_mut("wallhaven") {
+            Some(toml_edit::Item::Table(t)) => {
+                t.remove("api_key");
+            }
+            Some(toml_edit::Item::Value(toml_edit::Value::InlineTable(t))) => {
+                t.remove("api_key");
+            }
+            _ => {}
+        }
+    } else {
+        // Seed a real `[wallhaven]` section when the file has none: indexing
+        // straight into a missing key produces an *inline* table
+        // (`wallhaven = { api_key = "…" }`), which reads back fine but doesn't
+        // match the section style the rest of this config uses.
+        if doc.get("wallhaven").is_none() {
+            doc["wallhaven"] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        doc["wallhaven"]["api_key"] = toml_edit::value(key);
+    }
+    if let Some(parent) = config_toml.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    crate::configfs::atomic_write(config_toml, &doc.to_string())?;
+    // The key is a credential: keep it out of other users' reach. Best-effort,
+    // since a filesystem without unix permissions is not a reason to fail.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(config_toml, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+/// Save the key to the real config location.
+pub fn save_api_key(key: &str) -> Result<()> {
+    save_api_key_to(&crate::studio_config_dir().join("config.toml"), key)
+}
+
 // ------------------------------------------------------------------ client
 
 pub struct Client {
@@ -831,6 +884,61 @@ mod tests {
         assert_eq!(api_key_from(&cfg), Some("abc123".into()));
         std::fs::write(&cfg, "[wallhaven]\napi_key = \"\"\n").unwrap();
         assert_eq!(api_key_from(&cfg), None, "empty key = no key");
+    }
+
+    #[test]
+    fn saving_a_key_round_trips_and_keeps_other_settings() {
+        let dir = tmp_dir("key-save");
+        let cfg = dir.join("config.toml");
+
+        // Writes into a file that doesn't exist yet, as a real section rather
+        // than the inline `wallhaven = { .. }` that indexing alone produces.
+        save_api_key_to(&cfg, "abc123").unwrap();
+        assert_eq!(api_key_from(&cfg), Some("abc123".into()));
+        assert!(
+            std::fs::read_to_string(&cfg)
+                .unwrap()
+                .contains("[wallhaven]"),
+            "expected a [wallhaven] section"
+        );
+
+        // Someone else's settings must survive a key write — the config is
+        // shared with [targets] and [themesync].
+        let text = std::fs::read_to_string(&cfg).unwrap();
+        std::fs::write(
+            &cfg,
+            format!("# my notes\n[themesync]\ntools = [\"fzf\"]\n\n{text}"),
+        )
+        .unwrap();
+        save_api_key_to(&cfg, "  xyz789  ").unwrap();
+        let after = std::fs::read_to_string(&cfg).unwrap();
+        assert_eq!(api_key_from(&cfg), Some("xyz789".into()), "trimmed");
+        assert!(after.contains("# my notes"), "{after}");
+        assert!(after.contains("tools = [\"fzf\"]"), "{after}");
+    }
+
+    #[test]
+    fn saving_an_empty_key_clears_it() {
+        let dir = tmp_dir("key-clear");
+        let cfg = dir.join("config.toml");
+        save_api_key_to(&cfg, "abc123").unwrap();
+        save_api_key_to(&cfg, "   ").unwrap();
+        assert_eq!(api_key_from(&cfg), None);
+        // Cleared, not stored as an empty string that would be sent as a key.
+        assert!(!std::fs::read_to_string(&cfg).unwrap().contains("api_key"));
+    }
+
+    #[test]
+    fn a_broken_config_is_reported_not_overwritten() {
+        let dir = tmp_dir("key-broken");
+        let cfg = dir.join("config.toml");
+        std::fs::write(&cfg, "this is not [ valid toml\n").unwrap();
+        assert!(save_api_key_to(&cfg, "abc123").is_err());
+        // The user's file is left exactly as it was for them to fix.
+        assert_eq!(
+            std::fs::read_to_string(&cfg).unwrap(),
+            "this is not [ valid toml\n"
+        );
     }
 
     /// Live smoke test — network, excluded from CI. Run manually with

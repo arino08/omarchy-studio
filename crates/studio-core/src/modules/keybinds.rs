@@ -114,6 +114,75 @@ pub fn parse_runtime_binds(json: &str) -> Result<Vec<RuntimeBind>> {
     })
 }
 
+/// Parse the plain-text `hyprctl binds` output.
+///
+/// Each bind is a flags line (`bindled`) followed by indented `key: value`
+/// fields, blank-line separated:
+///
+/// ```text
+/// bindled
+/// \tmodmask: 0
+/// \tkey: XF86AudioRaiseVolume
+/// \tdispatcher: exec
+/// \targ: omarchy-swayosd-client --output-volume raise
+/// ```
+///
+/// Only the fields [`RuntimeBind`] carries are read; anything else is ignored,
+/// so a future Hyprland adding fields doesn't break this.
+pub fn parse_runtime_binds_text(text: &str) -> Vec<RuntimeBind> {
+    let mut out = Vec::new();
+    let mut cur: Option<RuntimeBind> = None;
+    let flush = |cur: &mut Option<RuntimeBind>, out: &mut Vec<RuntimeBind>| {
+        if let Some(b) = cur.take() {
+            // A bind with neither a key nor a keycode isn't one.
+            if !b.key.is_empty() || b.keycode != 0 {
+                out.push(b);
+            }
+        }
+    };
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        // Unindented line = the directive keyword, starting a new bind.
+        if !line.starts_with([' ', '\t']) {
+            flush(&mut cur, &mut out);
+            if line.trim_end().starts_with("bind") {
+                cur = Some(RuntimeBind {
+                    modmask: 0,
+                    key: String::new(),
+                    keycode: 0,
+                    dispatcher: String::new(),
+                    arg: String::new(),
+                    submap: String::new(),
+                    description: String::new(),
+                    locked: false,
+                    release: false,
+                    repeat: false,
+                });
+            }
+            continue;
+        }
+        let Some(b) = cur.as_mut() else { continue };
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
+        let v = v.trim();
+        match k.trim() {
+            "modmask" => b.modmask = v.parse().unwrap_or(0),
+            "key" => b.key = v.to_string(),
+            "keycode" => b.keycode = v.parse().unwrap_or(0),
+            "description" => b.description = v.to_string(),
+            "dispatcher" => b.dispatcher = v.to_string(),
+            "arg" => b.arg = v.to_string(),
+            "submap" => b.submap = v.to_string(),
+            _ => {}
+        }
+    }
+    flush(&mut cur, &mut out);
+    out
+}
+
 /// A `bind* = MODS, KEY, DISPATCHER, ARG…` line, parsed from a config file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigBind {
@@ -428,7 +497,24 @@ pub fn load_effective(
             },
         });
     }
-    let runtime = parse_runtime_binds(&out.stdout)?;
+    // Hyprland 0.56's `hyprctl binds -j` emits invalid JSON (an upstream bug:
+    // keys and values are misaligned and some values are unquoted). The plain
+    // text form is correct, so fall back to it rather than leaving the whole
+    // Keybinds screen dead on that version.
+    let runtime = match parse_runtime_binds(&out.stdout) {
+        Ok(b) => b,
+        Err(json_err) => {
+            let text = runner.run(&crate::omarchy::cmds::binds_text())?;
+            if !text.ok() {
+                return Err(json_err);
+            }
+            let parsed = parse_runtime_binds_text(&text.stdout);
+            if parsed.is_empty() {
+                return Err(json_err);
+            }
+            parsed
+        }
+    };
 
     // Source layers, lowest priority first. Defaults live under $OMARCHY_PATH.
     let mut docs: Vec<(Layer, HyprDoc)> = Vec::new();
@@ -540,13 +626,29 @@ pub fn install_marked(
     store: &crate::snapshot::SnapshotStore,
     runner: &dyn crate::cmd::CommandRunner,
 ) -> Result<ConfigBind> {
+    install_marked_dispatch(paths, desc, mods, key, "exec", exec, store, runner)
+}
+
+/// As [`install_marked`], but for a bind that isn't `exec` — a plugin
+/// dispatcher such as `scrolloverview:overview, toggle`.
+#[allow(clippy::too_many_arguments)]
+pub fn install_marked_dispatch(
+    paths: &OmarchyPaths,
+    desc: &str,
+    mods: &str,
+    key: &str,
+    dispatcher: &str,
+    arg: &str,
+    store: &crate::snapshot::SnapshotStore,
+    runner: &dyn crate::cmd::CommandRunner,
+) -> Result<ConfigBind> {
     let bind = ConfigBind {
         flags: "bindd".into(),
         modmask: mods_to_mask(mods),
         key: key.to_string(),
         description: Some(desc.to_string()),
-        dispatcher: "exec".into(),
-        arg: exec.to_string(),
+        dispatcher: dispatcher.to_string(),
+        arg: arg.to_string(),
     };
     let mut overrides: Vec<Override> = read_overrides(paths)
         .into_iter()
@@ -881,5 +983,55 @@ mod tests {
                 .unwrap();
         assert_eq!(back.description, vol.description);
         assert_eq!(back.arg, vol.arg);
+    }
+    /// Real `hyprctl binds` text from Hyprland 0.56, whose `-j` writer is
+    /// broken — this is the only readable keymap on that version.
+    const BINDS_TEXT: &str = "bindled\n\
+\tmodmask: 0\n\
+\tsubmap: \n\
+\tkey: XF86AudioRaiseVolume\n\
+\tkeycode: 0\n\
+\tcatchall: false\n\
+\tdescription: Volume up\n\
+\tdispatcher: exec\n\
+\targ: omarchy-swayosd-client --output-volume raise\n\
+\n\
+bindd\n\
+\tmodmask: 64\n\
+\tsubmap: \n\
+\tkey: Q\n\
+\tkeycode: 0\n\
+\tcatchall: false\n\
+\tdescription: Close window\n\
+\tdispatcher: killactive\n\
+\targ: \n";
+
+    #[test]
+    fn parses_the_plain_text_keymap_hyprland_056_forces_us_to_use() {
+        let binds = parse_runtime_binds_text(BINDS_TEXT);
+        assert_eq!(binds.len(), 2);
+
+        assert_eq!(binds[0].key, "XF86AudioRaiseVolume");
+        assert_eq!(binds[0].modmask, 0);
+        assert_eq!(binds[0].dispatcher, "exec");
+        assert_eq!(binds[0].arg, "omarchy-swayosd-client --output-volume raise");
+        assert_eq!(binds[0].description, "Volume up");
+
+        // Modifiers survive, so the chord renders the way the screen shows it.
+        assert_eq!(binds[1].modmask, mods::SUPER);
+        assert_eq!(binds[1].chord(), "SUPER+Q");
+        assert_eq!(binds[1].dispatcher, "killactive");
+    }
+
+    #[test]
+    fn text_parsing_ignores_junk_and_unknown_fields() {
+        // A future Hyprland adding fields must not break this, and a stray
+        // header line isn't a bind.
+        let odd =
+            "Bind list:\nbindd\n\tmodmask: 64\n\tkey: T\n\tsome_new_field: 1\n\tdispatcher: exec\n";
+        let binds = parse_runtime_binds_text(odd);
+        assert_eq!(binds.len(), 1);
+        assert_eq!(binds[0].key, "T");
+        assert!(parse_runtime_binds_text("").is_empty());
     }
 }

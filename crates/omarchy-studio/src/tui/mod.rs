@@ -21,6 +21,7 @@ mod screens {
     pub mod lockidle;
     pub mod looknfeel;
     pub mod monitors;
+    pub mod niri;
     pub mod notifications;
     pub mod nova;
     pub mod onboarding;
@@ -57,6 +58,7 @@ use screens::keybinds::{KeybindAction, KeybindsScreen};
 use screens::lockidle::{LockIdleAction, LockIdleScreen};
 use screens::looknfeel::{LookFeelAction, LookFeelScreen};
 use screens::monitors::{MonitorsAction, MonitorsScreen};
+use screens::niri::{NiriAction, NiriScreen};
 use screens::notifications::{NotifAction, NotificationsScreen};
 use screens::nova::{NovaAction, NovaScreen};
 use screens::onboarding::{self, OnboardingAction, OnboardingScreen};
@@ -87,11 +89,12 @@ enum Screen {
     Tweaks,
     Battery,
     Nova,
+    Niri,
     Doctor,
 }
 
 impl Screen {
-    const ALL: [Screen; 16] = [
+    const ALL: [Screen; 17] = [
         Screen::Themes,
         Screen::Wallpapers,
         Screen::Keybinds,
@@ -107,6 +110,7 @@ impl Screen {
         Screen::Tweaks,
         Screen::Battery,
         Screen::Nova,
+        Screen::Niri,
         Screen::Doctor,
     ];
 
@@ -127,6 +131,7 @@ impl Screen {
             Screen::Tweaks => "Tweaks",
             Screen::Battery => "Power",
             Screen::Nova => "Nice Launcher",
+            Screen::Niri => "Niri Mode",
             Screen::Doctor => "Doctor",
         }
     }
@@ -165,6 +170,7 @@ struct App {
     tweaks: TweaksScreen,
     battery: BatteryScreen,
     nova: NovaScreen,
+    niri: NiriScreen,
     doctor: DoctorScreen,
     integrations: IntegrationsScreen,
     wallpapers: WallpapersScreen,
@@ -227,6 +233,7 @@ impl App {
         let tweaks = TweaksScreen::load(&paths);
         let battery = BatteryScreen::load();
         let nova = NovaScreen::load(&paths);
+        let niri = NiriScreen::load(&paths, &RealRunner);
         let integrations = IntegrationsScreen::load(&RealRunner);
         let mut doctor = DoctorScreen::load(&paths, &RealRunner);
         doctor.set_graphics(images.protocol_label());
@@ -280,6 +287,7 @@ impl App {
             tweaks,
             battery,
             nova,
+            niri,
             doctor,
             integrations,
             wallpapers,
@@ -728,6 +736,13 @@ impl App {
                     });
                 }
             },
+            Screen::Niri => match self.niri.handle(key) {
+                NiriAction::None => {}
+                NiriAction::Save => self.niri_save(),
+                NiriAction::Source => self.niri_source(),
+                NiriAction::Bind => self.niri_bind(),
+                NiriAction::NavBinds(on) => self.niri_nav_binds(on),
+            },
             Screen::Nova => match self.nova.handle(key) {
                 NovaAction::None => {}
                 NovaAction::Apply => self.nova_apply(),
@@ -1161,6 +1176,189 @@ impl App {
                     ok: false,
                 });
             }
+        }
+    }
+
+    /// Persist the overview settings through the apply pipeline.
+    fn niri_save(&mut self) {
+        let Some(store) = self.history_or_toast() else {
+            return;
+        };
+        // The window layout lives in the Look & Feel schema — one writer for
+        // `general.layout`, so the two screens can't fight over it.
+        let mut lf = studio_core::modules::looknfeel::LookFeel::load(&self.paths);
+        let mode = self.niri.mode().to_string();
+        let switching = lf.value("general.layout") != mode;
+        if switching && lf.set("general.layout", &mode).is_err() {
+            self.toast = Some(Toast {
+                text: format!("`{mode}` isn't a layout this Hyprland knows"),
+                ok: false,
+            });
+            return;
+        }
+        if switching {
+            if let Err(e) = lf.apply(&self.paths, &store, &RealRunner, &format!("layout {mode}")) {
+                self.toast = Some(self.apply_toast(e, "layout"));
+                return;
+            }
+        }
+        let settings = self.niri.settings().clone();
+        match settings.apply(&self.paths, &store, &RealRunner) {
+            Ok(()) => {
+                self.niri.reload(&self.paths, &RealRunner);
+                self.toast = Some(Toast {
+                    text: if switching && mode == "scrolling" {
+                        "Niri mode on · SUPER+←/→ scrolls · undo from Snapshots".into()
+                    } else if switching {
+                        "Back to Hyprland tiling · undo from Snapshots".into()
+                    } else {
+                        "Saved overview settings · undo from Snapshots".into()
+                    },
+                    ok: true,
+                });
+            }
+            Err(e) => self.toast = Some(self.apply_toast(e, "overview settings")),
+        }
+    }
+
+    /// Write the `source =` line (with the settings file, in one apply).
+    fn niri_source(&mut self) {
+        let Some(store) = self.history_or_toast() else {
+            return;
+        };
+        match studio_core::modules::scrolloverview::ensure_sourced(&self.paths, &store, &RealRunner)
+        {
+            Ok(_) => {
+                self.niri.reload(&self.paths, &RealRunner);
+                self.toast = Some(Toast {
+                    text: "Your overview settings now load with Hyprland".into(),
+                    ok: true,
+                });
+            }
+            Err(e) => self.toast = Some(self.apply_toast(e, "hyprland.conf")),
+        }
+    }
+
+    /// Bind the overview toggle, picking a chord that isn't already taken.
+    fn niri_bind(&mut self) {
+        use studio_core::modules::keybinds::{install_marked_dispatch, render_chord};
+        use studio_core::modules::scrolloverview as sco;
+        let Some(store) = self.history_or_toast() else {
+            return;
+        };
+        // SUPER+G is what the plugin's README suggests, but Omarchy already
+        // uses it for window grouping — walk to the first free chord instead
+        // of quietly stealing one.
+        let taken = |chord: &str| -> bool {
+            studio_core::modules::keybinds::load_effective(&self.paths, &RealRunner)
+                .map(|binds| {
+                    binds
+                        .iter()
+                        .any(|b| b.runtime.chord().eq_ignore_ascii_case(chord))
+                })
+                .unwrap_or(false)
+        };
+        let Some((mods, key)) = [
+            ("SUPER", "GRAVE"),
+            ("SUPER", "G"),
+            ("SUPER", "O"),
+            ("SUPER SHIFT", "GRAVE"),
+        ]
+        .into_iter()
+        .find(|(m, k)| {
+            !taken(&render_chord(
+                studio_core::modules::keybinds::mods_to_mask(m),
+                k,
+            ))
+        }) else {
+            self.toast = Some(Toast {
+                text: "every suggested chord is taken — use `niri keybind MODS KEY`".into(),
+                ok: false,
+            });
+            return;
+        };
+        match install_marked_dispatch(
+            &self.paths,
+            "Toggle overview",
+            mods,
+            key,
+            &format!("{}:overview", sco::PLUGIN),
+            "toggle",
+            &store,
+            &RealRunner,
+        ) {
+            Ok(b) => {
+                self.niri.reload(&self.paths, &RealRunner);
+                self.toast = Some(Toast {
+                    text: format!("{} toggles the overview", render_chord(b.modmask, &b.key)),
+                    ok: true,
+                });
+            }
+            Err(e) => self.toast = Some(self.apply_toast(e, "keybinds")),
+        }
+    }
+
+    /// Install or remove the scrolling-navigation binds.
+    fn niri_nav_binds(&mut self, on: bool) {
+        let Some(store) = self.history_or_toast() else {
+            return;
+        };
+        match studio_core::modules::scrolloverview::set_nav_binds(
+            &self.paths,
+            on,
+            &store,
+            &RealRunner,
+        ) {
+            Ok(n) => {
+                self.niri.reload(&self.paths, &RealRunner);
+                self.toast = Some(Toast {
+                    text: if on {
+                        format!("{n} binds installed · SUPER+←/→ now scrolls")
+                    } else {
+                        "Removed — Omarchy's own arrow binds are back".into()
+                    },
+                    ok: true,
+                });
+            }
+            Err(e) => self.toast = Some(self.apply_toast(e, "keybinds")),
+        }
+    }
+
+    /// The snapshot store, or a toast explaining why we won't apply without it.
+    fn history_or_toast(&mut self) -> Option<SnapshotStore> {
+        match SnapshotStore::open_or_init(
+            studio_core::studio_state_dir().join("history"),
+            Box::new(RealRunner),
+        ) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                self.toast = Some(Toast {
+                    text: format!("no change history, not applying: {}", brief(e)),
+                    ok: false,
+                });
+                None
+            }
+        }
+    }
+
+    /// Render a failed apply the way the other screens do: a rollback that
+    /// worked is reassuring, one that didn't must shout.
+    fn apply_toast(&self, e: studio_core::StudioError, what: &str) -> Toast {
+        match e {
+            studio_core::StudioError::VerifyFailed { rolled_back, .. } => {
+                Toast {
+                    text: if rolled_back {
+                        format!("Hyprland rejected that — your previous {what} is back")
+                    } else {
+                        format!("Hyprland rejected that AND the rollback failed — see Snapshots ({what})")
+                    },
+                    ok: false,
+                }
+            }
+            other => Toast {
+                text: format!("{what}: {}", brief(other)),
+                ok: false,
+            },
         }
     }
 
@@ -2277,6 +2475,7 @@ impl App {
             Screen::Tweaks => self.tweaks.render(f, area, &self.skin),
             Screen::Battery => self.battery.render(f, area, &self.skin),
             Screen::Nova => self.nova.render(f, area, &self.skin),
+            Screen::Niri => self.niri.render(f, area, &self.skin),
             Screen::Doctor => self.doctor.render(f, area, &self.skin),
         }
     }
@@ -2313,6 +2512,7 @@ impl App {
                     Screen::Monitors => (format!("{} · esc back", self.monitors.hint()), true),
                     Screen::Tweaks => (format!("{} · esc back", self.tweaks.hint()), true),
                     Screen::Nova => (format!("{} · esc back", self.nova.hint()), true),
+                    Screen::Niri => (format!("{} · esc back", self.niri.hint()), true),
                     Screen::Snapshots => (format!("{} · esc back", self.snapshots.hint()), true),
                     _ => ("esc back".into(), true),
                 },
@@ -2535,7 +2735,7 @@ impl CommandPalette {
 }
 
 /// One-line rendering of a core error for a toast (no debug spew).
-fn brief(e: studio_core::StudioError) -> String {
+pub(crate) fn brief(e: studio_core::StudioError) -> String {
     use studio_core::StudioError::*;
     match e {
         External { detail, .. } => detail,

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use crate::cmd::{find_in_path, Cmd, CommandRunner};
 
 /// Resolved Omarchy locations (spec 02 §1).
+#[derive(Debug, Clone)]
 pub struct OmarchyPaths {
     /// `~/.local/share/omarchy` — `$OMARCHY_PATH`. READ-ONLY, always.
     pub system: PathBuf,
@@ -272,6 +273,13 @@ pub mod cmds {
     /// Effective keybinds as JSON — ground truth for the keybinds screen.
     pub fn binds_json() -> Cmd {
         Cmd::new("hyprctl").arg("binds").arg("-j")
+    }
+
+    /// Plain-text `hyprctl binds`. Needed because Hyprland 0.56's `-j` writer
+    /// emits malformed JSON (keys and values misaligned, unquoted values), so
+    /// the text form is the only readable keymap on that version.
+    pub fn binds_text() -> Cmd {
+        Cmd::new("hyprctl").arg("binds")
     }
 
     /// Apply a single setting live, without writing any file — the look & feel

@@ -34,6 +34,8 @@ enum RowKind {
 }
 
 pub struct LockIdleScreen {
+    /// Kept so the avatar import can resolve the picker directory.
+    paths: OmarchyPaths,
     idle: Option<Hypridle>,
     lock: Option<Hyprlock>,
     timeline: Vec<Listener>,
@@ -43,6 +45,10 @@ pub struct LockIdleScreen {
     pub dirty: bool,
     /// Avatar picker overlay: Some(index) while open.
     picker: Option<usize>,
+    /// `i` in the picker: the path being typed for an image to import.
+    import: Option<String>,
+    /// Result of the last import, shown in the picker.
+    import_msg: Option<String>,
 }
 
 impl LockIdleScreen {
@@ -57,6 +63,7 @@ impl LockIdleScreen {
             None
         };
         Self {
+            paths: paths.clone(),
             idle,
             lock,
             timeline,
@@ -65,6 +72,8 @@ impl LockIdleScreen {
             selected: 0,
             dirty: false,
             picker: None,
+            import: None,
+            import_msg: None,
         }
     }
 
@@ -107,11 +116,13 @@ impl LockIdleScreen {
         match key.code {
             KeyCode::Right | KeyCode::Char('+') | KeyCode::Char('=') => self.nudge(1),
             KeyCode::Left | KeyCode::Char('-') => self.nudge(-1),
-            KeyCode::Enter
-                if matches!(self.rows().get(self.selected), Some(RowKind::Avatar))
-                    && !self.avatars.is_empty() =>
-            {
+            // Opens even with nothing to pick: the picker is where `i` imports
+            // an image, so an empty collection has to be reachable — otherwise
+            // Enter on the Avatar row silently does nothing and there is no
+            // way in at all.
+            KeyCode::Enter if matches!(self.rows().get(self.selected), Some(RowKind::Avatar)) => {
                 self.picker = Some(0);
+                self.import_msg = None;
             }
             KeyCode::Char('s') if self.dirty => return LockIdleAction::Save,
             _ => {}
@@ -166,25 +177,72 @@ impl LockIdleScreen {
     }
 
     fn handle_picker(&mut self, key: KeyEvent) -> LockIdleAction {
+        // Path entry owns every key while open.
+        if let Some(buf) = self.import.as_mut() {
+            match key.code {
+                KeyCode::Enter => {
+                    let typed = self.import.take().unwrap_or_default();
+                    self.do_import(&typed);
+                }
+                KeyCode::Esc => self.import = None,
+                KeyCode::Backspace => {
+                    buf.pop();
+                }
+                KeyCode::Char(c) => buf.push(c),
+                _ => {}
+            }
+            return LockIdleAction::None;
+        }
+
         let Some(sel) = self.picker.as_mut() else {
             return LockIdleAction::None;
         };
         match key.code {
-            KeyCode::Esc => self.picker = None,
-            KeyCode::Down => *sel = (*sel + 1).min(self.avatars.len() - 1),
+            KeyCode::Esc => {
+                self.picker = None;
+                self.import_msg = None;
+            }
+            KeyCode::Char('i') => self.import = Some(String::new()),
+            // `len() - 1` underflows on an empty collection, which the picker
+            // can now be opened with.
+            KeyCode::Down => *sel = (*sel + 1).min(self.avatars.len().saturating_sub(1)),
             KeyCode::Up => *sel = sel.saturating_sub(1),
             KeyCode::Enter => {
-                let choice = self.avatars[*sel].display().to_string();
-                if let Some(lock) = self.lock.as_mut() {
-                    if lock.set_avatar(&choice) {
-                        self.dirty = true;
+                if let Some(choice) = self.avatars.get(*sel).map(|p| p.display().to_string()) {
+                    if let Some(lock) = self.lock.as_mut() {
+                        if lock.set_avatar(&choice) {
+                            self.dirty = true;
+                        }
                     }
+                    self.picker = None;
+                    self.import_msg = None;
                 }
-                self.picker = None;
             }
             _ => {}
         }
         LockIdleAction::None
+    }
+
+    /// Copy an image into the avatar collection and select it, so importing is
+    /// one step rather than import-then-find-it.
+    fn do_import(&mut self, typed: &str) {
+        match Hyprlock::import_avatar(&self.paths, typed) {
+            Ok(dest) => {
+                self.avatars = Hyprlock::avatar_choices(&self.paths);
+                let name = dest
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                if let Some(lock) = self.lock.as_mut() {
+                    if lock.set_avatar(&dest.display().to_string()) {
+                        self.dirty = true;
+                    }
+                }
+                self.picker = self.avatars.iter().position(|p| *p == dest).or(Some(0));
+                self.import_msg = Some(format!("added {name} — s saves"));
+            }
+            Err(e) => self.import_msg = Some(format!("couldn't import: {}", crate::tui::brief(e))),
+        }
     }
 
     // IO delegated from the App.
@@ -280,32 +338,60 @@ impl LockIdleScreen {
     }
 
     fn render_picker(&self, f: &mut Frame, area: Rect, skin: &Skin, sel: usize) {
-        let rect = crate::tui::ui::centered_rect(area, 60, self.avatars.len() as u16 + 2);
+        // Room for the list, plus the import field and any message.
+        let rows = self.avatars.len().max(1) as u16 + 4;
+        let rect = crate::tui::ui::centered_rect(area, 64, rows);
         f.render_widget(Clear, rect);
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(skin.accent_bold())
-            .title(" Pick an avatar — Enter, Esc to cancel ");
+            .title(" Avatar — ⏎ pick · i add an image · esc ");
         let inner = block.inner(rect);
         f.render_widget(block, rect);
-        let items: Vec<ListItem> = self
-            .avatars
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                let on = i == sel;
-                let name = p
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                let style = if on { skin.selection() } else { skin.body() };
-                ListItem::new(Line::from(vec![
-                    Span::styled(if on { "▸ " } else { "  " }, skin.accent_bold()),
-                    Span::styled(name, style),
-                ]))
-            })
-            .collect();
-        f.render_widget(List::new(items), inner);
+
+        let mut lines: Vec<Line> = Vec::new();
+        if self.avatars.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  No images yet — press i to add one",
+                skin.dim(),
+            )));
+        }
+        for (i, p) in self.avatars.iter().enumerate() {
+            let on = i == sel;
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            lines.push(Line::from(vec![
+                Span::styled(if on { "▸ " } else { "  " }, skin.accent_bold()),
+                Span::styled(name, if on { skin.selection() } else { skin.body() }),
+            ]));
+        }
+
+        lines.push(Line::from(""));
+        match &self.import {
+            Some(buf) => lines.push(Line::from(vec![
+                Span::styled("  image ", skin.accent_bold()),
+                Span::styled(buf.clone(), skin.body()),
+                Span::styled("▏", skin.accent_bold()),
+            ])),
+            None => {
+                if let Some(msg) = &self.import_msg {
+                    let style = if msg.starts_with("couldn't") {
+                        skin.error()
+                    } else {
+                        skin.ok()
+                    };
+                    lines.push(Line::from(Span::styled(format!("  {msg}"), style)));
+                } else {
+                    lines.push(Line::from(Span::styled(
+                        "  i — add a PNG, JPEG or WebP from anywhere",
+                        skin.dim(),
+                    )));
+                }
+            }
+        }
+        f.render_widget(Paragraph::new(lines), inner);
     }
 }
 

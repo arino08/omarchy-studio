@@ -110,7 +110,7 @@ fn cli() -> Command {
             "usage:\n  \
              idle timeline\n  \
              idle set <screensaver|lock|screen-off|suspend> <seconds>"))
-        .subcommand(group("lock", "Lock screen appearance", "usage: omarchy-studio lock show | avatar <path> | avatar list | size <px> | blur <n>"))
+        .subcommand(group("lock", "Lock screen appearance", "usage: omarchy-studio lock show | avatar <path> | avatar add <file> | avatar list | size <px> | blur <n>"))
         .subcommand(group("monitor", "Displays: layout, scale, primary, identify",
             "usage:\n  \
              monitor list | identify\n  \
@@ -129,6 +129,7 @@ fn cli() -> Command {
         .subcommand(group("battery", "Battery status and charge limits", "usage: omarchy-studio battery [status] | limit <start> <stop> [--persist]"))
         .subcommand(group("target", "Point Studio at configs outside the default paths",
             "usage: omarchy-studio target list | set <key> <path> | reset <key>"))
+        .subcommand(group("niri", "Niri-style scrolling overview (ScrollOverview by yayuuu)", "usage: omarchy-studio niri status | install | on | off | source | set <key> <value> | keybind [MODS KEY]\n   keys: scale layout workspace_gap blur gesture_distance"))
         .subcommand(group("nova", "Nice Launcher: config, keybind, install", "usage: omarchy-studio nova show | set <key> <value> | keybind [MODS KEY] | install | uninstall | launch"))
         .subcommand(group("hooks", "Studio's theme-set and post-update hooks", "usage: omarchy-studio hooks install | remove | status"))
         .subcommand(group("update", "Update Studio itself", "usage: omarchy-studio update [--check]"))
@@ -215,6 +216,7 @@ fn dispatch(argv: &[&str]) -> i32 {
         ["waybar", rest @ ..] => waybar(rest),
         ["notif", rest @ ..] => notif(rest),
         ["osd", rest @ ..] => osd(rest),
+        ["niri", rest @ ..] => niri(rest),
         ["nova", rest @ ..] => nova(rest),
         ["keybind", rest @ ..] => keybind_cli(rest),
         ["idle", rest @ ..] => idle(rest),
@@ -1918,6 +1920,173 @@ fn keybind_reset(paths: &OmarchyPaths) -> i32 {
     keybind_write(paths, &[], &format!("reset {count} keybind override(s)"))
 }
 
+// ── niri mode (ScrollOverview plugin by yayuuu, BSD-3) ───────────────────────
+
+/// Drive the ScrollOverview plugin: the niri-style overview Hyprland's own
+/// `scrolling` layout doesn't really replace.
+///
+/// Studio never vendors or patches the plugin — it drives `hyprpm`, the
+/// official plugin manager, exactly as the plugin's README documents.
+fn niri(args: &[&str]) -> i32 {
+    use studio_core::modules::scrolloverview as sco;
+    let Some(paths) = omarchy() else { return 4 };
+
+    match args {
+        [] | ["status"] => {
+            let state = sco::state(&RealRunner);
+            println!("ScrollOverview  {}", state.label());
+            println!("  by {} · {} · {}", sco::AUTHOR, sco::LICENSE, sco::REPO);
+            if state == sco::State::NoHyprpm {
+                println!("\nhyprpm is Hyprland's plugin manager and ships with Hyprland.");
+                return 1;
+            }
+            let s = sco::Settings::load(&paths);
+            println!("\nsettings");
+            println!("  scale             {:.2}", s.scale);
+            println!("  layout            {}", s.layout);
+            println!("  workspace_gap     {}", s.workspace_gap);
+            println!("  blur              {}", s.blur);
+            println!("  gesture_distance  {}", s.gesture_distance);
+            if !sco::is_sourced(&paths) && state != sco::State::NotAdded {
+                println!("\nnote: hyprland.conf doesn't source the settings file yet:");
+                println!("  {}", sco::source_line(&paths));
+            }
+            0
+        }
+        ["install"] => {
+            // Compiles C++ against the Hyprland headers; minutes, not seconds.
+            println!(
+                "building the plugin (this compiles against Hyprland — give it a few minutes)…"
+            );
+            match sco::add(&RealRunner) {
+                Ok(msg) => {
+                    println!("{msg} · turn it on with `omarchy-studio niri on`");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("{}", brief(e));
+                    1
+                }
+            }
+        }
+        ["source"] => {
+            let store = match history() {
+                Ok(st) => st,
+                Err(code) => return code,
+            };
+            match sco::ensure_sourced(&paths, &store, &RealRunner) {
+                Ok(true) => {
+                    println!("hyprland.conf now sources the overview settings");
+                    0
+                }
+                Ok(false) => {
+                    println!("already sourced");
+                    0
+                }
+                Err(e) => report_apply_error(e, "hyprland.conf was"),
+            }
+        }
+        ["on"] | ["off"] => {
+            let on = args[0] == "on";
+            match sco::set_enabled(&RealRunner, on) {
+                Ok(msg) => {
+                    println!("{msg}");
+                    if on && !sco::is_sourced(&paths) {
+                        println!("tip: run `omarchy-studio niri source` so your settings apply");
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("{}", brief(e));
+                    1
+                }
+            }
+        }
+        ["set", key, value] => {
+            let mut s = sco::Settings::load(&paths);
+            let bad = |what: &str| -> i32 {
+                eprintln!("{what}");
+                2
+            };
+            match *key {
+                "scale" => match value.parse::<f64>() {
+                    Ok(f) if (0.1..=0.9).contains(&f) => s.scale = f,
+                    _ => return bad("scale must be between 0.1 and 0.9"),
+                },
+                "layout" => match *value {
+                    "vertical" | "horizontal" => s.layout = value.to_string(),
+                    _ => return bad("layout must be vertical or horizontal"),
+                },
+                "workspace_gap" => match value.parse::<i64>() {
+                    Ok(n) if (0..=1000).contains(&n) => s.workspace_gap = n,
+                    _ => return bad("workspace_gap must be 0–1000"),
+                },
+                "gesture_distance" => match value.parse::<i64>() {
+                    Ok(n) if (50..=2000).contains(&n) => s.gesture_distance = n,
+                    _ => return bad("gesture_distance must be 50–2000"),
+                },
+                "blur" => match *value {
+                    "true" | "false" => s.blur = *value == "true",
+                    _ => return bad("blur must be true or false"),
+                },
+                _ => return bad(&format!("unknown setting `{key}` — see `niri status`")),
+            }
+            let store = match history() {
+                Ok(st) => st,
+                Err(code) => return code,
+            };
+            match s.apply(&paths, &store, &RealRunner) {
+                Ok(()) => {
+                    println!("{key} = {value} · undo with `omarchy-studio snapshot undo`");
+                    if !sco::is_sourced(&paths) {
+                        println!("add this to hyprland.conf for it to take effect:");
+                        println!("  {}", sco::source_line(&paths));
+                    }
+                    0
+                }
+                Err(e) => report_apply_error(e, "overview settings were"),
+            }
+        }
+        ["keybind", chord @ ..] => {
+            use studio_core::modules::keybinds::{install_marked_dispatch, render_chord};
+            let (mods, key) = match chord {
+                [] => ("SUPER", "G"),
+                [m, k] => (*m, *k),
+                _ => {
+                    eprintln!("usage: niri keybind [MODS KEY]   (e.g. SUPER G)");
+                    return 2;
+                }
+            };
+            let store = match history() {
+                Ok(st) => st,
+                Err(code) => return code,
+            };
+            // The plugin's own dispatcher, exactly as its README documents —
+            // not an `exec`, so it needs the dispatch variant.
+            match install_marked_dispatch(
+                &paths,
+                "Toggle overview",
+                mods,
+                key,
+                &format!("{}:overview", sco::PLUGIN),
+                "toggle",
+                &store,
+                &RealRunner,
+            ) {
+                Ok(b) => {
+                    println!("{} toggles the overview", render_chord(b.modmask, &b.key));
+                    0
+                }
+                Err(e) => report_apply_error(e, "keybinds were"),
+            }
+        }
+        _ => {
+            eprintln!("usage: omarchy-studio niri status | install | on | off | set <key> <value> | keybind [MODS KEY]");
+            2
+        }
+    }
+}
+
 // ── nova ────────────────────────────────────────────────────────────────────
 
 fn nova(args: &[&str]) -> i32 {
@@ -2289,6 +2458,20 @@ fn lock(args: &[&str]) -> i32 {
     use studio_core::modules::lockidle::Hyprlock;
     let Some(paths) = omarchy() else { return 4 };
 
+    if let ["avatar", "add", src] = args {
+        // Copies into the picker directory so the TUI offers it too.
+        return match Hyprlock::import_avatar(&paths, src) {
+            Ok(dest) => {
+                println!("added {}", dest.display());
+                println!("set it with: omarchy-studio lock avatar {}", dest.display());
+                0
+            }
+            Err(e) => {
+                eprintln!("couldn't import: {}", brief(e));
+                1
+            }
+        };
+    }
     if let ["avatar", "list"] = args {
         let choices = Hyprlock::avatar_choices(&paths);
         if choices.is_empty() {
