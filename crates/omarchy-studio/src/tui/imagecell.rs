@@ -138,10 +138,7 @@ impl ImageCell {
             let result = image::open(&decode_path).ok();
             let _ = tx.send(result);
         });
-        self.pending = Some(PendingDecode {
-            path: owned,
-            rx,
-        });
+        self.pending = Some(PendingDecode { path: owned, rx });
 
         // Show previous image (stale but instant) while decoding.
         self.draw(f, area);
