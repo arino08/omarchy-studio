@@ -88,7 +88,8 @@ pub struct NiriScreen {
     /// scrolling is "niri mode".
     mode: String,
     settings: Settings,
-    sourced: bool,
+    /// Both the source line and the boot-autoload are in place.
+    set_up: bool,
     /// The chord bound to the overview, if Studio installed one.
     bind: Option<String>,
     /// Are the scroll-navigation binds in place?
@@ -103,7 +104,7 @@ impl NiriScreen {
             state: sco::state(runner),
             mode: studio_core::modules::looknfeel::LookFeel::load(paths).value("general.layout"),
             settings: Settings::load(paths),
-            sourced: sco::is_sourced(paths),
+            set_up: sco::is_sourced(paths) && sco::autoloads(paths),
             bind: current_bind(paths),
             nav: sco::nav_binds_installed(paths),
             selected: 0,
@@ -131,8 +132,8 @@ impl NiriScreen {
         if self.dirty {
             parts.push("s save");
         }
-        if !self.sourced {
-            parts.push("o source it");
+        if !self.set_up {
+            parts.push("o finish setup");
         }
         if self.bind.is_none() {
             parts.push("b bind");
@@ -153,7 +154,7 @@ impl NiriScreen {
             KeyCode::Right | KeyCode::Char('+') | KeyCode::Char('=') => self.nudge(1),
             KeyCode::Left | KeyCode::Char('-') => self.nudge(-1),
             KeyCode::Char('s') if self.dirty => return NiriAction::Save,
-            KeyCode::Char('o') if !self.sourced => return NiriAction::Source,
+            KeyCode::Char('o') if !self.set_up => return NiriAction::Source,
             KeyCode::Char('b') => return NiriAction::Bind,
             KeyCode::Char('n') => return NiriAction::NavBinds(!self.nav),
             _ => {}
@@ -281,8 +282,10 @@ impl NiriScreen {
             )),
             State::Enabled => {}
         }
-        if !self.sourced {
-            v.push("your settings aren't sourced yet — press o".into());
+        if !self.set_up {
+            // The reboot trap: enabled but not loaded on boot sprays config
+            // errors until something loads the plugin.
+            v.push("not fully set up — press o so it loads on boot".into());
         }
         // The single most confusing thing about the scrolling layout: the
         // arrow keys Omarchy binds do nothing in it.
@@ -333,7 +336,7 @@ mod tests {
             mode: "dwindle".into(),
             nav: true,
             settings: Settings::default(),
-            sourced: true,
+            set_up: true,
             bind: Some("SUPER+GRAVE".into()),
             selected: 0,
             dirty: false,
@@ -401,7 +404,7 @@ mod tests {
             s.handle(key(KeyCode::Char('o'))),
             NiriAction::None
         ));
-        s.sourced = false;
+        s.set_up = false;
         assert!(matches!(
             s.handle(key(KeyCode::Char('o'))),
             NiriAction::Source

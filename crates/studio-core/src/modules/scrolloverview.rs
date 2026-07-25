@@ -428,6 +428,50 @@ pub fn is_sourced(paths: &OmarchyPaths) -> bool {
         .unwrap_or(false)
 }
 
+/// `~/.config/hypr/autostart.conf` — where the user's own `exec-once` lines
+/// live, and thus where the plugin-autoload line belongs.
+fn autostart_path(paths: &OmarchyPaths) -> PathBuf {
+    paths.hypr_config().join("autostart.conf")
+}
+
+/// hyprpm plugins are built and enabled, but nothing loads them at boot — so
+/// after a reboot the plugin is absent and every `scrolloverview:*` dispatcher
+/// and its whole config block become "invalid", spraying config errors. This
+/// `exec-once` runs `hyprpm reload -n` once at Hyprland startup, which is the
+/// documented way to load enabled plugins.
+const AUTOLOAD_LINE: &str = "exec-once = hyprpm reload -n";
+
+fn autoload_block() -> ManagedBlock {
+    ManagedBlock::new("plugin-autoload", CommentStyle::Hash)
+}
+
+/// Is the plugin-autoload line present?
+pub fn autoloads(paths: &OmarchyPaths) -> bool {
+    std::fs::read_to_string(autostart_path(paths))
+        .map(|c| c.contains("hyprpm reload"))
+        .unwrap_or(false)
+}
+
+/// Plan the autoload `exec-once` into autostart.conf.
+fn plan_autoload(paths: &OmarchyPaths) -> Option<crate::engine::FileEdit> {
+    let path = autostart_path(paths);
+    let on_disk = std::fs::read_to_string(&path).unwrap_or_default();
+    // Nothing to do if the user (or Omarchy) already loads plugins.
+    if on_disk.contains("hyprpm reload") && !autoload_block().contains(&on_disk) {
+        return None;
+    }
+    let updated = autoload_block().upsert(&on_disk, AUTOLOAD_LINE);
+    (updated != on_disk).then(|| {
+        crate::engine::FileEdit::new(
+            path,
+            std::fs::read_to_string(autostart_path(paths))
+                .ok()
+                .as_deref(),
+            updated,
+        )
+    })
+}
+
 /// Plan the `source =` line into the user's `hyprland.conf`.
 ///
 /// Hyprland only reads files something sources, so without this the settings
@@ -460,6 +504,10 @@ pub fn ensure_sourced(
         edits.extend(Settings::load(paths).plan(paths));
     }
     edits.extend(plan_source(paths));
+    // Also make the plugin load on boot — without this every reboot errors
+    // until it's loaded by hand (exec-once can't create a file it references,
+    // but hyprpm reload has no such dependency, so it's safe to add alone).
+    edits.extend(plan_autoload(paths));
     if edits.is_empty() {
         return Ok(false);
     }
@@ -584,6 +632,36 @@ mod tests {
         let msg = format!("{e:?}");
         assert!(msg.contains("password"), "{msg}");
         assert!(msg.contains("terminal"), "{msg}");
+    }
+
+    #[test]
+    fn ensure_sourced_also_makes_the_plugin_load_on_boot() {
+        // The reboot trap: enabled but not auto-loaded errors on every boot.
+        let dir = tmpdir("autoload");
+        let p = paths(&dir);
+        std::fs::write(p.hypr_config().join("hyprland.conf"), "").unwrap();
+
+        assert!(!autoloads(&p), "nothing loads plugins to begin with");
+        // Apply just the autoload edit (source needs a runner; this is the
+        // half that fixes the reboot errors).
+        let edit = plan_autoload(&p).expect("a missing autoload line is a change");
+        std::fs::write(&edit.file, &edit.new_content).unwrap();
+        assert!(autoloads(&p), "now loads on boot");
+        assert!(plan_autoload(&p).is_none(), "idempotent");
+    }
+
+    #[test]
+    fn autoload_defers_to_an_existing_hyprpm_reload() {
+        // If the user already loads plugins their own way, don't add a second.
+        let dir = tmpdir("autoload-exists");
+        let p = paths(&dir);
+        std::fs::write(
+            p.hypr_config().join("autostart.conf"),
+            "exec-once = hyprpm reload -n  # mine\n",
+        )
+        .unwrap();
+        assert!(autoloads(&p));
+        assert!(plan_autoload(&p).is_none(), "their line is enough");
     }
 
     #[test]
