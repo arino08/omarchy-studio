@@ -15,11 +15,18 @@
 //! actually run, with zero stdin reads.
 //!
 //! Decoding happens on one long-lived worker thread so navigation never
-//! blocks. The UI keeps showing the previous image (or nothing) until the new
-//! one is ready. The worker coalesces: holding `j` through a wallpaper list
-//! queues paths faster than a 4K JPEG decodes, so it drains to the newest
-//! request and drops the ones already scrolled past — one decode in flight,
-//! not one per keypress.
+//! blocks; a screen renders its own text fallback until the image is ready.
+//!
+//! Decoded images are kept in a small path-keyed cache rather than a single
+//! "current" slot, because one frame legitimately draws more than one image:
+//! the wallhaven and community browsers are modals over `cols[1]`, so
+//! `draw_panel` renders the Wallpapers preview and the browser then renders
+//! its thumbnail — same `ImageCell`, same frame, two paths (tui/mod.rs). With
+//! one slot those two evict each other every frame, so neither ever settles
+//! and the pane flickers between them with no decode ever finishing.
+//!
+//! The cache is deliberately tiny: an entry holds the full-resolution image
+//! so the protocol can re-resize, and wallpapers are routinely 4K.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -31,14 +38,41 @@ use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::{Resize, StatefulImage};
 
+/// Decoded images held at once. Three covers the deepest real stack — the
+/// Wallpapers preview under a browser modal, plus one in hand while another
+/// decodes — without holding several 4K images resident.
+const CACHE_CAP: usize = 3;
+
+/// Decodes queued at once. Beyond this a `render` skips the request and asks
+/// again next frame, which is what bounds a held-down `j`: the backlog stays
+/// short and the retry naturally asks for whatever is selected *now* rather
+/// than working through everything scrolled past.
+const MAX_IN_FLIGHT: usize = 3;
+
+/// Paths remembered as undecodable. Bounded so a directory of broken files
+/// can't grow this without limit.
+const FAILED_CAP: usize = 32;
+
+/// What a [`ImageCell::render`] call managed to put on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Preview {
+    /// The image is on screen; the caller draws nothing.
+    Drawn,
+    /// Decode is in flight — a later frame will draw it. Callers that show a
+    /// message should say "loading", not "broken".
+    Decoding,
+    /// The file didn't decode and won't be retried.
+    Failed,
+}
+
 pub struct ImageCell {
     picker: Picker,
-    /// Protocol state for the image currently on screen.
-    current: Option<(PathBuf, StatefulProtocol)>,
-    /// Last path that failed to decode — don't retry every frame.
-    failed: Option<PathBuf>,
-    /// Path the worker is decoding right now, if any.
-    pending: Option<PathBuf>,
+    /// Decoded protocols, least-recently-drawn first.
+    cache: Vec<(PathBuf, StatefulProtocol)>,
+    /// Paths that didn't decode — don't retry them every frame.
+    failed: Vec<PathBuf>,
+    /// Paths the worker still owes us an answer for.
+    pending: Vec<PathBuf>,
     decoder: Decoder,
 }
 
@@ -53,11 +87,11 @@ impl Decoder {
         let (req_tx, req_rx) = mpsc::channel::<PathBuf>();
         let (res_tx, res_rx) = mpsc::channel();
         thread::spawn(move || {
-            while let Ok(mut path) = req_rx.recv() {
-                // Skip anything the user has already scrolled past.
-                while let Ok(newer) = req_rx.try_recv() {
-                    path = newer;
-                }
+            // Every request gets an answer, in order. Nothing is coalesced
+            // away: callers dedupe by path and won't re-ask for one already
+            // in flight, so a dropped request would strand that path forever.
+            // Backlog is bounded by MAX_IN_FLIGHT on the sending side.
+            while let Ok(path) = req_rx.recv() {
                 let img = image::open(&path).ok();
                 if res_tx.send((path, img)).is_err() {
                     break;
@@ -107,9 +141,9 @@ impl ImageCell {
         picker.set_protocol_type(detect_protocol());
         Self {
             picker,
-            current: None,
-            failed: None,
-            pending: None,
+            cache: Vec::new(),
+            failed: Vec::new(),
+            pending: Vec::new(),
             decoder: Decoder::spawn(),
         }
     }
@@ -124,79 +158,83 @@ impl ImageCell {
         }
     }
 
-    /// Draw `path` scaled into `area`. Returns false when the file didn't
-    /// decode — caller renders its text fallback instead.
-    pub fn render(&mut self, f: &mut Frame, area: Rect, path: &Path) -> bool {
-        if self.failed.as_deref() == Some(path) {
-            return false;
-        }
-
+    /// Draw `path` scaled into `area`. When nothing was drawn the caller
+    /// renders its own fallback, and the variant says which one: a file still
+    /// decoding is not a file that failed to decode. Never draws some *other*
+    /// path's image — two screens share this cell within one frame, so a stale
+    /// draw would put one screen's wallpaper in the other's pane.
+    pub fn render(&mut self, f: &mut Frame, area: Rect, path: &Path) -> Preview {
         self.poll();
 
-        // Decoded and on screen already — just draw it.
-        if self.current.as_ref().map(|(p, _)| p.as_path()) == Some(path) {
-            self.draw(f, area);
-            return true;
-        }
-        // The decode we just collected may have been a failure for this path.
-        if self.failed.as_deref() == Some(path) {
-            return false;
-        }
-
-        // Not decoded and not already queued — ask the worker for it.
-        if self.pending.as_deref() != Some(path) {
-            let owned = path.to_path_buf();
-            if self.decoder.tx.send(owned.clone()).is_err() {
-                // Worker died; nothing will ever arrive for this path.
-                self.failed = Some(owned);
-                return false;
-            }
-            self.pending = Some(owned);
-        }
-
-        // Show the previous image (stale but instant) while the decode runs.
-        self.draw(f, area);
-        self.current.is_some()
-    }
-
-    /// Drain finished decodes. Results for paths the user has scrolled past
-    /// are dropped — only the one still pending can become `current`. The
-    /// event loop calls this too: a decode kicked off on a screen the user
-    /// then left still has to clear `pending`, or the loop keeps polling
-    /// instead of going back to a blocking read.
-    pub fn poll(&mut self) {
-        while let Ok((path, img)) = self.decoder.rx.try_recv() {
-            if self.pending.as_deref() != Some(path.as_path()) {
-                continue;
-            }
-            self.pending = None;
-            match img {
-                Some(img) => {
-                    self.current = Some((path, self.picker.new_resize_protocol(img)));
-                    self.failed = None;
-                }
-                None => {
-                    self.failed = Some(path);
-                    self.current = None;
-                }
-            }
-        }
-    }
-
-    /// True while a decode is in flight — the event loop polls instead of
-    /// blocking so the preview appears as soon as it lands.
-    pub fn has_pending(&self) -> bool {
-        self.pending.is_some()
-    }
-
-    fn draw(&mut self, f: &mut Frame, area: Rect) {
-        if let Some((_, protocol)) = self.current.as_mut() {
+        if let Some(i) = self.cache.iter().position(|(p, _)| p == path) {
+            // Move to the back: least-recently-drawn is evicted first, and
+            // the modal underneath redraws every frame, so it stays resident.
+            let entry = self.cache.remove(i);
+            self.cache.push(entry);
+            let (_, protocol) = self.cache.last_mut().expect("just pushed");
             f.render_stateful_widget(
                 StatefulImage::default().resize(Resize::Fit(None)),
                 area,
                 protocol,
             );
+            return Preview::Drawn;
         }
+
+        if self.failed.iter().any(|p| p == path) {
+            return Preview::Failed;
+        }
+        self.request(path);
+        Preview::Decoding
+    }
+
+    /// Queue a decode unless it's already queued or the backlog is full.
+    fn request(&mut self, path: &Path) {
+        if self.pending.iter().any(|p| p == path) || self.pending.len() >= MAX_IN_FLIGHT {
+            return;
+        }
+        let owned = path.to_path_buf();
+        if self.decoder.tx.send(owned.clone()).is_err() {
+            // Worker died; nothing will ever arrive for this path.
+            self.remember_failed(owned);
+            return;
+        }
+        self.pending.push(owned);
+    }
+
+    /// Drain finished decodes. The event loop calls this too: a decode kicked
+    /// off on a screen the user then left still has to clear `pending`, or the
+    /// loop keeps polling instead of going back to a blocking read.
+    pub fn poll(&mut self) {
+        while let Ok((path, img)) = self.decoder.rx.try_recv() {
+            self.pending.retain(|p| p != &path);
+            match img {
+                Some(img) => {
+                    let protocol = self.picker.new_resize_protocol(img);
+                    self.cache.retain(|(p, _)| p != &path);
+                    if self.cache.len() >= CACHE_CAP {
+                        self.cache.remove(0);
+                    }
+                    self.cache.push((path, protocol));
+                }
+                None => self.remember_failed(path),
+            }
+        }
+    }
+
+    fn remember_failed(&mut self, path: PathBuf) {
+        if self.failed.iter().any(|p| p == &path) {
+            return;
+        }
+        if self.failed.len() >= FAILED_CAP {
+            self.failed.remove(0);
+        }
+        self.failed.push(path);
+    }
+
+    /// True while a decode is in flight — the event loop polls instead of
+    /// blocking so the preview appears as soon as it lands.
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
     }
 }
 
@@ -215,6 +253,10 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn self_cached(cell: &ImageCell, path: &Path) -> bool {
+        cell.cache.iter().any(|(p, _)| p == path)
     }
 
     /// Write a tiny valid PNG so the worker has something real to decode.
@@ -247,42 +289,121 @@ mod tests {
         assert!(img.is_none());
     }
 
-    /// Holding `j` queues paths faster than they decode. Whether any given
-    /// run actually coalesces is a race (4×4 PNGs decode faster than the test
-    /// can queue them), so what's asserted is the contract `poll` relies on:
-    /// replies never reorder, and the run ends on the newest request — a
-    /// dropped intermediate is a skipped reply, never a late one.
+    /// Every request is answered, in order. `render` won't re-ask for a path
+    /// already in `pending`, so a request the worker dropped would leave that
+    /// path pending forever and its screen stuck on the text fallback.
     #[test]
-    fn decode_replies_stay_in_order_and_end_on_the_newest_path() {
-        let dir = scratch("coalesce");
+    fn every_queued_request_is_answered_in_order() {
+        let dir = scratch("queue");
         let queued: Vec<PathBuf> = ["a.png", "b.png", "c.png", "d.png", "z.png"]
             .iter()
             .map(|n| png(&dir, n))
             .collect();
-        let last = queued.last().unwrap().clone();
 
         let decoder = Decoder::spawn();
         for path in &queued {
             decoder.tx.send(path.clone()).unwrap();
         }
 
-        let mut seen = Vec::new();
-        loop {
-            let (path, img) = decoder.rx.recv().unwrap();
-            assert!(img.is_some(), "{path:?} should have decoded");
-            let done = path == last;
-            seen.push(path);
-            if done {
+        for want in &queued {
+            let (got, img) = decoder.rx.recv().unwrap();
+            assert_eq!(&got, want);
+            assert!(img.is_some(), "{got:?} should have decoded");
+        }
+    }
+
+    /// Drives the frame shape that broke wallhaven previews: `draw_panel`
+    /// renders the Wallpapers preview into `cols[1]`, then the browser modal
+    /// renders its thumbnail into the same rect. Two paths, one cell, one
+    /// frame — with a single `current` slot they evicted each other forever
+    /// and the modal's pane never settled.
+    #[test]
+    fn two_screens_in_one_frame_both_get_their_own_image() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let dir = scratch("twoup");
+        let under = png(&dir, "wallpaper.png");
+        let modal = png(&dir, "thumb.png");
+
+        let mut cell = ImageCell::probe();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+        let mut both = false;
+        for _ in 0..50 {
+            let (mut a, mut b) = (Preview::Decoding, Preview::Decoding);
+            term.draw(|f| {
+                a = cell.render(f, Rect::new(0, 0, 40, 20), &under);
+                b = cell.render(f, Rect::new(40, 0, 40, 20), &modal);
+            })
+            .unwrap();
+            if a == Preview::Drawn && b == Preview::Drawn {
+                both = true;
                 break;
             }
+            cell.poll();
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert!(seen.len() <= queued.len());
-        assert_eq!(seen.last().unwrap(), &last);
-        // Replies are a subsequence of the send order — the worker only ever
-        // skips ahead, so nothing stale can land after something newer.
-        let mut want = queued.iter();
-        for got in &seen {
-            assert!(want.any(|q| q == got), "{got:?} arrived out of order");
+        assert!(both, "both panes should settle on their own image");
+        // Both really are resident — a `true` here means this path's own
+        // image was drawn, not whatever the other screen last decoded.
+        assert!(self_cached(&cell, &under) && self_cached(&cell, &modal));
+
+        // And they stay settled — no eviction war on subsequent frames.
+        for _ in 0..5 {
+            let (mut a, mut b) = (Preview::Decoding, Preview::Decoding);
+            term.draw(|f| {
+                a = cell.render(f, Rect::new(0, 0, 40, 20), &under);
+                b = cell.render(f, Rect::new(40, 0, 40, 20), &modal);
+            })
+            .unwrap();
+            assert_eq!(
+                (a, b),
+                (Preview::Drawn, Preview::Drawn),
+                "an image was evicted by the other screen"
+            );
         }
+        assert!(!cell.has_pending(), "loop would keep polling forever");
+    }
+
+    /// A path that fails to decode is remembered, so the worker isn't asked
+    /// again on every frame.
+    #[test]
+    fn a_failed_path_is_not_requeued_every_frame() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let dir = scratch("failed");
+        let path = dir.join("broken.png");
+        std::fs::write(&path, b"not an image").unwrap();
+
+        let mut cell = ImageCell::probe();
+        let mut term = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        for _ in 0..50 {
+            term.draw(|f| {
+                cell.render(f, Rect::new(0, 0, 40, 12), &path);
+            })
+            .unwrap();
+            if cell.failed.iter().any(|p| p == &path) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            cell.failed.iter().any(|p| p == &path),
+            "failure not recorded"
+        );
+
+        let mut got = Preview::Drawn;
+        term.draw(|f| {
+            got = cell.render(f, Rect::new(0, 0, 40, 12), &path);
+        })
+        .unwrap();
+        assert_eq!(
+            got,
+            Preview::Failed,
+            "caller must be told it failed, not that it's still loading"
+        );
+        assert!(!cell.has_pending(), "a known-bad path was queued again");
     }
 }

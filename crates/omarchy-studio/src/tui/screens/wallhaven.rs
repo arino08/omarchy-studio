@@ -24,7 +24,7 @@ use studio_core::modules::wallhaven::{
     load_api_key, nearest_color, Client, Purity, Query, SearchPage, Sorting, ThumbCache, Wallpaper,
 };
 
-use super::super::imagecell::ImageCell;
+use super::super::imagecell::{ImageCell, Preview};
 use super::super::theme::Skin;
 
 /// Ratio filter cycle (`r`).
@@ -549,15 +549,17 @@ impl WallhavenBrowser {
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(3), Constraint::Length(2)])
             .split(area);
-        let mut drew = false;
+        let mut state = None;
         if let Some((id, path)) = &self.thumb {
             if *id == wp.id {
-                drew = images.render(f, rows[0], path);
+                state = Some(images.render(f, rows[0], path));
             }
         }
-        if !drew {
+        if state != Some(Preview::Drawn) {
             let note = if self.thumb_inflight.as_deref() == Some(&wp.id) {
                 "fetching preview…"
+            } else if state == Some(Preview::Decoding) {
+                "decoding preview…"
             } else {
                 "no preview — enter still sets it"
             };

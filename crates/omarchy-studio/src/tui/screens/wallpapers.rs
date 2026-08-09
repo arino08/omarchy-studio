@@ -16,7 +16,7 @@ use ratatui::Frame;
 use studio_core::modules::wallpapers::{Entry, Kind, Wallpapers};
 use studio_core::omarchy::OmarchyPaths;
 
-use crate::tui::imagecell::ImageCell;
+use crate::tui::imagecell::{ImageCell, Preview};
 use crate::tui::theme::Skin;
 
 pub enum WallpaperAction {
@@ -274,17 +274,17 @@ impl WallpapersScreen {
                 f,
                 format!("{}\n\nvideo — press o to play it in mpv", e.name()),
             ),
-            _ => {
-                if !images.render(f, inner, &e.path) {
-                    fallback(
-                        f,
-                        format!(
-                            "{}\n\ncould not decode — press o to open it in imv",
-                            e.name()
-                        ),
-                    );
-                }
-            }
+            _ => match images.render(f, inner, &e.path) {
+                Preview::Drawn => {}
+                Preview::Decoding => fallback(f, format!("{}\n\nloading preview…", e.name())),
+                Preview::Failed => fallback(
+                    f,
+                    format!(
+                        "{}\n\ncould not decode — press o to open it in imv",
+                        e.name()
+                    ),
+                ),
+            },
         }
     }
 
