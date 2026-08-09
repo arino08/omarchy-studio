@@ -11,6 +11,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 ver="${1:-$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)}"
+ver="${ver#v}"  # tolerate the tag name; the URL below adds its own v
 url="https://github.com/arino08/omarchy-studio/archive/refs/tags/v${ver}.tar.gz"
 pkg=packaging/aur/PKGBUILD
 

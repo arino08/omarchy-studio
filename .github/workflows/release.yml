@@ -51,8 +51,12 @@ jobs:
             echo "PKGBUILD ($pkg) and .SRCINFO ($src) disagree — run tools/refresh-pkgbuild.sh" >&2
             exit 1
           fi
+          # The script takes a bare version, not the tag — it builds the URL
+          # as v$ver, so passing the tag asks GitHub for vv0.9.1 and 404s.
           echo "AUR package currently at v$pkg; after this release run:"
-          echo "  tools/refresh-pkgbuild.sh ${{ inputs.tag || github.ref_name }}"
+          echo "  tools/refresh-pkgbuild.sh ${tag#v}"
+        env:
+          tag: ${{ inputs.tag || github.ref_name }}
 
       - name: Install Rust (pinned, matches CI)
         uses: dtolnay/rust-toolchain@1.96.1
