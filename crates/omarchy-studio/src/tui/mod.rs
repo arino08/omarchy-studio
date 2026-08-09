@@ -2876,7 +2876,10 @@ pub fn run() -> i32 {
             || app.community.as_ref().is_some_and(|b| b.busy())
             || app.images.has_pending();
         if background_busy {
-            match event::poll(std::time::Duration::from_millis(250)) {
+            // A finished decode should reach the screen on the next frame, not
+            // a quarter second later, so poll tighter while one is in flight.
+            let tick = if app.images.has_pending() { 20 } else { 250 };
+            match event::poll(std::time::Duration::from_millis(tick)) {
                 Ok(ready) => {
                     let polled = app.update_rx.as_ref().map(|rx| rx.try_recv());
                     match polled {
@@ -2888,6 +2891,7 @@ pub fn run() -> i32 {
                     }
                     app.wallhaven_poll();
                     app.community_poll();
+                    app.images.poll();
                     if app.quit {
                         break Ok(());
                     }

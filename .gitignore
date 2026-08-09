@@ -3,7 +3,6 @@ target/
 .direnv/
 .claude/
 /.aider.conventions.md
-/.github
 /.rtk
 /.serena
 /.tokensave

@@ -14,8 +14,12 @@
 //! sniffing + the `TIOCGWINSZ` pixel size cover the terminals Omarchy users
 //! actually run, with zero stdin reads.
 //!
-//! Decoding happens on a background thread so navigation never blocks.
-//! The UI shows the previous image (or nothing) until the new one is ready.
+//! Decoding happens on one long-lived worker thread so navigation never
+//! blocks. The UI keeps showing the previous image (or nothing) until the new
+//! one is ready. The worker coalesces: holding `j` through a wallpaper list
+//! queues paths faster than a 4K JPEG decodes, so it drains to the newest
+//! request and drops the ones already scrolled past — one decode in flight,
+//! not one per keypress.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -29,17 +33,47 @@ use ratatui_image::{Resize, StatefulImage};
 
 pub struct ImageCell {
     picker: Picker,
+    /// Protocol state for the image currently on screen.
     current: Option<(PathBuf, StatefulProtocol)>,
+    /// Last path that failed to decode — don't retry every frame.
     failed: Option<PathBuf>,
-    pending: Option<PendingDecode>,
+    /// Path the worker is decoding right now, if any.
+    pending: Option<PathBuf>,
+    decoder: Decoder,
 }
 
-struct PendingDecode {
-    path: PathBuf,
-    rx: mpsc::Receiver<Option<image::DynamicImage>>,
+/// Handle to the decode worker: paths out, decoded images back.
+struct Decoder {
+    tx: mpsc::Sender<PathBuf>,
+    rx: mpsc::Receiver<(PathBuf, Option<image::DynamicImage>)>,
+}
+
+impl Decoder {
+    fn spawn() -> Self {
+        let (req_tx, req_rx) = mpsc::channel::<PathBuf>();
+        let (res_tx, res_rx) = mpsc::channel();
+        thread::spawn(move || {
+            while let Ok(mut path) = req_rx.recv() {
+                // Skip anything the user has already scrolled past.
+                while let Ok(newer) = req_rx.try_recv() {
+                    path = newer;
+                }
+                let img = image::open(&path).ok();
+                if res_tx.send((path, img)).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            tx: req_tx,
+            rx: res_rx,
+        }
+    }
 }
 
 /// Graphics protocol from the environment, never from a tty round-trip.
+/// Conservative: inside tmux always half-blocks (passthrough is off by
+/// default and detection would need the racy stdin query).
 fn detect_protocol() -> ProtocolType {
     let var = |k: &str| std::env::var(k).unwrap_or_default();
     let term = var("TERM");
@@ -59,6 +93,9 @@ fn detect_protocol() -> ProtocolType {
 }
 
 impl ImageCell {
+    /// Probe once at startup. Cell pixel size comes from the window-size
+    /// ioctl where the terminal reports it; otherwise a common 8×16 guess —
+    /// only aspect correction depends on it.
     pub fn probe() -> Self {
         let font_size = match ratatui::crossterm::terminal::window_size() {
             Ok(ws) if ws.width > 0 && ws.height > 0 && ws.columns > 0 && ws.rows > 0 => {
@@ -73,9 +110,11 @@ impl ImageCell {
             current: None,
             failed: None,
             pending: None,
+            decoder: Decoder::spawn(),
         }
     }
 
+    /// Human name for the Doctor screen's capability line.
     pub fn protocol_label(&self) -> &'static str {
         match self.picker.protocol_type() {
             ProtocolType::Kitty => "kitty graphics",
@@ -92,59 +131,60 @@ impl ImageCell {
             return false;
         }
 
-        // Already showing this image — just draw it.
+        self.poll();
+
+        // Decoded and on screen already — just draw it.
         if self.current.as_ref().map(|(p, _)| p.as_path()) == Some(path) {
             self.draw(f, area);
             return true;
         }
-
-        // Check if a background decode finished.
-        if let Some(pending) = &self.pending {
-            if pending.path == path {
-                match pending.rx.try_recv() {
-                    Ok(Some(img)) => {
-                        let proto = self.picker.new_resize_protocol(img);
-                        self.current = Some((path.to_path_buf(), proto));
-                        self.pending = None;
-                        self.failed = None;
-                        self.draw(f, area);
-                        return true;
-                    }
-                    Ok(None) => {
-                        self.failed = Some(path.to_path_buf());
-                        self.current = None;
-                        self.pending = None;
-                        return false;
-                    }
-                    Err(mpsc::TryRecvError::Empty) => {
-                        // Still decoding — show previous image if we have one.
-                        self.draw(f, area);
-                        return self.current.is_some();
-                    }
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        self.failed = Some(path.to_path_buf());
-                        self.pending = None;
-                        return false;
-                    }
-                }
-            }
+        // The decode we just collected may have been a failure for this path.
+        if self.failed.as_deref() == Some(path) {
+            return false;
         }
 
-        // New path — kick off a background decode.
-        let (tx, rx) = mpsc::channel();
-        let owned = path.to_path_buf();
-        let decode_path = owned.clone();
-        thread::spawn(move || {
-            let result = image::open(&decode_path).ok();
-            let _ = tx.send(result);
-        });
-        self.pending = Some(PendingDecode { path: owned, rx });
+        // Not decoded and not already queued — ask the worker for it.
+        if self.pending.as_deref() != Some(path) {
+            let owned = path.to_path_buf();
+            if self.decoder.tx.send(owned.clone()).is_err() {
+                // Worker died; nothing will ever arrive for this path.
+                self.failed = Some(owned);
+                return false;
+            }
+            self.pending = Some(owned);
+        }
 
-        // Show previous image (stale but instant) while decoding.
+        // Show the previous image (stale but instant) while the decode runs.
         self.draw(f, area);
         self.current.is_some()
     }
 
+    /// Drain finished decodes. Results for paths the user has scrolled past
+    /// are dropped — only the one still pending can become `current`. The
+    /// event loop calls this too: a decode kicked off on a screen the user
+    /// then left still has to clear `pending`, or the loop keeps polling
+    /// instead of going back to a blocking read.
+    pub fn poll(&mut self) {
+        while let Ok((path, img)) = self.decoder.rx.try_recv() {
+            if self.pending.as_deref() != Some(path.as_path()) {
+                continue;
+            }
+            self.pending = None;
+            match img {
+                Some(img) => {
+                    self.current = Some((path, self.picker.new_resize_protocol(img)));
+                    self.failed = None;
+                }
+                None => {
+                    self.failed = Some(path);
+                    self.current = None;
+                }
+            }
+        }
+    }
+
+    /// True while a decode is in flight — the event loop polls instead of
+    /// blocking so the preview appears as soon as it lands.
     pub fn has_pending(&self) -> bool {
         self.pending.is_some()
     }
@@ -156,6 +196,93 @@ impl ImageCell {
                 area,
                 protocol,
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "omarchy-studio-imagecell-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Write a tiny valid PNG so the worker has something real to decode.
+    fn png(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        image::RgbImage::new(4, 4).save(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn worker_decodes_and_reports_the_path_it_decoded() {
+        let dir = scratch("ok");
+        let path = png(&dir, "wall.png");
+        let decoder = Decoder::spawn();
+        decoder.tx.send(path.clone()).unwrap();
+        let (got, img) = decoder.rx.recv().unwrap();
+        assert_eq!(got, path);
+        assert!(img.is_some());
+    }
+
+    #[test]
+    fn undecodable_file_comes_back_as_none_rather_than_hanging() {
+        let dir = scratch("bad");
+        let path = dir.join("not-an-image.png");
+        std::fs::write(&path, b"definitely not a png").unwrap();
+        let decoder = Decoder::spawn();
+        decoder.tx.send(path.clone()).unwrap();
+        let (got, img) = decoder.rx.recv().unwrap();
+        assert_eq!(got, path);
+        assert!(img.is_none());
+    }
+
+    /// Holding `j` queues paths faster than they decode. Whether any given
+    /// run actually coalesces is a race (4×4 PNGs decode faster than the test
+    /// can queue them), so what's asserted is the contract `poll` relies on:
+    /// replies never reorder, and the run ends on the newest request — a
+    /// dropped intermediate is a skipped reply, never a late one.
+    #[test]
+    fn decode_replies_stay_in_order_and_end_on_the_newest_path() {
+        let dir = scratch("coalesce");
+        let queued: Vec<PathBuf> = ["a.png", "b.png", "c.png", "d.png", "z.png"]
+            .iter()
+            .map(|n| png(&dir, n))
+            .collect();
+        let last = queued.last().unwrap().clone();
+
+        let decoder = Decoder::spawn();
+        for path in &queued {
+            decoder.tx.send(path.clone()).unwrap();
+        }
+
+        let mut seen = Vec::new();
+        loop {
+            let (path, img) = decoder.rx.recv().unwrap();
+            assert!(img.is_some(), "{path:?} should have decoded");
+            let done = path == last;
+            seen.push(path);
+            if done {
+                break;
+            }
+        }
+        assert!(seen.len() <= queued.len());
+        assert_eq!(seen.last().unwrap(), &last);
+        // Replies are a subsequence of the send order — the worker only ever
+        // skips ahead, so nothing stale can land after something newer.
+        let mut want = queued.iter();
+        for got in &seen {
+            assert!(want.any(|q| q == got), "{got:?} arrived out of order");
         }
     }
 }

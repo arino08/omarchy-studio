@@ -83,7 +83,7 @@ Frontend contract: every error renders as *what happened → why → what to do 
 
 ## 5. Concurrency model (D3)
 
-Single-threaded core; worker threads only for: wallhaven HTTP + thumbnail decode, palette extraction, and `Cmd` execution with timeout. Frontends communicate via `std::sync::mpsc`. No tokio unless a real need appears (it hasn't: hyprctl/omarchy commands are all fast local execs).
+Single-threaded core; worker threads only for: wallhaven HTTP + thumbnail decode, local preview decode (one long-lived coalescing worker behind `tui::imagecell`), palette extraction, and `Cmd` execution with timeout. Frontends communicate via `std::sync::mpsc`. No tokio unless a real need appears (it hasn't: hyprctl/omarchy commands are all fast local execs).
 
 ## 6. Dependency policy for the crates themselves
 
