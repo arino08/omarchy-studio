@@ -660,7 +660,7 @@ dependencies = [
 
 [[package]]
 name = "omarchy-studio"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "clap",
  "image",
@@ -1075,7 +1075,7 @@ dependencies = [
 
 [[package]]
 name = "studio-core"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "image",
  "serde",
