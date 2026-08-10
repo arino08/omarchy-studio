@@ -113,10 +113,14 @@ fn cli() -> Command {
         .subcommand(group("lock", "Lock screen appearance", "usage: omarchy-studio lock show | avatar <path> | avatar add <file> | avatar list | size <px> | blur <n>"))
         .subcommand(group("monitor", "Displays: resolution, refresh rate, layout, scale, identify",
             "usage:\n  \
-             monitor list | identify | modes <name>\n  \
+             monitor list | identify | check | modes <name>\n  \
              monitor mode <name> <WxH[@Hz]|Hz|preferred> [--dry-run]\n  \
-             monitor primary <name> | scale <name> <factor> [--dry-run]\n  \
-             monitor apply [--dry-run]"))
+             monitor scale <name> <factor> [--dry-run]\n  \
+             monitor position <name> <XxY> [--dry-run]\n  \
+             monitor place <name> <left-of|right-of|above|below> <anchor> \
+             [--align start|center|end] [--dry-run]\n  \
+             monitor arrange <row|column> [<name>…] [--align …] [--dry-run]\n  \
+             monitor normalize [--dry-run] | apply [--dry-run]"))
         .subcommand(group("apps", "Remove apps and webapps safely, with a cascade preview",
             "usage:\n  \
              apps list [--installed] [--all]\n  \
@@ -3172,6 +3176,7 @@ fn monitor(args: &[&str]) -> i32 {
             monitor_write(
                 &paths,
                 &layout,
+                &live,
                 &format!("monitor mode {name} {shown}"),
                 dry_run,
             )
@@ -3195,9 +3200,107 @@ fn monitor(args: &[&str]) -> i32 {
             monitor_write(
                 &paths,
                 &layout,
+                &live,
                 &format!("monitor scale {name} {value}"),
                 dry_run,
             )
+        }
+        ["position", name, spec, rest @ ..] => {
+            let dry_run = rest.contains(&"--dry-run");
+            let Some((x, y)) = parse_point(spec) else {
+                eprintln!("can't read `{spec}` — try 1080x1440 or 1080,1440");
+                return 2;
+            };
+            let mut layout = mon::Layout::from_monitors(&live);
+            if !layout.set_position(name, x, y) {
+                eprintln!("no monitor named `{name}` — see `monitor list`");
+                return 2;
+            }
+            monitor_write(
+                &paths,
+                &layout,
+                &live,
+                &format!("monitor position {name} {x}x{y}"),
+                dry_run,
+            )
+        }
+        ["place", name, side, anchor, rest @ ..] => {
+            let (_, align, dry_run) = match parse_layout_args(rest) {
+                Ok(v) => v,
+                Err(msg) => {
+                    eprintln!("{msg}");
+                    return 2;
+                }
+            };
+            let Some(side) = mon::Side::parse(side) else {
+                eprintln!("can't read `{side}` — try left-of, right-of, above, or below");
+                return 2;
+            };
+            let mut layout = mon::Layout::from_monitors(&live);
+            if let Err(msg) = layout.place_relative(name, anchor, side, align, &live) {
+                eprintln!("{msg}");
+                return 2;
+            }
+            monitor_write(
+                &paths,
+                &layout,
+                &live,
+                &format!("monitor place {name} {} {anchor}", side.label()),
+                dry_run,
+            )
+        }
+        ["arrange", axis, rest @ ..] => {
+            let (order, align, dry_run) = match parse_layout_args(rest) {
+                Ok(v) => v,
+                Err(msg) => {
+                    eprintln!("{msg}");
+                    return 2;
+                }
+            };
+            let side = match *axis {
+                "row" | "horizontal" | "lr" => mon::Side::RightOf,
+                "column" | "col" | "vertical" | "stack" => mon::Side::Below,
+                other => {
+                    eprintln!("can't read `{other}` — arrange takes `row` or `column`");
+                    return 2;
+                }
+            };
+            let mut layout = mon::Layout::from_monitors(&live);
+            if let Err(msg) = layout.arrange(side, &order, align, &live) {
+                eprintln!("{msg}");
+                return 2;
+            }
+            monitor_write(
+                &paths,
+                &layout,
+                &live,
+                &format!("monitor arrange {axis}"),
+                dry_run,
+            )
+        }
+        ["normalize", rest @ ..] => {
+            let dry_run = rest.contains(&"--dry-run");
+            let mut layout = mon::Layout::from_monitors(&live);
+            layout.normalize(&live);
+            monitor_write(
+                &paths,
+                &layout,
+                &live,
+                "monitor normalize (re-origin the arrangement)",
+                dry_run,
+            )
+        }
+        ["check"] => {
+            let layout = mon::Layout::from_monitors(&live);
+            let issues = layout.check(&live);
+            if issues.is_empty() {
+                println!("your displays tile cleanly — no overlaps, no gaps.");
+                return 0;
+            }
+            for issue in &issues {
+                eprintln!("warning: {}", issue.message());
+            }
+            1
         }
         ["apply", rest @ ..] => {
             let dry_run = rest.contains(&"--dry-run");
@@ -3205,31 +3308,84 @@ fn monitor(args: &[&str]) -> i32 {
             monitor_write(
                 &paths,
                 &layout,
+                &live,
                 "monitor apply (persist current layout)",
                 dry_run,
             )
         }
         _ => {
             eprintln!(
-                "usage: monitor list | identify | modes <name>\n       \
+                "usage: monitor list | identify | check | modes <name>\n       \
                  monitor mode <name> <WxH[@Hz]|Hz|preferred> [--dry-run]\n       \
-                 monitor scale <name> <f> [--dry-run] | apply [--dry-run]"
+                 monitor scale <name> <f> [--dry-run]\n       \
+                 monitor position <name> <XxY> [--dry-run]\n       \
+                 monitor place <name> <left-of|right-of|above|below> <anchor> \
+                 [--align start|center|end] [--dry-run]\n       \
+                 monitor arrange <row|column> [<name>…] [--align …] [--dry-run]\n       \
+                 monitor normalize [--dry-run] | apply [--dry-run]"
             );
             2
         }
     }
 }
 
+/// Read an `XxY` (or `X,Y`) coordinate pair, negatives included.
+fn parse_point(spec: &str) -> Option<(i32, i32)> {
+    let s = spec.trim();
+    let (a, b) = s.split_once('x').or_else(|| s.split_once(','))?;
+    Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+}
+
+/// Split a trailing arg slice into positional display names, the `--align`
+/// value, and `--dry-run`. Accepts `--align center` and `--align=center`;
+/// taking the value explicitly is what keeps it from being read as a name.
+fn parse_layout_args(
+    rest: &[&str],
+) -> std::result::Result<(Vec<String>, studio_core::modules::monitors::Align, bool), String> {
+    use studio_core::modules::monitors as mon;
+    let bad = |v: &str| format!("can't read `{v}` — --align takes start, center, or end");
+    let mut names = Vec::new();
+    let mut align = mon::Align::default();
+    let mut dry_run = false;
+    let mut it = rest.iter().copied();
+    while let Some(arg) = it.next() {
+        if arg == "--dry-run" {
+            dry_run = true;
+        } else if let Some(v) = arg.strip_prefix("--align=") {
+            align = mon::Align::parse(v).ok_or_else(|| bad(v))?;
+        } else if arg == "--align" {
+            let v = it
+                .next()
+                .ok_or("--align needs a value: start, center, or end")?;
+            align = mon::Align::parse(v).ok_or_else(|| bad(v))?;
+        } else if let Some(flag) = arg.strip_prefix("--") {
+            return Err(format!("unknown flag `--{flag}`"));
+        } else {
+            names.push(arg.to_string());
+        }
+    }
+    Ok((names, align, dry_run))
+}
+
 /// Render the layout into monitors.conf and (unless dry-run) snapshot, write,
 /// and reload Hyprland.
+///
+/// Overlaps and unreachable screens are reported but never block the write —
+/// they're legal Hyprland configs, and a deliberate overlap is someone's mirror
+/// setup. Scale and resolution changes get checked too: resizing a display can
+/// pull a neighbour apart just as surely as moving one.
 fn monitor_write(
     paths: &OmarchyPaths,
     layout: &studio_core::modules::monitors::Layout,
+    live: &[studio_core::modules::monitors::Monitor],
     summary: &str,
     dry_run: bool,
 ) -> i32 {
     use studio_core::modules::monitors as mon;
     let path = mon::conf_path(paths);
+    for issue in layout.check(live) {
+        eprintln!("warning: {}", issue.message());
+    }
     if dry_run {
         println!("would write {}:\n", path.display());
         println!("{}", layout.render_body());

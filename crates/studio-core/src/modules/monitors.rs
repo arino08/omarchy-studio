@@ -12,8 +12,11 @@
 //! written — an unsupported rate returns the list of real ones instead of a
 //! `monitor=` line Hyprland would quietly fall back from.
 //!
-//! The layout math (effective size under scale and rotation, absolute
-//! placement) is pure and unit-tested; the frontend drives it.
+//! The layout math (effective size under scale and rotation, placing a display
+//! flush against a neighbour, re-origining the result) is pure and
+//! unit-tested; the frontend drives it. `Layout::check` reports overlapping
+//! and unreachable displays, but only ever as a warning — Hyprland loads both
+//! quite happily, and a deliberate overlap is somebody's mirror setup.
 
 use crate::cmd::{Cmd, CommandRunner};
 use crate::configfs::{CommentStyle, ManagedBlock};
@@ -370,16 +373,169 @@ pub enum Side {
     Below,
 }
 
+impl Side {
+    /// Read `left-of`/`left`, `right-of`/`right`, `above`/`up`, `below`/`down`.
+    pub fn parse(s: &str) -> Option<Side> {
+        match s.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "left-of" | "left" | "l" => Some(Side::LeftOf),
+            "right-of" | "right" | "r" => Some(Side::RightOf),
+            "above" | "up" | "top" | "u" => Some(Side::Above),
+            "below" | "down" | "under" | "d" => Some(Side::Below),
+            _ => None,
+        }
+    }
+
+    /// How it reads back to the user.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Side::LeftOf => "left of",
+            Side::RightOf => "right of",
+            Side::Above => "above",
+            Side::Below => "below",
+        }
+    }
+
+    /// True for sides that stack horizontally, so the cross axis is vertical.
+    pub fn is_horizontal(&self) -> bool {
+        matches!(self, Side::LeftOf | Side::RightOf)
+    }
+}
+
+/// Where a display sits on the axis it is *not* being stacked along: placing a
+/// short panel right of a tall one still has to decide top, middle, or bottom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Align {
+    /// Top edges flush (or left edges, stacking vertically).
+    #[default]
+    Start,
+    /// Centres line up — what a laptop beside an ultrawide usually wants.
+    Center,
+    /// Bottom edges flush (or right edges, stacking vertically).
+    End,
+}
+
+impl Align {
+    pub fn parse(s: &str) -> Option<Align> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "start" | "top" | "left" => Some(Align::Start),
+            "center" | "centre" | "middle" => Some(Align::Center),
+            "end" | "bottom" | "right" => Some(Align::End),
+            _ => None,
+        }
+    }
+
+    /// Names the edge it lines up, which differs per axis.
+    pub fn label(&self, horizontal: bool) -> &'static str {
+        match (self, horizontal) {
+            (Align::Start, true) => "top",
+            (Align::Center, _) => "center",
+            (Align::End, true) => "bottom",
+            (Align::Start, false) => "left",
+            (Align::End, false) => "right",
+        }
+    }
+
+    pub fn next(&self) -> Align {
+        match self {
+            Align::Start => Align::Center,
+            Align::Center => Align::End,
+            Align::End => Align::Start,
+        }
+    }
+
+    /// Offset for a `len`-long span inside a `base`-long one.
+    fn offset(&self, base: u32, len: u32) -> i32 {
+        match self {
+            Align::Start => 0,
+            Align::Center => (base as i32 - len as i32) / 2,
+            Align::End => base as i32 - len as i32,
+        }
+    }
+}
+
+/// A display's footprint in Hyprland's logical coordinate space (post-scale,
+/// post-rotation), which is the space `monitor=` positions live in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rect {
+    pub x: i32,
+    pub y: i32,
+    pub w: u32,
+    pub h: u32,
+}
+
+impl Rect {
+    pub fn new(x: i32, y: i32, w: u32, h: u32) -> Self {
+        Self { x, y, w, h }
+    }
+
+    pub fn right(&self) -> i32 {
+        self.x + self.w as i32
+    }
+
+    pub fn bottom(&self) -> i32 {
+        self.y + self.h as i32
+    }
+
+    /// Shared interior area — touching edges don't count as overlapping.
+    pub fn overlaps(&self, other: &Rect) -> bool {
+        self.x < other.right()
+            && other.x < self.right()
+            && self.y < other.bottom()
+            && other.y < self.bottom()
+    }
+
+    /// A shared border of non-zero length: the cursor can cross here. Corner
+    /// contact is not enough, so the overlap on the shared edge must be > 0.
+    pub fn touches(&self, other: &Rect) -> bool {
+        let x_overlap = self.x.max(other.x) < self.right().min(other.right());
+        let y_overlap = self.y.max(other.y) < self.bottom().min(other.bottom());
+        (self.right() == other.x || other.right() == self.x) && y_overlap
+            || (self.bottom() == other.y || other.bottom() == self.y) && x_overlap
+    }
+}
+
 /// Position `size` (a display's effective w×h) relative to an already-placed
-/// `base` rect (x, y, w, h), touching on the given side.
+/// `base` rect (x, y, w, h), touching on the given side, flush at the start of
+/// the cross axis. Kept for callers that don't care about alignment.
 pub fn place(base: (i32, i32, u32, u32), size: (u32, u32), side: Side) -> (i32, i32) {
     let (bx, by, bw, bh) = base;
+    place_aligned(Rect::new(bx, by, bw, bh), size, side, Align::Start)
+}
+
+/// Position `size` against `base` on `side`, lining the two up on the cross
+/// axis according to `align`.
+pub fn place_aligned(base: Rect, size: (u32, u32), side: Side, align: Align) -> (i32, i32) {
     let (w, h) = size;
     match side {
-        Side::RightOf => (bx + bw as i32, by),
-        Side::LeftOf => (bx - w as i32, by),
-        Side::Below => (bx, by + bh as i32),
-        Side::Above => (bx, by - h as i32),
+        Side::RightOf => (base.right(), base.y + align.offset(base.h, h)),
+        Side::LeftOf => (base.x - w as i32, base.y + align.offset(base.h, h)),
+        Side::Below => (base.x + align.offset(base.w, w), base.bottom()),
+        Side::Above => (base.x + align.offset(base.w, w), base.y - h as i32),
+    }
+}
+
+/// What's wrong with an arrangement. Neither stops Hyprland from loading, so
+/// these are warnings the frontend shows — not errors that block a write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LayoutIssue {
+    /// Two displays claim the same logical pixels; Hyprland will render the
+    /// overlap to both and the cursor behaves oddly across it.
+    Overlap { a: String, b: String },
+    /// An island with no shared edge — the pointer can't reach it, because
+    /// there is no border to cross.
+    Detached { name: String },
+}
+
+impl LayoutIssue {
+    pub fn message(&self) -> String {
+        match self {
+            LayoutIssue::Overlap { a, b } => {
+                format!("{a} and {b} overlap — they'll fight over the same pixels")
+            }
+            LayoutIssue::Detached { name } => {
+                format!("{name} has a gap around it — the cursor can't reach that screen")
+            }
+        }
     }
 }
 
@@ -423,6 +579,41 @@ impl MonitorSetting {
             transform: m.transform,
             disabled: m.disabled,
         }
+    }
+
+    /// The scale this setting asks for, falling back to 1 on an unparseable
+    /// string (the field is rendered by `fmt_scale`, so that shouldn't happen).
+    pub fn scale_value(&self) -> f64 {
+        self.scale
+            .parse::<f64>()
+            .ok()
+            .filter(|s| *s > 0.0)
+            .unwrap_or(1.0)
+    }
+
+    /// Native size this setting selects. `None` when it says `preferred` —
+    /// only Hyprland knows what that resolves to.
+    pub fn mode_size(&self) -> Option<(u32, u32)> {
+        Mode::parse(&self.mode).map(|m| (m.width, m.height))
+    }
+
+    /// Logical size after scale and rotation. Falls back to the live display
+    /// when the mode is `preferred`; `None` if neither can say.
+    pub fn effective_size(&self, live: Option<&Monitor>) -> Option<(u32, u32)> {
+        let (w, h) = self
+            .mode_size()
+            .or_else(|| live.map(|m| (m.width, m.height)))?;
+        Some(effective_size(w, h, self.scale_value(), self.transform))
+    }
+
+    /// This display's footprint, or `None` for a disabled display or one whose
+    /// size can't be determined.
+    pub fn rect(&self, live: Option<&Monitor>) -> Option<Rect> {
+        if self.disabled {
+            return None;
+        }
+        let (w, h) = self.effective_size(live)?;
+        Some(Rect::new(self.x, self.y, w, h))
     }
 
     /// The `monitor=` directive for this display.
@@ -470,6 +661,200 @@ impl Layout {
             }
         }
         hit
+    }
+
+    // -------------------------------------------------------- arrangement
+
+    /// Every enabled display's footprint, paired with its name, in layout
+    /// order. Displays that are off (or whose size is unknowable) drop out.
+    pub fn rects(&self, live: &[Monitor]) -> Vec<(String, Rect)> {
+        self.monitors
+            .iter()
+            .filter_map(|s| {
+                let l = live.iter().find(|m| m.name == s.name);
+                s.rect(l).map(|r| (s.name.clone(), r))
+            })
+            .collect()
+    }
+
+    /// Move one display to an absolute logical position. False when no display
+    /// in the layout goes by that name.
+    pub fn set_position(&mut self, name: &str, x: i32, y: i32) -> bool {
+        let mut hit = false;
+        for s in &mut self.monitors {
+            if s.name == name {
+                (s.x, s.y) = (x, y);
+                hit = true;
+            }
+        }
+        hit
+    }
+
+    /// Put `name` flush against `anchor` on `side`, lined up per `align`, then
+    /// re-origin the whole arrangement so nothing sits at negative coordinates.
+    ///
+    /// The error is user-facing: a name that isn't a display, an anchor that is
+    /// the display itself, or a display that's currently disabled (moving an
+    /// off screen would write a position Hyprland ignores).
+    pub fn place_relative(
+        &mut self,
+        name: &str,
+        anchor: &str,
+        side: Side,
+        align: Align,
+        live: &[Monitor],
+    ) -> std::result::Result<(), String> {
+        if name == anchor {
+            return Err(format!("{name} can't be placed relative to itself"));
+        }
+        let size = self.require_size(name, live)?;
+        let base = self.require_rect(anchor, live)?;
+        let (x, y) = place_aligned(base, size, side, align);
+        self.set_position(name, x, y);
+        self.normalize(live);
+        Ok(())
+    }
+
+    /// Lay the enabled displays out edge to edge along one axis.
+    ///
+    /// `order` names the displays left-to-right (or top-to-bottom); any enabled
+    /// display it omits is appended in layout order, so a partial order like
+    /// `["HDMI-A-1"]` still produces a complete arrangement.
+    pub fn arrange(
+        &mut self,
+        side: Side,
+        order: &[String],
+        align: Align,
+        live: &[Monitor],
+    ) -> std::result::Result<(), String> {
+        let mut seq: Vec<String> = Vec::new();
+        for want in order {
+            let known = self.monitors.iter().any(|s| &s.name == want);
+            if !known {
+                return Err(format!("no display named `{want}` in this layout"));
+            }
+            if !seq.contains(want) {
+                seq.push(want.clone());
+            }
+        }
+        for (name, _) in self.rects(live) {
+            if !seq.contains(&name) {
+                seq.push(name);
+            }
+        }
+        // Drop anything disabled — an off display has no footprint to chain.
+        seq.retain(|n| self.rect_of(n, live).is_some());
+        let Some((first, rest)) = seq.split_first() else {
+            return Err("no enabled displays to arrange".into());
+        };
+        let size = self.require_size(first, live)?;
+        self.set_position(first, 0, 0);
+        let mut prev = Rect::new(0, 0, size.0, size.1);
+        for name in rest {
+            let size = self.require_size(name, live)?;
+            let (x, y) = place_aligned(prev, size, side, align);
+            self.set_position(name, x, y);
+            prev = Rect::new(x, y, size.0, size.1);
+        }
+        self.normalize(live);
+        Ok(())
+    }
+
+    /// Shift every display by the same offset so the top-left-most edge sits at
+    /// the origin. Hyprland accepts negative coordinates, but keeping the
+    /// arrangement in positive space makes `monitors.conf` readable and keeps
+    /// relative moves from drifting away from 0,0 over successive edits.
+    pub fn normalize(&mut self, live: &[Monitor]) {
+        let rects = self.rects(live);
+        let (Some(min_x), Some(min_y)) = (
+            rects.iter().map(|(_, r)| r.x).min(),
+            rects.iter().map(|(_, r)| r.y).min(),
+        ) else {
+            return;
+        };
+        if (min_x, min_y) == (0, 0) {
+            return;
+        }
+        let names: Vec<String> = rects.into_iter().map(|(n, _)| n).collect();
+        for s in &mut self.monitors {
+            if names.contains(&s.name) {
+                s.x -= min_x;
+                s.y -= min_y;
+            }
+        }
+    }
+
+    /// Overlaps and unreachable islands in the current arrangement. Empty means
+    /// every enabled display tiles cleanly and the cursor can reach all of them.
+    pub fn check(&self, live: &[Monitor]) -> Vec<LayoutIssue> {
+        let rects = self.rects(live);
+        let mut issues = Vec::new();
+        for (i, (a, ra)) in rects.iter().enumerate() {
+            for (b, rb) in rects.iter().skip(i + 1) {
+                if ra.overlaps(rb) {
+                    issues.push(LayoutIssue::Overlap {
+                        a: a.clone(),
+                        b: b.clone(),
+                    });
+                }
+            }
+        }
+        // Flood-fill the "shares an edge with" graph from the first display;
+        // anything unvisited is an island the pointer can't cross into.
+        // Overlapping counts as connected — that's a different complaint,
+        // already reported above, and it is emphatically not a gap.
+        if rects.len() > 1 {
+            // Start from the biggest display: with two disconnected screens
+            // either could be called the island, and the small one floating
+            // away from the main desktop is the answer a user expects.
+            let anchor = rects
+                .iter()
+                .enumerate()
+                .max_by_key(|(i, (_, r))| (r.w as u64 * r.h as u64, std::cmp::Reverse(*i)))
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            let mut seen = vec![false; rects.len()];
+            let mut stack = vec![anchor];
+            seen[anchor] = true;
+            while let Some(i) = stack.pop() {
+                for (j, (_, rj)) in rects.iter().enumerate() {
+                    if !seen[j] && (rects[i].1.touches(rj) || rects[i].1.overlaps(rj)) {
+                        seen[j] = true;
+                        stack.push(j);
+                    }
+                }
+            }
+            for (i, reached) in seen.iter().enumerate() {
+                if !reached {
+                    issues.push(LayoutIssue::Detached {
+                        name: rects[i].0.clone(),
+                    });
+                }
+            }
+        }
+        issues
+    }
+
+    fn rect_of(&self, name: &str, live: &[Monitor]) -> Option<Rect> {
+        let s = self.monitors.iter().find(|s| s.name == name)?;
+        s.rect(live.iter().find(|m| m.name == name))
+    }
+
+    /// A named display's footprint, or a user-facing reason there isn't one.
+    fn require_rect(&self, name: &str, live: &[Monitor]) -> std::result::Result<Rect, String> {
+        if !self.monitors.iter().any(|s| s.name == name) {
+            return Err(format!("no display named `{name}` — see `monitor list`"));
+        }
+        self.rect_of(name, live)
+            .ok_or_else(|| format!("{name} is disabled — enable it before arranging around it"))
+    }
+
+    fn require_size(
+        &self,
+        name: &str,
+        live: &[Monitor],
+    ) -> std::result::Result<(u32, u32), String> {
+        self.require_rect(name, live).map(|r| (r.w, r.h))
     }
 
     /// The managed-block body: one `monitor=` line per display, then a
@@ -797,6 +1182,269 @@ mod tests {
         assert!(body.contains("monitor = eDP-1,"));
         assert!(body.contains("monitor = HDMI-A-1,"));
         assert!(body.trim_end().ends_with("monitor = , preferred, auto, 1"));
+    }
+
+    // A 3440x1440 ultrawide plus a 1920x1080 laptop panel at scale 1.5, which
+    // is 1280x720 effective — the mismatch that makes alignment matter.
+    const DESK: &str = r#"[
+      {"id":0,"name":"eDP-1","description":"Lenovo 0x9059","make":"Lenovo","model":"0x9059",
+       "width":1920,"height":1080,"refreshRate":120.213,"x":3440,"y":0,"scale":1.5,"transform":0,
+       "focused":false,"disabled":false,"dpmsStatus":true},
+      {"id":1,"name":"HDMI-A-1","description":"Acer ED340CUR","make":"Acer","model":"ED340CUR",
+       "width":3440,"height":1440,"refreshRate":100.0,"x":0,"y":0,"scale":1.0,"transform":0,
+       "focused":true,"disabled":false,"dpmsStatus":true}
+    ]"#;
+
+    fn desk() -> (Vec<Monitor>, Layout) {
+        let live = parse(DESK).unwrap();
+        let layout = Layout::from_monitors(&live);
+        (live, layout)
+    }
+
+    #[test]
+    fn setting_reports_its_effective_footprint() {
+        let (live, layout) = desk();
+        let laptop = &layout.monitors[0];
+        // 1920x1080 at 1.5 is 1280x720 logical.
+        assert_eq!(laptop.effective_size(Some(&live[0])), Some((1280, 720)));
+        assert_eq!(
+            laptop.rect(Some(&live[0])),
+            Some(Rect::new(3440, 0, 1280, 720))
+        );
+    }
+
+    #[test]
+    fn preferred_falls_back_to_the_live_size() {
+        let (live, mut layout) = desk();
+        layout.set_mode("eDP-1", None);
+        assert_eq!(layout.monitors[0].mode, "preferred");
+        assert_eq!(
+            layout.monitors[0].effective_size(Some(&live[0])),
+            Some((1280, 720))
+        );
+        // With nothing live to ask, `preferred` has no knowable size.
+        assert_eq!(layout.monitors[0].effective_size(None), None);
+    }
+
+    #[test]
+    fn disabled_displays_have_no_footprint() {
+        let (live, mut layout) = desk();
+        layout.monitors[0].disabled = true;
+        assert_eq!(layout.monitors[0].rect(Some(&live[0])), None);
+        assert_eq!(layout.rects(&live).len(), 1);
+    }
+
+    #[test]
+    fn place_aligned_lines_up_the_cross_axis() {
+        let base = Rect::new(0, 0, 3440, 1440);
+        let small = (1280, 720);
+        assert_eq!(
+            place_aligned(base, small, Side::RightOf, Align::Start),
+            (3440, 0)
+        );
+        assert_eq!(
+            place_aligned(base, small, Side::RightOf, Align::Center),
+            (3440, 360)
+        );
+        assert_eq!(
+            place_aligned(base, small, Side::RightOf, Align::End),
+            (3440, 720)
+        );
+        assert_eq!(
+            place_aligned(base, small, Side::LeftOf, Align::End),
+            (-1280, 720)
+        );
+        assert_eq!(
+            place_aligned(base, small, Side::Below, Align::Center),
+            (1080, 1440)
+        );
+        assert_eq!(
+            place_aligned(base, small, Side::Above, Align::Center),
+            (1080, -720)
+        );
+        // The alignment-free helper stays flush at the start.
+        assert_eq!(place((0, 0, 3440, 1440), small, Side::Below), (0, 1440));
+    }
+
+    #[test]
+    fn rects_distinguish_touching_from_overlapping() {
+        let a = Rect::new(0, 0, 100, 100);
+        assert!(a.touches(&Rect::new(100, 0, 50, 50)));
+        assert!(!a.overlaps(&Rect::new(100, 0, 50, 50)));
+        assert!(a.overlaps(&Rect::new(99, 0, 50, 50)));
+        // Corner-to-corner shares a point, not an edge: not reachable.
+        assert!(!a.touches(&Rect::new(100, 100, 50, 50)));
+        // A gap is neither.
+        assert!(!a.touches(&Rect::new(120, 0, 50, 50)));
+    }
+
+    #[test]
+    fn place_relative_puts_the_laptop_under_the_ultrawide() {
+        let (live, mut layout) = desk();
+        layout
+            .place_relative("eDP-1", "HDMI-A-1", Side::Below, Align::Center, &live)
+            .unwrap();
+        // Centred under a 3440-wide screen: (3440-1280)/2 = 1080.
+        assert_eq!(layout.monitors[0].x, 1080);
+        assert_eq!(layout.monitors[0].y, 1440);
+        assert_eq!((layout.monitors[1].x, layout.monitors[1].y), (0, 0));
+        assert!(layout.check(&live).is_empty());
+    }
+
+    #[test]
+    fn place_relative_left_renormalizes_to_the_origin() {
+        let (live, mut layout) = desk();
+        layout
+            .place_relative("eDP-1", "HDMI-A-1", Side::LeftOf, Align::End, &live)
+            .unwrap();
+        // Laptop lands at -1280; normalize slides the pair back to 0.
+        assert_eq!((layout.monitors[0].x, layout.monitors[0].y), (0, 720));
+        assert_eq!((layout.monitors[1].x, layout.monitors[1].y), (1280, 0));
+        assert!(layout.check(&live).is_empty());
+    }
+
+    #[test]
+    fn place_relative_rejects_bad_targets() {
+        let (live, mut layout) = desk();
+        let err = layout
+            .place_relative("eDP-1", "eDP-1", Side::LeftOf, Align::Start, &live)
+            .unwrap_err();
+        assert!(err.contains("relative to itself"), "{err}");
+
+        let err = layout
+            .place_relative("DP-9", "eDP-1", Side::LeftOf, Align::Start, &live)
+            .unwrap_err();
+        assert!(err.contains("no display named"), "{err}");
+
+        layout.monitors[1].disabled = true;
+        let err = layout
+            .place_relative("eDP-1", "HDMI-A-1", Side::LeftOf, Align::Start, &live)
+            .unwrap_err();
+        assert!(err.contains("is disabled"), "{err}");
+    }
+
+    #[test]
+    fn arrange_chains_displays_in_the_given_order() {
+        let (live, mut layout) = desk();
+        layout
+            .arrange(
+                Side::RightOf,
+                &["HDMI-A-1".to_string()],
+                Align::Center,
+                &live,
+            )
+            .unwrap();
+        // Named first, so the ultrawide anchors at the origin and the laptop
+        // (unnamed, appended) centres against its right edge.
+        assert_eq!((layout.monitors[1].x, layout.monitors[1].y), (0, 0));
+        assert_eq!((layout.monitors[0].x, layout.monitors[0].y), (3440, 360));
+        assert!(layout.check(&live).is_empty());
+    }
+
+    #[test]
+    fn arrange_stacks_vertically_too() {
+        let (live, mut layout) = desk();
+        layout
+            .arrange(Side::Below, &["eDP-1".to_string()], Align::Start, &live)
+            .unwrap();
+        assert_eq!((layout.monitors[0].x, layout.monitors[0].y), (0, 0));
+        assert_eq!((layout.monitors[1].x, layout.monitors[1].y), (0, 720));
+        assert!(layout.check(&live).is_empty());
+    }
+
+    #[test]
+    fn arrange_skips_disabled_displays() {
+        let (live, mut layout) = desk();
+        layout.monitors[0].disabled = true;
+        layout
+            .arrange(Side::RightOf, &[], Align::Start, &live)
+            .unwrap();
+        assert_eq!((layout.monitors[1].x, layout.monitors[1].y), (0, 0));
+        // A layout with nothing lit has nothing to arrange.
+        layout.monitors[1].disabled = true;
+        let err = layout
+            .arrange(Side::RightOf, &[], Align::Start, &live)
+            .unwrap_err();
+        assert!(err.contains("no enabled displays"), "{err}");
+    }
+
+    #[test]
+    fn arrange_rejects_an_unknown_name_in_the_order() {
+        let (live, mut layout) = desk();
+        let err = layout
+            .arrange(Side::RightOf, &["DP-9".to_string()], Align::Start, &live)
+            .unwrap_err();
+        assert!(err.contains("no display named `DP-9`"), "{err}");
+    }
+
+    #[test]
+    fn check_catches_overlap_and_islands() {
+        let (live, mut layout) = desk();
+        // Drag the laptop on top of the ultrawide.
+        layout.set_position("eDP-1", 100, 100);
+        let issues = layout.check(&live);
+        assert_eq!(
+            issues,
+            vec![LayoutIssue::Overlap {
+                a: "eDP-1".into(),
+                b: "HDMI-A-1".into()
+            }]
+        );
+        assert!(issues[0].message().contains("overlap"));
+
+        // Float it clear of everything: reachable by neither edge.
+        layout.set_position("eDP-1", 5000, 5000);
+        let issues = layout.check(&live);
+        assert_eq!(
+            issues,
+            vec![LayoutIssue::Detached {
+                name: "eDP-1".into()
+            }]
+        );
+        assert!(issues[0].message().contains("cursor can't reach"));
+    }
+
+    #[test]
+    fn check_is_quiet_on_a_single_display() {
+        let live = parse(ULTRAWIDE).unwrap();
+        let layout = Layout::from_monitors(&live);
+        assert!(layout.check(&live).is_empty());
+    }
+
+    #[test]
+    fn normalize_slides_negative_coords_back() {
+        let (live, mut layout) = desk();
+        layout.set_position("eDP-1", -500, -200);
+        layout.normalize(&live);
+        assert_eq!((layout.monitors[0].x, layout.monitors[0].y), (0, 0));
+        assert_eq!((layout.monitors[1].x, layout.monitors[1].y), (500, 200));
+        // Already at the origin: a second pass changes nothing.
+        let before = layout.clone();
+        layout.normalize(&live);
+        assert_eq!(layout, before);
+    }
+
+    #[test]
+    fn set_position_reports_unknown_names() {
+        let (_, mut layout) = desk();
+        assert!(layout.set_position("eDP-1", 10, 20));
+        assert_eq!((layout.monitors[0].x, layout.monitors[0].y), (10, 20));
+        assert!(!layout.set_position("DP-9", 0, 0));
+    }
+
+    #[test]
+    fn side_and_align_parse_what_users_type() {
+        assert_eq!(Side::parse("left-of"), Some(Side::LeftOf));
+        assert_eq!(Side::parse("RIGHT"), Some(Side::RightOf));
+        assert_eq!(Side::parse("above"), Some(Side::Above));
+        assert_eq!(Side::parse("down"), Some(Side::Below));
+        assert_eq!(Side::parse("sideways"), None);
+        assert_eq!(Align::parse("centre"), Some(Align::Center));
+        assert_eq!(Align::parse("bottom"), Some(Align::End));
+        assert_eq!(Align::parse("nope"), None);
+        assert_eq!(Align::Start.label(true), "top");
+        assert_eq!(Align::Start.label(false), "left");
+        assert_eq!(Align::Start.next().next(), Align::End);
     }
 
     #[test]

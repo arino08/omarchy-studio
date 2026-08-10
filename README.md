@@ -83,7 +83,7 @@ This is the part that matters, so it's not buried at the bottom:
 | **Integrations** | Dependency health + companion-tool detection (Aether, Omarchist, matugen, hyprmon) with launch actions; "Open in Aether" appears in the wallpaper browser when installed | v0.6 |
 | **Power** | Battery charge thresholds on ThinkPads & friends (`charge_control_*_threshold`) — no TLP needed; CLI can persist them across reboots. Plus power profiles (switch & persist at login) and an AC/battery auto-switch udev rule shown for approval before any root write | v0.6 · v0.8 |
 | **Apps & services** | Remove bundled apps and web apps safely: a `pacman -Rs --print` **cascade preview** shows every orphaned dependency, enabled systemd units are disabled first, and pacman's refusal to break a dependency is surfaced as a blocker (never forced). Every removal is logged so `apps restore <id>` can reinstall it. No bulk-confirm bypass | v0.8 |
-| **Monitors** | Detect displays (`hyprctl monitors -j`), identify which panel is which, set resolution and refresh rate from the modes the panel actually advertises (asking a 100Hz display for 200Hz is refused with the list of what it can do, not silently dropped), adjust scale with the effective resolution shown live, disable a display — written to `monitors.conf` as a managed block with a hotplug fallback, snapshot-backed | v0.8 |
+| **Monitors** | Detect displays (`hyprctl monitors -j`), identify which panel is which, set resolution and refresh rate from the modes the panel actually advertises (asking a 100Hz display for 200Hz is refused with the list of what it can do, not silently dropped), adjust scale with the effective resolution shown live, disable a display, and **arrange the screens** against a proportional map of your desk — put the laptop below the ultrawide centred, or left of it bottom-aligned, with overlaps and unreachable screens called out before you save. Written to `monitors.conf` as a managed block with a hotplug fallback, snapshot-backed | v0.8 |
 | **Quick tweaks** | One-key reversible toggles (Caps→Escape, inactive-window transparency, screenshot/screencast folders…) — each a self-contained managed block, individually revertible, never touching Omarchy's vendored files | v0.8 |
 | **Nice Launcher** | Drive the Nice Launcher (Quickshell app-search overlay): visual mode (constellation / spotlight / orbital / grid), backdrop, animation toggles and providers written to `nova.json`, snapshot-backed; optional launch keybind through the managed keybinds block; launch or install it straight from the rail. CLI `nova show|mode|set|anim|providers|keybind|launch|install|uninstall` | — |
 | **Snapshots** | Browse every change Studio has ever made as a timeline with a live colored diff pane, and roll the whole tree back to any point — the restore is itself recorded, so it too can be undone. Only possible because the undo store is a real git repo. CLI `snapshot log`/`show <id>`/`restore <id>` | v0.9 |
@@ -228,6 +228,11 @@ omarchy-studio monitor identify                  # flash each monitor's name on-
 omarchy-studio monitor modes <name>              # every resolution/refresh the panel supports
 omarchy-studio monitor mode <name> <WxH[@Hz]|Hz|preferred> [--dry-run]
 omarchy-studio monitor scale <name> <f> [--dry-run]
+omarchy-studio monitor place <name> <left-of|right-of|above|below> <anchor> [--align start|center|end] [--dry-run]
+omarchy-studio monitor arrange <row|column> [<name>…] [--align …] [--dry-run]
+omarchy-studio monitor position <name> <XxY> [--dry-run]   # exact logical coords
+omarchy-studio monitor normalize [--dry-run]     # re-origin the arrangement at 0,0
+omarchy-studio monitor check                     # warn about overlaps and unreachable screens
 omarchy-studio monitor apply [--dry-run]         # persist the current layout
 
 # Quick tweaks — one-key reversible toggles
