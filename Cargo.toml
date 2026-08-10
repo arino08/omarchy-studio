@@ -6,7 +6,7 @@ members = ["crates/studio-core", "crates/omarchy-studio"]
 # Must match the next release tag — release.yml refuses a tag that disagrees
 # (the binary bakes this in as CARGO_PKG_VERSION; a stale value makes the
 # self-updater loop forever on "newer" releases).
-version = "0.9.2"
+version = "0.9.3"
 edition = "2021"
 license = "MIT"
 authors = ["Ariz <arinopc22@gmail.com>"]
@@ -17,7 +17,7 @@ keywords = ["omarchy", "hyprland", "theming", "tui", "config"]
 categories = ["command-line-utilities", "config"]
 
 [workspace.dependencies]
-studio-core = { path = "crates/studio-core", version = "0.9.2" }
+studio-core = { path = "crates/studio-core", version = "0.9.3" }
 toml_edit = "0.22"          # lossless TOML (colors.toml, walker/swayosd configs)
 ratatui = "0.29"            # TUI framework (crossterm re-exported via ratatui::crossterm)
 serde = { version = "1", features = ["derive"] }  # hyprctl -j, wallhaven API
