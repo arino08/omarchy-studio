@@ -1,6 +1,6 @@
 # Maintainer: Ariz <arinopc22@gmail.com>
 pkgname=omarchy-studio
-pkgver=0.9.2
+pkgver=0.9.3
 pkgrel=1
 pkgdesc="One-stop theming cockpit for Omarchy — themes, keybinds, waybar, notifications, lock/idle (TUI + CLI)"
 arch=('x86_64')
@@ -10,7 +10,7 @@ depends=('gcc-libs')
 makedepends=('cargo')
 # Runtime: expects an Omarchy install (omarchy-theme-set, omarchy-restart-*, hyprctl on PATH).
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('297c49763db1ee7132e9908aa7277554610535c387b97b0ede9e879f691aebca')
+sha256sums=('eb0dcbcdcd01668ddffc3dbe2e0145f19f7083674164c7ae471c8d81cb0ddc6d')
 
 prepare() {
     cd "$pkgname-$pkgver"
