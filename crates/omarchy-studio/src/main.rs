@@ -111,9 +111,10 @@ fn cli() -> Command {
              idle timeline\n  \
              idle set <screensaver|lock|screen-off|suspend> <seconds>"))
         .subcommand(group("lock", "Lock screen appearance", "usage: omarchy-studio lock show | avatar <path> | avatar add <file> | avatar list | size <px> | blur <n>"))
-        .subcommand(group("monitor", "Displays: layout, scale, primary, identify",
+        .subcommand(group("monitor", "Displays: resolution, refresh rate, layout, scale, identify",
             "usage:\n  \
-             monitor list | identify\n  \
+             monitor list | identify | modes <name>\n  \
+             monitor mode <name> <WxH[@Hz]|Hz|preferred> [--dry-run]\n  \
              monitor primary <name> | scale <name> <factor> [--dry-run]\n  \
              monitor apply [--dry-run]"))
         .subcommand(group("apps", "Remove apps and webapps safely, with a cascade preview",
@@ -3120,6 +3121,61 @@ fn monitor(args: &[&str]) -> i32 {
             println!("flashed each monitor's name for 2s.");
             0
         }
+        ["modes", name] => {
+            let Some(m) = live.iter().find(|m| &m.name == name) else {
+                eprintln!("no monitor named `{name}` — see `monitor list`");
+                return 2;
+            };
+            let modes = m.modes();
+            if modes.is_empty() {
+                eprintln!("{name} reports no modes (Hyprland too old to list them?)");
+                return 1;
+            }
+            let current = mon::Mode {
+                width: m.width,
+                height: m.height,
+                refresh: m.refresh_rate,
+            };
+            for mode in &modes {
+                let tag = if mode.matches(&current) {
+                    "  [current]"
+                } else {
+                    ""
+                };
+                println!("{}{tag}", mode.label());
+            }
+            0
+        }
+        ["mode", name, spec, rest @ ..] | ["rate", name, spec, rest @ ..] => {
+            let dry_run = rest.contains(&"--dry-run");
+            let Some(m) = live.iter().find(|m| &m.name == name) else {
+                eprintln!("no monitor named `{name}` — see `monitor list`");
+                return 2;
+            };
+            let Some(req) = mon::ModeRequest::parse(spec) else {
+                eprintln!("can't read `{spec}` — try 3440x1440@100, 3440x1440, 100, or preferred");
+                return 2;
+            };
+            let resolved = match m.resolve_mode(req) {
+                Ok(r) => r,
+                Err(msg) => {
+                    eprintln!("{msg}");
+                    eprintln!("see `monitor modes {name}` for the full list");
+                    return 2;
+                }
+            };
+            let mut layout = mon::Layout::from_monitors(&live);
+            layout.set_mode(name, resolved);
+            let shown = resolved
+                .map(|r| r.label())
+                .unwrap_or_else(|| "preferred".into());
+            monitor_write(
+                &paths,
+                &layout,
+                &format!("monitor mode {name} {shown}"),
+                dry_run,
+            )
+        }
         ["scale", name, value, rest @ ..] => {
             let dry_run = rest.contains(&"--dry-run");
             let Ok(scale) = value.parse::<f64>() else {
@@ -3155,7 +3211,9 @@ fn monitor(args: &[&str]) -> i32 {
         }
         _ => {
             eprintln!(
-                "usage: monitor list | identify | scale <name> <f> [--dry-run] | apply [--dry-run]"
+                "usage: monitor list | identify | modes <name>\n       \
+                 monitor mode <name> <WxH[@Hz]|Hz|preferred> [--dry-run]\n       \
+                 monitor scale <name> <f> [--dry-run] | apply [--dry-run]"
             );
             2
         }
