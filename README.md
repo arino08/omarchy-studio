@@ -26,7 +26,7 @@ curl -sL https://raw.githubusercontent.com/arino08/omarchy-studio/main/install.s
 omarchy-studio
 ```
 
-> **Status: alpha, and honest about it.** Everything below is built, tested (264 tests, plus the TUI itself driven in a pty on every CI run) and drives the real Omarchy config on disk. v0.9.0 is the current release. Tested against Omarchy 3.8 / Hyprland 0.55 — Studio warns, but never refuses to run, on versions it hasn't seen.
+> **Status: alpha, and honest about it.** Everything below is built, tested (361 tests, plus the TUI itself driven in a pty on every CI run) and drives the real Omarchy config on disk. v0.9.3 is the current release. Tested against Omarchy 3.8 / Hyprland 0.55 — Studio warns, but never refuses to run, on versions it hasn't seen.
 
 ## Why
 
