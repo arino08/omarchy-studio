@@ -74,6 +74,7 @@ This is the part that matters, so it's not buried at the bottom:
 | **Notifications (mako)** | Behavior schema (timeouts, layout, urgency rules), do-not-disturb, live sample notifications | v0.5 |
 | **OSD (swayosd)** | Volume/brightness popup geometry, percentage, margins, self-test | v0.5 |
 | **Lock & Idle** | Retime the hypridle timeline (screensaver → lock → screen-off → suspend), hyprlock avatar/blur/dim | v0.5 |
+| **Omarchy 4 shell** | Bar layout and plugin state on Quattro's Quickshell `omarchy-shell` — wraps Omarchy's own `omarchy bar`/`omarchy plugin` commands rather than hand-editing `shell.json`, plus direct idle-timer editing (no dedicated command upstream). Replaces the old Waybar/Notifications/OSD/Lock & Idle coverage on Omarchy 4, where those components don't exist. CLI-only so far (`shell idle`/`shell bar`/`shell plugin`) — no TUI screen yet | — |
 | **Update survival** | Lifecycle hooks (`theme-set`, `post-update`) re-assert Studio's style blocks after theme changes and flag drift/clobbers after `omarchy-update` | v0.5 |
 | **Doctor** | One health view: system facts, capability probes, hook status, drift report — in the TUI and the CLI | v0.5 |
 | **Wallpapers** | Browse all four background sources (yours / theme / videos) with in-terminal previews (kitty / sixel / half-blocks), set/cycle/add/remove, `o` opens in imv/mpv | v0.6 |
@@ -253,6 +254,12 @@ omarchy-studio osd test
 omarchy-studio idle timeline
 omarchy-studio idle set <screensaver|lock|screen-off|suspend> <seconds>
 omarchy-studio lock show | avatar <path> | avatar list | size <px> | blur <n> | dim <0..1> | preview
+
+# Omarchy 4 shell (bar/plugins/idle — replaces Waybar/Notifications/OSD/Lock & Idle on Quattro)
+omarchy-studio shell idle show | set <screensaver|lock> <seconds>
+omarchy-studio shell bar list | catalog | position <top|bottom|left|right> | transparent <true|false|toggle>
+omarchy-studio shell bar move <id> [placement] | put <id> [placement] | set <id> <key> <value> [--json] [placement] | defaults
+omarchy-studio shell plugin list | enable <id> [placement] | disable <id>
 
 # Battery charge thresholds (ThinkPads & friends — no TLP needed)
 omarchy-studio battery [status]

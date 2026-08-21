@@ -35,6 +35,7 @@ pub mod nova;
 pub mod power;
 pub mod rice;
 pub mod scrolloverview;
+pub mod shell;
 pub mod swayosd;
 pub mod targets;
 pub mod themes;

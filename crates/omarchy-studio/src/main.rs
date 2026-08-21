@@ -108,6 +108,13 @@ fn cli() -> Command {
             "usage:\n  \
              osd show | test\n  \
              osd set show-percentage <on|off> | max-volume <n> | top-margin <f>"))
+        .subcommand(group("shell", "Omarchy 4 shell: bar layout, plugins, idle timers",
+            "usage:\n  \
+             shell idle show | set <screensaver|lock> <seconds>\n  \
+             shell bar list | catalog | position <top|bottom|left|right> | transparent <true|false|toggle>\n  \
+             shell bar move <id> [placement] | put <id> [placement] | set <id> <key> <value> [--json] [placement] | defaults\n  \
+             shell plugin list | enable <id> [placement] | disable <id>\n  \
+             placement: --section <left|center|right> --index <n> --before <id> --after <id> --from-section <s> --from-index <n>"))
         .subcommand(group("idle", "Idle timeline (screensaver, lock, screen-off, suspend)",
             "usage:\n  \
              idle timeline\n  \
@@ -222,6 +229,7 @@ fn dispatch(argv: &[&str]) -> i32 {
         ["waybar", rest @ ..] => gate(Component::Waybar).unwrap_or_else(|| waybar(rest)),
         ["notif", rest @ ..] => gate(Component::Mako).unwrap_or_else(|| notif(rest)),
         ["osd", rest @ ..] => gate(Component::Swayosd).unwrap_or_else(|| osd(rest)),
+        ["shell", rest @ ..] => shell(rest),
         ["niri", rest @ ..] => niri(rest),
         ["nova", rest @ ..] => nova(rest),
         ["keybind", rest @ ..] => keybind_cli(rest),
@@ -1616,6 +1624,339 @@ fn osd(args: &[&str]) -> i32 {
         Err(e) => {
             eprintln!("apply failed: {e:?}");
             1
+        }
+    }
+}
+
+// ── shell (Omarchy 4: bar, plugins, idle) ──────────────────────────────────
+
+fn shell(args: &[&str]) -> i32 {
+    use studio_core::cmd::find_in_path;
+    if find_in_path("omarchy-shell").is_none() {
+        eprintln!(
+            "omarchy-shell isn't installed — this machine isn't running the Omarchy 4 shell. \
+             The bar/notifications/idle are Waybar/Mako/hypridle here; use `waybar`/`notif`/`idle` instead."
+        );
+        return 3;
+    }
+    let Some(paths) = omarchy() else { return 4 };
+    match args {
+        ["idle", rest @ ..] => shell_idle(&paths, rest),
+        ["bar", rest @ ..] => shell_bar(&paths, rest),
+        ["plugin", rest @ ..] => shell_plugin(&paths, rest),
+        _ => {
+            eprintln!(
+                "usage: shell idle show|set <screensaver|lock> <seconds> | \
+                 shell bar list|catalog|position|transparent|move|put|set|defaults | \
+                 shell plugin list|enable|disable"
+            );
+            2
+        }
+    }
+}
+
+fn shell_idle(paths: &OmarchyPaths, args: &[&str]) -> i32 {
+    use studio_core::modules::shell::{self as shell_mod, Shell};
+    let shell = Shell::load(paths);
+    match args {
+        ["show"] | [] => {
+            println!("screensaver  {}s", shell.cfg.idle.screensaver);
+            println!("lock         {}s", shell.cfg.idle.lock);
+            0
+        }
+        ["set", field @ ("screensaver" | "lock"), v] => {
+            let Ok(seconds) = v.parse::<i64>() else {
+                eprintln!("seconds must be a non-negative integer");
+                return 2;
+            };
+            if seconds < 0 {
+                eprintln!("seconds must be a non-negative integer");
+                return 2;
+            }
+            let (screensaver, lock) = if *field == "screensaver" {
+                (seconds, shell.cfg.idle.lock)
+            } else {
+                (shell.cfg.idle.screensaver, seconds)
+            };
+            let summary = format!("shell: idle.{field} = {seconds}s");
+            let path = shell_mod::config_path(paths);
+            let store = history().ok();
+            if let Some(s) = &store {
+                let _ = s.record(
+                    SnapshotKind::Pre,
+                    &format!("before {summary}"),
+                    std::slice::from_ref(&path),
+                    "shell",
+                    &[],
+                );
+            }
+            match shell_mod::apply_idle(paths, screensaver, lock, &RealRunner) {
+                Ok(_) => {
+                    if let Some(s) = &store {
+                        let _ = s.record(
+                            SnapshotKind::Post,
+                            &summary,
+                            std::slice::from_ref(&path),
+                            "shell",
+                            &[],
+                        );
+                    }
+                    println!("{summary} · undo with `omarchy-studio snapshot undo`");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("apply failed: {}", brief(e));
+                    1
+                }
+            }
+        }
+        _ => {
+            eprintln!("usage: shell idle show | set <screensaver|lock> <seconds>");
+            2
+        }
+    }
+}
+
+/// Parse `omarchy-bar`'s own placement flags: `--section`, `--index`,
+/// `--before`, `--after`, `--from-section`, `--from-index`.
+fn parse_placement(
+    args: &[&str],
+) -> std::result::Result<studio_core::modules::shell::Placement, String> {
+    use studio_core::modules::shell::{Placement, Section};
+    let mut p = Placement::default();
+    let mut i = 0;
+    while i < args.len() {
+        let need = |i: usize| -> std::result::Result<&str, String> {
+            args.get(i)
+                .copied()
+                .ok_or_else(|| format!("{} requires a value", args[i - 1]))
+        };
+        match args[i] {
+            "--section" => {
+                let v = need(i + 1)?;
+                p.section = Some(
+                    Section::parse(v)
+                        .ok_or_else(|| "section must be left, center, or right".to_string())?,
+                );
+                i += 2;
+            }
+            "--index" => {
+                let v = need(i + 1)?;
+                p.index = Some(
+                    v.parse()
+                        .map_err(|_| "index must be a non-negative integer".to_string())?,
+                );
+                i += 2;
+            }
+            "--before" => {
+                p.before = Some(need(i + 1)?.to_string());
+                i += 2;
+            }
+            "--after" => {
+                p.after = Some(need(i + 1)?.to_string());
+                i += 2;
+            }
+            "--from-section" => {
+                let v = need(i + 1)?;
+                p.from_section = Some(
+                    Section::parse(v)
+                        .ok_or_else(|| "section must be left, center, or right".to_string())?,
+                );
+                i += 2;
+            }
+            "--from-index" => {
+                let v = need(i + 1)?;
+                p.from_index = Some(
+                    v.parse()
+                        .map_err(|_| "index must be a non-negative integer".to_string())?,
+                );
+                i += 2;
+            }
+            other => return Err(format!("unknown option: {other}")),
+        }
+    }
+    if p.before.is_some() && p.after.is_some() {
+        return Err("use only one of --before or --after".into());
+    }
+    Ok(p)
+}
+
+/// Run a mutating `omarchy bar`/`omarchy plugin` command, snapshotting
+/// `shell.json` around it (the command writes and reloads it itself — Studio
+/// only needs before/after state for undo).
+fn run_shell_cmd(paths: &OmarchyPaths, summary: &str, cmd: &studio_core::cmd::Cmd) -> i32 {
+    use studio_core::modules::shell;
+    let path = shell::config_path(paths);
+    let full = format!("shell: {summary}");
+    let store = history().ok();
+    if let Some(s) = &store {
+        let _ = s.record(
+            SnapshotKind::Pre,
+            &format!("before {full}"),
+            std::slice::from_ref(&path),
+            "shell",
+            &[],
+        );
+    }
+    match RealRunner.run(cmd) {
+        Ok(out) if out.ok() => {
+            if let Some(s) = &store {
+                let _ = s.record(
+                    SnapshotKind::Post,
+                    &full,
+                    std::slice::from_ref(&path),
+                    "shell",
+                    &[],
+                );
+            }
+            println!("{full} · undo with `omarchy-studio snapshot undo`");
+            0
+        }
+        Ok(out) => {
+            eprintln!("{}", out.stderr.trim());
+            1
+        }
+        Err(e) => {
+            eprintln!("{}", brief(e));
+            1
+        }
+    }
+}
+
+fn shell_bar(paths: &OmarchyPaths, args: &[&str]) -> i32 {
+    use studio_core::modules::shell::{bar_widget_catalog, Section, Shell};
+    match args {
+        ["list"] | [] => {
+            let shell = Shell::load(paths);
+            for section in Section::ALL {
+                println!("{}", section.as_str());
+                for w in shell.cfg.bar.layout.section(section) {
+                    println!("  {}", w.id);
+                }
+            }
+            println!();
+            println!("position     {}", shell.cfg.bar.position);
+            println!("transparent  {}", shell.cfg.bar.transparent);
+            0
+        }
+        ["catalog"] => match bar_widget_catalog(&RealRunner) {
+            Ok(cat) => {
+                for p in cat {
+                    let mark = if p.enabled { "*" } else { " " };
+                    println!("{mark} {:<28} {}", p.id, p.name);
+                }
+                0
+            }
+            Err(e) => {
+                eprintln!("{}", brief(e));
+                1
+            }
+        },
+        ["position", pos] => run_shell_cmd(
+            paths,
+            &format!("bar position {pos}"),
+            &cmds::bar_position(pos),
+        ),
+        ["transparent", v] => run_shell_cmd(
+            paths,
+            &format!("bar transparent {v}"),
+            &cmds::bar_transparent(v),
+        ),
+        ["defaults"] => run_shell_cmd(paths, "bar defaults", &cmds::bar_defaults()),
+        ["move", id, rest @ ..] => match parse_placement(rest) {
+            Ok(p) => run_shell_cmd(
+                paths,
+                &format!("bar move {id}"),
+                &cmds::bar_move(id, &p.to_args()),
+            ),
+            Err(e) => {
+                eprintln!("{e}");
+                2
+            }
+        },
+        ["put", id, rest @ ..] => match parse_placement(rest) {
+            Ok(p) => run_shell_cmd(
+                paths,
+                &format!("bar put {id}"),
+                &cmds::bar_put(id, &p.to_args()),
+            ),
+            Err(e) => {
+                eprintln!("{e}");
+                2
+            }
+        },
+        ["set", id, key, value, rest @ ..] => {
+            let as_json = rest.contains(&"--json");
+            let placement_args: Vec<&str> =
+                rest.iter().filter(|a| **a != "--json").copied().collect();
+            match parse_placement(&placement_args) {
+                Ok(p) => run_shell_cmd(
+                    paths,
+                    &format!("bar set {id} {key} {value}"),
+                    &cmds::bar_set(id, key, value, as_json, &p.to_args()),
+                ),
+                Err(e) => {
+                    eprintln!("{e}");
+                    2
+                }
+            }
+        }
+        _ => {
+            eprintln!(
+                "usage: shell bar list | catalog | position <top|bottom|left|right> | \
+                 transparent <true|false|toggle> | move <id> [placement] | put <id> [placement] | \
+                 set <id> <key> <value> [--json] [placement] | defaults"
+            );
+            2
+        }
+    }
+}
+
+fn shell_plugin(paths: &OmarchyPaths, args: &[&str]) -> i32 {
+    use studio_core::modules::shell::parse_plugin_list;
+    match args {
+        ["list"] | [] => match RealRunner.run(&cmds::plugin_list_json()) {
+            Ok(out) if out.ok() => match parse_plugin_list(&out.stdout) {
+                Ok(all) => {
+                    for p in all {
+                        let mark = if p.enabled { "*" } else { " " };
+                        println!("{mark} {:<28} {:<24} {}", p.id, p.name, p.kinds.join(","));
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("{}", brief(e));
+                    1
+                }
+            },
+            Ok(out) => {
+                eprintln!("{}", out.stderr.trim());
+                1
+            }
+            Err(e) => {
+                eprintln!("{}", brief(e));
+                1
+            }
+        },
+        ["enable", id, rest @ ..] => match parse_placement(rest) {
+            Ok(p) => run_shell_cmd(
+                paths,
+                &format!("plugin enable {id}"),
+                &cmds::plugin_enable(id, &p.to_args()),
+            ),
+            Err(e) => {
+                eprintln!("{e}");
+                2
+            }
+        },
+        ["disable", id] => run_shell_cmd(
+            paths,
+            &format!("plugin disable {id}"),
+            &cmds::plugin_disable(id),
+        ),
+        _ => {
+            eprintln!("usage: shell plugin list | enable <id> [placement] | disable <id>");
+            2
         }
     }
 }

@@ -617,6 +617,91 @@ pub mod cmds {
     pub fn webapp_remove(names: &[String]) -> Cmd {
         Cmd::new("omarchy-webapp-remove").args(names.iter().cloned())
     }
+
+    // ── Omarchy 4 shell: bar, plugins, idle (roadmap O4.5) ──────────────────
+
+    /// Ask the running `omarchy-shell` to reread `shell.json`. The bar and
+    /// menu already hot-reload on save; this is for callers (like Studio) that
+    /// want to be sure a write landed rather than relying on the file watcher.
+    pub fn shell_reload() -> Cmd {
+        Cmd::new("omarchy-shell").arg("shell").arg("reloadConfig")
+    }
+
+    /// Fallback when `reloadConfig` isn't wired up in this build — rescans
+    /// plugin code, which also re-reads config. Mirrors what
+    /// `omarchy-shell-config`'s own `refresh_shell_config` helper does.
+    pub fn shell_rescan_plugins() -> Cmd {
+        Cmd::new("omarchy-shell")
+            .arg("-q")
+            .arg("shell")
+            .arg("rescanPlugins")
+    }
+
+    /// Every discovered shell plugin (bar widgets, services, panels), with
+    /// enabled/active state. The `omarchy plugin` group's own catalog — reuse
+    /// it rather than re-deriving one from `shell/plugins/**/manifest.json`.
+    pub fn plugin_list_json() -> Cmd {
+        Cmd::new("omarchy").arg("plugin").arg("list").arg("--json")
+    }
+
+    pub fn plugin_enable(id: &str, placement: &[String]) -> Cmd {
+        Cmd::new("omarchy")
+            .arg("plugin")
+            .arg("enable")
+            .arg(id)
+            .args(placement.iter().cloned())
+    }
+
+    pub fn plugin_disable(id: &str) -> Cmd {
+        Cmd::new("omarchy").arg("plugin").arg("disable").arg(id)
+    }
+
+    /// `omarchy bar move|put` — reorder or place a widget. `placement` is the
+    /// already-rendered `--section/--index/--before/--after/…` flag pairs
+    /// (see `modules::shell::Placement::to_args`).
+    pub fn bar_move(id: &str, placement: &[String]) -> Cmd {
+        Cmd::new("omarchy")
+            .arg("bar")
+            .arg("move")
+            .arg(id)
+            .args(placement.iter().cloned())
+    }
+
+    pub fn bar_put(id: &str, placement: &[String]) -> Cmd {
+        Cmd::new("omarchy")
+            .arg("bar")
+            .arg("put")
+            .arg(id)
+            .args(placement.iter().cloned())
+    }
+
+    /// A per-widget setting, e.g. `omarchy bar set omarchy.clock format HH:mm`.
+    pub fn bar_set(id: &str, key: &str, value: &str, as_json: bool, placement: &[String]) -> Cmd {
+        let mut c = Cmd::new("omarchy")
+            .arg("bar")
+            .arg("set")
+            .arg(id)
+            .arg(key)
+            .arg(value);
+        if as_json {
+            c = c.arg("--json");
+        }
+        c.args(placement.iter().cloned())
+    }
+
+    pub fn bar_position(position: &str) -> Cmd {
+        Cmd::new("omarchy").arg("bar").arg("position").arg(position)
+    }
+
+    /// `true` / `false` / `toggle`.
+    pub fn bar_transparent(value: &str) -> Cmd {
+        Cmd::new("omarchy").arg("bar").arg("transparent").arg(value)
+    }
+
+    /// Restore the default bar and service widgets — `omarchy bar defaults`.
+    pub fn bar_defaults() -> Cmd {
+        Cmd::new("omarchy").arg("bar").arg("defaults")
+    }
 }
 
 #[cfg(test)]
