@@ -13,6 +13,7 @@ mod ui;
 mod screens {
     pub mod animations;
     pub mod apps;
+    pub mod bar;
     pub mod battery;
     pub mod community;
     pub mod doctor;
@@ -50,6 +51,7 @@ use studio_core::snapshot::{SnapshotKind, SnapshotStore};
 
 use screens::animations::{AnimAction, AnimationsScreen};
 use screens::apps::{AppsAction, AppsScreen};
+use screens::bar::{BarAction, BarScreen};
 use screens::battery::{BatteryAction, BatteryScreen};
 use screens::community::{CommunityAction, CommunityBrowser};
 use screens::doctor::{DoctorAction, DoctorScreen};
@@ -162,6 +164,7 @@ struct App {
     looknfeel: LookFeelScreen,
     animations: AnimationsScreen,
     waybar: WaybarScreen,
+    bar: BarScreen,
     notifications: NotificationsScreen,
     lockidle: LockIdleScreen,
     snapshots: SnapshotsScreen,
@@ -224,6 +227,7 @@ impl App {
         let looknfeel = LookFeelScreen::load(&paths);
         let animations = AnimationsScreen::load(&paths);
         let waybar = WaybarScreen::load(&paths);
+        let bar = BarScreen::load(&paths);
         let mut notifications = NotificationsScreen::load(&paths);
         notifications.set_dnd(Some(studio_core::modules::mako::dnd_active(&RealRunner)));
         let lockidle = LockIdleScreen::load(&paths);
@@ -279,6 +283,7 @@ impl App {
             looknfeel,
             animations,
             waybar,
+            bar,
             notifications,
             lockidle,
             snapshots,
@@ -516,6 +521,7 @@ impl App {
             || (matches!(self.screen, Screen::Keybinds) && self.keybinds.is_capturing())
             || (matches!(self.screen, Screen::LookFeel) && self.looknfeel.is_modal())
             || (matches!(self.screen, Screen::Waybar) && self.waybar.is_modal())
+            || (matches!(self.screen, Screen::Waybar) && self.bar.is_modal())
             || (matches!(self.screen, Screen::Notifications) && self.notifications.is_modal())
             || (matches!(self.screen, Screen::LockIdle) && self.lockidle.is_modal())
             || (matches!(self.screen, Screen::Apps) && self.apps.is_modal())
@@ -661,8 +667,21 @@ impl App {
                 AnimAction::Apply(name) => self.apply_animation(&name),
             },
             // A screen whose component is gone shows an explanation, not an
-            // editor — so it must not act on edit keys either.
-            Screen::Waybar if unavailable(Component::Waybar).is_some() => {}
+            // editor — so it must not act on edit keys either. On Omarchy 4
+            // the Waybar slot becomes the shell's own bar (shell.json), so
+            // route there instead of going dark when omarchy-shell is present.
+            Screen::Waybar if unavailable(Component::Waybar).is_some() => {
+                if shell_available() {
+                    match self.bar.handle(key) {
+                        BarAction::None => {}
+                        BarAction::Move { id, args } => self.apply_bar_move(id, args),
+                        BarAction::Remove { id } => self.apply_bar_remove(id),
+                        BarAction::Add { id, args } => self.apply_bar_add(id, args),
+                        BarAction::Position(p) => self.apply_bar_position(p),
+                        BarAction::ToggleTransparent => self.apply_bar_transparent(),
+                    }
+                }
+            }
             Screen::Waybar => match self.waybar.handle(key) {
                 WaybarAction::None => {}
                 WaybarAction::Apply => self.apply_waybar(),
@@ -1391,6 +1410,80 @@ impl App {
             Ok(text) => Toast { text, ok: true },
             Err(text) => Toast { text, ok: false },
         });
+    }
+
+    /// Run one `omarchy bar`/`omarchy plugin` command, snapshotting
+    /// `shell.json` around it (the command writes and reloads it itself —
+    /// this only needs before/after state for undo), then refresh the screen.
+    fn apply_bar_cmd(&mut self, summary: &str, cmd: studio_core::cmd::Cmd) {
+        use studio_core::modules::shell;
+        let path = shell::config_path(&self.paths);
+        let full = format!("shell: {summary}");
+        let store = SnapshotStore::open_or_init(
+            studio_core::studio_state_dir().join("history"),
+            Box::new(RealRunner),
+        )
+        .ok();
+        if let Some(s) = &store {
+            let _ = s.record(
+                SnapshotKind::Pre,
+                &format!("before {full}"),
+                std::slice::from_ref(&path),
+                "shell",
+                &[],
+            );
+        }
+        self.toast = Some(match RealRunner.run(&cmd) {
+            Ok(out) if out.ok() => {
+                if let Some(s) = &store {
+                    let _ = s.record(
+                        SnapshotKind::Post,
+                        &full,
+                        std::slice::from_ref(&path),
+                        "shell",
+                        &[],
+                    );
+                }
+                Toast {
+                    text: full,
+                    ok: true,
+                }
+            }
+            Ok(out) => Toast {
+                text: out.stderr.trim().to_string(),
+                ok: false,
+            },
+            Err(e) => Toast {
+                text: brief(e),
+                ok: false,
+            },
+        });
+        self.bar.reload(&self.paths);
+    }
+
+    fn apply_bar_move(&mut self, id: String, args: Vec<String>) {
+        let cmd = cmds::bar_move(&id, &args);
+        self.apply_bar_cmd(&format!("bar move {id}"), cmd);
+    }
+
+    fn apply_bar_remove(&mut self, id: String) {
+        let cmd = cmds::plugin_disable(&id);
+        self.apply_bar_cmd(&format!("plugin disable {id}"), cmd);
+    }
+
+    fn apply_bar_add(&mut self, id: String, args: Vec<String>) {
+        let cmd = cmds::plugin_enable(&id, &args);
+        self.apply_bar_cmd(&format!("plugin enable {id}"), cmd);
+    }
+
+    fn apply_bar_position(&mut self, position: &str) {
+        let cmd = cmds::bar_position(position);
+        self.apply_bar_cmd(&format!("bar position {position}"), cmd);
+    }
+
+    fn apply_bar_transparent(&mut self) {
+        let cmd = cmds::bar_transparent("toggle");
+        self.apply_bar_cmd("bar transparent toggle", cmd);
     }
 
     /// Write mako behavior through the pipeline, then refresh the screen.
@@ -2475,7 +2568,13 @@ impl App {
             // usual editor there would show an empty list and quietly invite
             // edits to a file nothing reads, so say what happened instead.
             Screen::Waybar => match unavailable(Component::Waybar) {
-                Some(msg) => render_unavailable(f, area, &self.skin, "Bar", &msg),
+                Some(msg) => {
+                    if shell_available() {
+                        self.bar.render(f, area, &self.skin);
+                    } else {
+                        render_unavailable(f, area, &self.skin, "Bar", &msg);
+                    }
+                }
                 None => self.waybar.render(f, area, &self.skin),
             },
             Screen::Notifications => match unavailable(Component::Mako) {
@@ -2768,6 +2867,15 @@ fn unavailable(c: Component) -> Option<String> {
     map.entry(c.binary())
         .or_insert_with(|| c.unavailable_reason())
         .clone()
+}
+
+/// Is `omarchy-shell` on `PATH`? Cached like [`unavailable`] — `PATH` can't
+/// change under a running TUI.
+fn shell_available() -> bool {
+    use std::sync::LazyLock;
+    static AVAILABLE: LazyLock<bool> =
+        LazyLock::new(|| studio_core::cmd::find_in_path("omarchy-shell").is_some());
+    *AVAILABLE
 }
 
 /// A screen that can't do anything here, and why.

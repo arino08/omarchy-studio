@@ -1644,13 +1644,140 @@ fn shell(args: &[&str]) -> i32 {
         ["idle", rest @ ..] => shell_idle(&paths, rest),
         ["bar", rest @ ..] => shell_bar(&paths, rest),
         ["plugin", rest @ ..] => shell_plugin(&paths, rest),
+        ["appearance", rest @ ..] => shell_appearance(&paths, rest),
         _ => {
             eprintln!(
                 "usage: shell idle show|set <screensaver|lock> <seconds> | \
                  shell bar list|catalog|position|transparent|move|put|set|defaults | \
-                 shell plugin list|enable|disable"
+                 shell plugin list|enable|disable | \
+                 shell appearance show|set <font-size|bar-size-horizontal|bar-size-vertical|\
+                 bar-scale-with-font|spacing-scale|spacing-scale-with-font> <value>"
             );
             2
+        }
+    }
+}
+
+fn shell_appearance(paths: &OmarchyPaths, args: &[&str]) -> i32 {
+    use studio_core::modules::shell::Appearance;
+    let mut a = Appearance::load(paths);
+    let summary = match args {
+        ["show"] | [] => {
+            println!("font-size                {}px", a.font_base_size);
+            println!("bar-size-horizontal       {}px", a.bar_size_horizontal);
+            println!("bar-size-vertical         {}px", a.bar_size_vertical);
+            println!(
+                "bar-scale-with-font       {}",
+                if a.bar_scale_with_font { "on" } else { "off" }
+            );
+            println!("spacing-scale             {}", a.spacing_scale);
+            println!(
+                "spacing-scale-with-font   {}",
+                if a.spacing_scale_with_font {
+                    "on"
+                } else {
+                    "off"
+                }
+            );
+            return 0;
+        }
+        ["set", "font-size", v] => match v.parse::<i64>() {
+            Ok(n) if n >= 1 => {
+                a.font_base_size = n;
+                format!("shell.toml: font-size = {n}px")
+            }
+            _ => {
+                eprintln!("font-size must be a positive integer (px)");
+                return 2;
+            }
+        },
+        ["set", "bar-size-horizontal", v] => match v.parse::<i64>() {
+            Ok(n) if n >= 1 => {
+                a.bar_size_horizontal = n;
+                format!("shell.toml: bar-size-horizontal = {n}px")
+            }
+            _ => {
+                eprintln!("bar-size-horizontal must be a positive integer (px)");
+                return 2;
+            }
+        },
+        ["set", "bar-size-vertical", v] => match v.parse::<i64>() {
+            Ok(n) if n >= 1 => {
+                a.bar_size_vertical = n;
+                format!("shell.toml: bar-size-vertical = {n}px")
+            }
+            _ => {
+                eprintln!("bar-size-vertical must be a positive integer (px)");
+                return 2;
+            }
+        },
+        ["set", "bar-scale-with-font", v] => match parse_bool(v) {
+            Some(b) => {
+                a.bar_scale_with_font = b;
+                format!("shell.toml: bar-scale-with-font = {b}")
+            }
+            None => {
+                eprintln!("bar-scale-with-font is on or off");
+                return 2;
+            }
+        },
+        ["set", "spacing-scale", v] => match v.parse::<f64>() {
+            Ok(n) if n > 0.0 => {
+                a.spacing_scale = n;
+                format!("shell.toml: spacing-scale = {n}")
+            }
+            _ => {
+                eprintln!("spacing-scale must be a positive number");
+                return 2;
+            }
+        },
+        ["set", "spacing-scale-with-font", v] => match parse_bool(v) {
+            Some(b) => {
+                a.spacing_scale_with_font = b;
+                format!("shell.toml: spacing-scale-with-font = {b}")
+            }
+            None => {
+                eprintln!("spacing-scale-with-font is on or off");
+                return 2;
+            }
+        },
+        _ => {
+            eprintln!(
+                "usage: shell appearance show | set <font-size|bar-size-horizontal|\
+                 bar-size-vertical|bar-scale-with-font|spacing-scale|spacing-scale-with-font> <value>"
+            );
+            return 2;
+        }
+    };
+
+    let path = studio_core::modules::shell::shell_toml_path(paths);
+    let store = history().ok();
+    if let Some(s) = &store {
+        let _ = s.record(
+            SnapshotKind::Pre,
+            &format!("before {summary}"),
+            std::slice::from_ref(&path),
+            "shell",
+            &[],
+        );
+    }
+    match a.save(paths) {
+        Ok(()) => {
+            if let Some(s) = &store {
+                let _ = s.record(
+                    SnapshotKind::Post,
+                    &summary,
+                    std::slice::from_ref(&path),
+                    "shell",
+                    &[],
+                );
+            }
+            println!("{summary} · undo with `omarchy-studio snapshot undo`");
+            0
+        }
+        Err(e) => {
+            eprintln!("apply failed: {}", brief(e));
+            1
         }
     }
 }

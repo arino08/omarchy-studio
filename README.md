@@ -74,7 +74,7 @@ This is the part that matters, so it's not buried at the bottom:
 | **Notifications (mako)** | Behavior schema (timeouts, layout, urgency rules), do-not-disturb, live sample notifications | v0.5 |
 | **OSD (swayosd)** | Volume/brightness popup geometry, percentage, margins, self-test | v0.5 |
 | **Lock & Idle** | Retime the hypridle timeline (screensaver → lock → screen-off → suspend), hyprlock avatar/blur/dim | v0.5 |
-| **Omarchy 4 shell** | Bar layout and plugin state on Quattro's Quickshell `omarchy-shell` — wraps Omarchy's own `omarchy bar`/`omarchy plugin` commands rather than hand-editing `shell.json`, plus direct idle-timer editing (no dedicated command upstream). Replaces the old Waybar/Notifications/OSD/Lock & Idle coverage on Omarchy 4, where those components don't exist. CLI-only so far (`shell idle`/`shell bar`/`shell plugin`) — no TUI screen yet | — |
+| **Omarchy 4 shell** | Bar layout on Quattro's Quickshell `omarchy-shell`: the Waybar rail screen becomes a real bar-layout editor there — reorder/move/add/remove widgets, flip position/transparency — wrapping Omarchy's own `omarchy bar`/`omarchy plugin` commands rather than hand-editing `shell.json`. Plus idle timers and shell-wide font/bar-size/spacing scale (`shell.toml`'s only non-colour knobs — everything else there is theme-derived colour, verified against the shipped template). Replaces the old Waybar/Notifications/OSD/Lock & Idle coverage on Omarchy 4, where those components don't exist. CLI `shell idle`/`shell bar`/`shell plugin`/`shell appearance` | — |
 | **Update survival** | Lifecycle hooks (`theme-set`, `post-update`) re-assert Studio's style blocks after theme changes and flag drift/clobbers after `omarchy-update` | v0.5 |
 | **Doctor** | One health view: system facts, capability probes, hook status, drift report — in the TUI and the CLI | v0.5 |
 | **Wallpapers** | Browse all four background sources (yours / theme / videos) with in-terminal previews (kitty / sixel / half-blocks), set/cycle/add/remove, `o` opens in imv/mpv | v0.6 |
@@ -260,6 +260,7 @@ omarchy-studio shell idle show | set <screensaver|lock> <seconds>
 omarchy-studio shell bar list | catalog | position <top|bottom|left|right> | transparent <true|false|toggle>
 omarchy-studio shell bar move <id> [placement] | put <id> [placement] | set <id> <key> <value> [--json] [placement] | defaults
 omarchy-studio shell plugin list | enable <id> [placement] | disable <id>
+omarchy-studio shell appearance show | set <font-size|bar-size-horizontal|bar-size-vertical|bar-scale-with-font|spacing-scale|spacing-scale-with-font> <value>
 
 # Battery charge thresholds (ThinkPads & friends — no TLP needed)
 omarchy-studio battery [status]

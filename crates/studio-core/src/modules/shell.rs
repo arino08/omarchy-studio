@@ -215,6 +215,17 @@ impl Shell {
         &self.path
     }
 
+    /// Build a `Shell` from an already-known path and config, skipping disk
+    /// entirely — for a caller that already has a `ShellConfig` from
+    /// elsewhere (tests; a future in-memory editor).
+    pub fn from_config(path: PathBuf, cfg: ShellConfig) -> Self {
+        Self {
+            path,
+            existed: true,
+            cfg,
+        }
+    }
+
     /// Write `shell.json` (pretty, trailing newline, `version` pinned to 1 —
     /// matching the shape `omarchy-shell-config`'s own `NORMALIZE` jq pipeline
     /// produces). The shell hot-reloads layout changes on save; idle changes
@@ -244,6 +255,125 @@ impl Shell {
             cmd: "omarchy-shell shell reloadConfig".into(),
             detail: out.stderr.trim().to_string(),
         })
+    }
+}
+
+// ── shell.toml: font / bar-size / spacing ───────────────────────────────────
+//
+// Every *other* section in shell.toml ([popups], [notifications], [lock],
+// [menu], [launcher], [tooltip], [polkit], [image-picker], [controls],
+// [hyprland]) is colour/border tokens the active theme derives from
+// `colors.toml` (verified against the shipped `shell.toml.tpl`) — Studio
+// leaves those alone, the same rule it follows for Waybar's `@define-color`
+// block and mako's colour section. `[font] base-size`, `[bar] size-*` and
+// `[spacing] scale` are the only plain numbers a theme doesn't own, so
+// they're the shell.toml analogue of the old style.css geometry block.
+//
+// `~/.config/omarchy/shell.toml` is always a plain user file — never written
+// by theme apply (only `current/theme/shell.toml`, the *generated* file, is)
+// — and the shell watches it directly (`FileView.watchChanges: true` on
+// `Color.qml`'s `userShellFile`), so a write alone is picked up live with no
+// reload call needed.
+
+/// The user's `~/.config/omarchy/shell.toml`.
+pub fn shell_toml_path(paths: &OmarchyPaths) -> PathBuf {
+    paths.config.join("shell.toml")
+}
+
+/// Non-colour shell.toml knobs, defaults matching Omarchy's own
+/// (`Style.qml`'s fallbacks / the shipped `shell.toml.tpl`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Appearance {
+    pub font_base_size: i64,
+    pub bar_size_horizontal: i64,
+    pub bar_size_vertical: i64,
+    pub bar_scale_with_font: bool,
+    pub spacing_scale: f64,
+    pub spacing_scale_with_font: bool,
+}
+
+impl Default for Appearance {
+    fn default() -> Self {
+        Self {
+            font_base_size: 12,
+            bar_size_horizontal: 26,
+            bar_size_vertical: 28,
+            bar_scale_with_font: true,
+            spacing_scale: 1.0,
+            spacing_scale_with_font: true,
+        }
+    }
+}
+
+impl Appearance {
+    /// Read the six keys back out of the user's shell.toml, falling back to
+    /// Omarchy's own defaults for anything absent (an unwritten key means
+    /// "theme/shell default", not zero).
+    pub fn load(paths: &OmarchyPaths) -> Self {
+        let mut a = Self::default();
+        let Ok(text) = std::fs::read_to_string(shell_toml_path(paths)) else {
+            return a;
+        };
+        let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
+            return a;
+        };
+        if let Some(v) = doc
+            .get("font")
+            .and_then(|t| t.get("base-size"))
+            .and_then(|v| v.as_integer())
+        {
+            a.font_base_size = v;
+        }
+        if let Some(bar) = doc.get("bar") {
+            if let Some(v) = bar.get("size-horizontal").and_then(|v| v.as_integer()) {
+                a.bar_size_horizontal = v;
+            }
+            if let Some(v) = bar.get("size-vertical").and_then(|v| v.as_integer()) {
+                a.bar_size_vertical = v;
+            }
+            if let Some(v) = bar.get("scale-with-font").and_then(|v| v.as_bool()) {
+                a.bar_scale_with_font = v;
+            }
+        }
+        if let Some(sp) = doc.get("spacing") {
+            if let Some(v) = sp
+                .get("scale")
+                .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
+            {
+                a.spacing_scale = v;
+            }
+            if let Some(v) = sp.get("scale-with-font").and_then(|v| v.as_bool()) {
+                a.spacing_scale_with_font = v;
+            }
+        }
+        a
+    }
+
+    /// Persist through `toml_edit`, touching only these six keys — every
+    /// other key, section and comment in the user's shell.toml (colour
+    /// overrides someone hand-wrote, say) round-trips untouched. Caller
+    /// snapshots first; no reload call needed (see module docs above).
+    pub fn save(&self, paths: &OmarchyPaths) -> Result<()> {
+        let path = shell_toml_path(paths);
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let mut doc =
+            existing
+                .parse::<toml_edit::DocumentMut>()
+                .map_err(|e| StudioError::ParseFailed {
+                    file: path.clone(),
+                    line: None,
+                    hint: e.to_string(),
+                })?;
+        let font = doc["font"].or_insert(toml_edit::table());
+        font["base-size"] = toml_edit::value(self.font_base_size);
+        let bar = doc["bar"].or_insert(toml_edit::table());
+        bar["size-horizontal"] = toml_edit::value(self.bar_size_horizontal);
+        bar["size-vertical"] = toml_edit::value(self.bar_size_vertical);
+        bar["scale-with-font"] = toml_edit::value(self.bar_scale_with_font);
+        let spacing = doc["spacing"].or_insert(toml_edit::table());
+        spacing["scale"] = toml_edit::value(self.spacing_scale);
+        spacing["scale-with-font"] = toml_edit::value(self.spacing_scale_with_font);
+        atomic_write(&path, &doc.to_string())
     }
 }
 
@@ -542,5 +672,70 @@ mod tests {
     fn bar_widget_catalog_surfaces_a_failing_command() {
         let runner = StubRunner::default().with_fail("omarchy plugin list --json");
         assert!(bar_widget_catalog(&runner).is_err());
+    }
+
+    #[test]
+    fn appearance_defaults_when_the_user_has_no_shell_toml() {
+        let p = paths("appearance-defaults");
+        let a = Appearance::load(&p);
+        assert_eq!(a, Appearance::default());
+    }
+
+    #[test]
+    fn appearance_reads_only_the_keys_it_understands() {
+        let p = paths("appearance-read");
+        std::fs::write(
+            shell_toml_path(&p),
+            "[font]\nbase-size = 16\n\n[bar]\nsize-horizontal = 30\n\n[lock]\nbackground = \"#000\"\n",
+        )
+        .unwrap();
+        let a = Appearance::load(&p);
+        assert_eq!(a.font_base_size, 16);
+        assert_eq!(a.bar_size_horizontal, 30);
+        // Absent keys fall back to Omarchy's own defaults, not zero.
+        assert_eq!(a.bar_size_vertical, 28);
+        assert!(a.bar_scale_with_font);
+        assert_eq!(a.spacing_scale, 1.0);
+    }
+
+    #[test]
+    fn appearance_save_touches_only_its_six_keys() {
+        let p = paths("appearance-save");
+        let path = shell_toml_path(&p);
+        std::fs::write(
+            &path,
+            "# a comment the user wrote\n[lock]\nbackground = \"#123456\"\n",
+        )
+        .unwrap();
+
+        let mut a = Appearance::load(&p);
+        a.font_base_size = 18;
+        a.spacing_scale = 1.25;
+        a.save(&p).unwrap();
+
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(out.contains("# a comment the user wrote"));
+        assert!(out.contains("[lock]"));
+        assert!(out.contains("background = \"#123456\""));
+        assert!(out.contains("base-size = 18"));
+        assert!(out.contains("scale = 1.25"));
+
+        let reloaded = Appearance::load(&p);
+        assert_eq!(reloaded.font_base_size, 18);
+        assert_eq!(reloaded.spacing_scale, 1.25);
+    }
+
+    #[test]
+    fn appearance_save_is_idempotent_on_the_keys_it_owns() {
+        let p = paths("appearance-idempotent");
+        let a = Appearance {
+            font_base_size: 14,
+            ..Appearance::default()
+        };
+        a.save(&p).unwrap();
+        let first = std::fs::read_to_string(shell_toml_path(&p)).unwrap();
+        a.save(&p).unwrap();
+        let second = std::fs::read_to_string(shell_toml_path(&p)).unwrap();
+        assert_eq!(first, second);
     }
 }
