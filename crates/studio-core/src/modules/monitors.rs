@@ -489,6 +489,52 @@ impl Layout {
         }
     }
 
+    /// Move `name` one step left/right among the monitors, keeping the row
+    /// touching left-to-right on effective width (each display keeps its own
+    /// `y` — this reorders the row, it doesn't touch vertical offsets, so a
+    /// stacked/staggered layout isn't flattened by a horizontal move).
+    ///
+    /// `live` supplies the physical width/height the move needs (a pending
+    /// mode change in this layout hasn't necessarily hit `hyprctl` yet).
+    /// Returns `false` when `name` is already at that edge, or unknown.
+    pub fn move_horizontal(&mut self, live: &[Monitor], name: &str, dir: i64) -> bool {
+        // Left-to-right order by current x, ties broken by name so the order
+        // is deterministic when two displays start at the same position.
+        let mut order: Vec<usize> = (0..self.monitors.len()).collect();
+        order.sort_by(|&a, &b| {
+            self.monitors[a]
+                .x
+                .cmp(&self.monitors[b].x)
+                .then_with(|| self.monitors[a].name.cmp(&self.monitors[b].name))
+        });
+        let Some(pos) = order.iter().position(|&i| self.monitors[i].name == name) else {
+            return false;
+        };
+        let target = pos as i64 + dir;
+        if target < 0 || target as usize >= order.len() {
+            return false;
+        }
+        order.swap(pos, target as usize);
+
+        // Re-pack x left-to-right in the new order, at each display's own
+        // (possibly just-edited) scale and transform.
+        let mut x = 0i32;
+        for &i in &order {
+            let s = &mut self.monitors[i];
+            let w = live
+                .iter()
+                .find(|m| m.name == s.name)
+                .map(|m| {
+                    let scale = s.scale.parse().unwrap_or(m.scale);
+                    effective_size(m.width, m.height, scale, s.transform).0
+                })
+                .unwrap_or(0);
+            s.x = x;
+            x += w as i32;
+        }
+        true
+    }
+
     /// Point one display at a mode (`None` = `preferred`). False when no
     /// display in the layout goes by that name.
     pub fn set_mode(&mut self, name: &str, mode: Option<Mode>) -> bool {
@@ -900,6 +946,54 @@ mod tests {
         // Re-rendering is idempotent (managed block replaced, not duplicated).
         let again = render_conf(&out, &layout);
         assert_eq!(again.matches("omarchy-studio:monitors").count(), 2); // open+close
+    }
+
+    #[test]
+    fn move_horizontal_swaps_two_touching_displays() {
+        let mons = parse(TWO).unwrap();
+        let mut layout = Layout::from_monitors(&mons);
+        assert!(layout.move_horizontal(&mons, "eDP-1", 1));
+        assert_eq!(layout.monitors[0].name, "eDP-1");
+        assert_eq!(layout.monitors[0].x, 1920, "eDP-1 moved to the right slot");
+        assert_eq!(layout.monitors[1].x, 0, "HDMI-A-1 took the left slot");
+        // y is untouched — a horizontal move never flattens vertical offsets.
+        assert_eq!(layout.monitors[0].y, 0);
+    }
+
+    #[test]
+    fn move_horizontal_refuses_past_the_edge() {
+        let mons = parse(TWO).unwrap();
+        let mut layout = Layout::from_monitors(&mons);
+        // eDP-1 is already leftmost.
+        assert!(!layout.move_horizontal(&mons, "eDP-1", -1));
+        assert_eq!(layout.monitors[0].x, 0, "unchanged");
+        // HDMI-A-1 is already rightmost.
+        assert!(!layout.move_horizontal(&mons, "HDMI-A-1", 1));
+        assert_eq!(layout.monitors[1].x, 1920, "unchanged");
+    }
+
+    #[test]
+    fn move_horizontal_unknown_name_is_a_no_op() {
+        let mons = parse(TWO).unwrap();
+        let mut layout = Layout::from_monitors(&mons);
+        assert!(!layout.move_horizontal(&mons, "DP-99", 1));
+    }
+
+    #[test]
+    fn move_horizontal_repacks_a_three_monitor_row() {
+        let mut mons = parse(TWO).unwrap();
+        let mut third = mons[1].clone();
+        third.name = "DP-3".into();
+        third.x = 3840;
+        mons.push(third);
+        let mut layout = Layout::from_monitors(&mons);
+        // Row is eDP-1(0) · HDMI-A-1(1920) · DP-3(3840), each 1920 wide.
+        // Move DP-3 (rightmost) one step left, past HDMI-A-1.
+        assert!(layout.move_horizontal(&mons, "DP-3", -1));
+        let by_name = |n: &str| layout.monitors.iter().find(|m| m.name == n).unwrap().x;
+        assert_eq!(by_name("eDP-1"), 0);
+        assert_eq!(by_name("DP-3"), 1920);
+        assert_eq!(by_name("HDMI-A-1"), 3840);
     }
 }
 

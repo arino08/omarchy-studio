@@ -120,11 +120,12 @@ fn cli() -> Command {
              idle timeline\n  \
              idle set <screensaver|lock|screen-off|suspend> <seconds>"))
         .subcommand(group("lock", "Lock screen appearance", "usage: omarchy-studio lock show | avatar <path> | avatar add <file> | avatar list | size <px> | blur <n>"))
-        .subcommand(group("monitor", "Displays: resolution, refresh rate, layout, scale, identify",
+        .subcommand(group("monitor", "Displays: resolution, refresh rate, position, scale, identify",
             "usage:\n  \
              monitor list | identify | modes <name>\n  \
              monitor mode <name> <WxH[@Hz]|Hz|preferred> [--dry-run]\n  \
-             monitor primary <name> | scale <name> <factor> [--dry-run]\n  \
+             monitor position <name> <left|right> [--dry-run]\n  \
+             monitor scale <name> <factor> [--dry-run]\n  \
              monitor apply [--dry-run]"))
         .subcommand(group("apps", "Remove apps and webapps safely, with a cascade preview",
             "usage:\n  \
@@ -3725,6 +3726,35 @@ fn monitor(args: &[&str]) -> i32 {
                 dry_run,
             )
         }
+        ["position", name, dir, rest @ ..] => {
+            let dry_run = rest.contains(&"--dry-run");
+            let delta = match *dir {
+                "left" => -1i64,
+                "right" => 1i64,
+                _ => {
+                    eprintln!("direction must be `left` or `right`");
+                    return 2;
+                }
+            };
+            if !live.iter().any(|m| &m.name == name) {
+                eprintln!("no monitor named `{name}` — see `monitor list`");
+                return 2;
+            }
+            let mut layout = mon::Layout::from_monitors(&live);
+            if !layout.move_horizontal(&live, name, delta) {
+                eprintln!(
+                    "{name} is already the {}most display",
+                    if delta < 0 { "left" } else { "right" }
+                );
+                return 2;
+            }
+            monitor_write(
+                &paths,
+                &layout,
+                &format!("monitor position {name} {dir}"),
+                dry_run,
+            )
+        }
         ["apply", rest @ ..] => {
             let dry_run = rest.contains(&"--dry-run");
             let layout = mon::Layout::from_monitors(&live);
@@ -3739,6 +3769,7 @@ fn monitor(args: &[&str]) -> i32 {
             eprintln!(
                 "usage: monitor list | identify | modes <name>\n       \
                  monitor mode <name> <WxH[@Hz]|Hz|preferred> [--dry-run]\n       \
+                 monitor position <name> <left|right> [--dry-run]\n       \
                  monitor scale <name> <f> [--dry-run] | apply [--dry-run]"
             );
             2

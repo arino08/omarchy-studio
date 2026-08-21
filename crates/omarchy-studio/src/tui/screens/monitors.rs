@@ -62,7 +62,7 @@ impl MonitorsScreen {
     }
 
     pub fn hint(&self) -> &'static str {
-        "↑↓ move · r rate · m resolution · +/- scale · d disable · i identify · s save"
+        "↑↓ move · ←→ reorder · r rate · m resolution · +/- scale · d disable · i identify · s save"
     }
 
     /// The live monitor behind the row under the cursor.
@@ -166,6 +166,8 @@ impl MonitorsScreen {
             KeyCode::Char('m') => self.cycle_resolution(),
             KeyCode::Char('+') | KeyCode::Char('=') => self.nudge_scale(0.25),
             KeyCode::Char('-') | KeyCode::Char('_') => self.nudge_scale(-0.25),
+            KeyCode::Left => self.move_horizontal(-1),
+            KeyCode::Right => self.move_horizontal(1),
             KeyCode::Char('d') => {
                 if let Some(s) = self.layout.monitors.get_mut(self.cursor) {
                     s.disabled = !s.disabled;
@@ -177,6 +179,27 @@ impl MonitorsScreen {
             _ => {}
         }
         MonitorsAction::None
+    }
+
+    /// Reorder the selected display one step left/right in the row, keeping
+    /// it touching its new neighbor. `notice` explains a refusal (already at
+    /// that edge) the same way a rate/resolution refusal does.
+    fn move_horizontal(&mut self, dir: i64) {
+        let Some(name) = self
+            .layout
+            .monitors
+            .get(self.cursor)
+            .map(|s| s.name.clone())
+        else {
+            return;
+        };
+        if self.layout.move_horizontal(&self.live, &name, dir) {
+            self.dirty = true;
+            self.notice = None;
+        } else {
+            let edge = if dir < 0 { "leftmost" } else { "rightmost" };
+            self.notice = Some(format!("{name} is already the {edge} display"));
+        }
     }
 
     pub fn render(&self, f: &mut Frame, area: Rect, skin: &Skin) {
