@@ -16,7 +16,7 @@ use clap::{Arg, Command};
 use studio_core::cmd::{CommandRunner, RealRunner};
 use studio_core::deps::{probe_all, DepStatus, Registry};
 use studio_core::modules::themes::{slugify, ThemeOrigin, ThemeStore};
-use studio_core::omarchy::{cmds, Capabilities, OmarchyPaths};
+use studio_core::omarchy::{cmds, Capabilities, Component, OmarchyPaths};
 use studio_core::snapshot::{SnapshotKind, SnapshotStore};
 
 /// One verb group: a one-line summary for the group list, and its real usage
@@ -45,7 +45,7 @@ fn cli() -> Command {
             format!(
                 "{} (tested against omarchy {})",
                 studio_core::VERSION,
-                studio_core::TESTED_OMARCHY
+                studio_core::tested_omarchy()
             )
             .into_boxed_str(),
         ))
@@ -59,6 +59,8 @@ fn cli() -> Command {
         .subcommand_required(false)
         .arg_required_else_help(false)
         .subcommand(group("doctor", "Check the install, capabilities and update survival", "usage: omarchy-studio doctor [--deps] [--quiet]"))
+        .subcommand(group("migrate", "Clean up Studio's blocks in the pre-Omarchy-4 config files",
+            "usage: omarchy-studio migrate [--dry-run]"))
         .subcommand(group("theme", "List, apply, fork, extract and install themes",
             "usage:\n  \
              theme list | current | coverage [name] | apply <name> | fork <src> <new>\n  \
@@ -111,9 +113,10 @@ fn cli() -> Command {
              idle timeline\n  \
              idle set <screensaver|lock|screen-off|suspend> <seconds>"))
         .subcommand(group("lock", "Lock screen appearance", "usage: omarchy-studio lock show | avatar <path> | avatar add <file> | avatar list | size <px> | blur <n>"))
-        .subcommand(group("monitor", "Displays: layout, scale, primary, identify",
+        .subcommand(group("monitor", "Displays: resolution, refresh rate, layout, scale, identify",
             "usage:\n  \
-             monitor list | identify\n  \
+             monitor list | identify | modes <name>\n  \
+             monitor mode <name> <WxH[@Hz]|Hz|preferred> [--dry-run]\n  \
              monitor primary <name> | scale <name> <factor> [--dry-run]\n  \
              monitor apply [--dry-run]"))
         .subcommand(group("apps", "Remove apps and webapps safely, with a cascade preview",
@@ -205,6 +208,7 @@ fn print_group_help(name: &str) {
 fn dispatch(argv: &[&str]) -> i32 {
     match argv {
         ["doctor", rest @ ..] => doctor(rest.contains(&"--deps"), rest.contains(&"--quiet")),
+        ["migrate", rest @ ..] => migrate(rest.contains(&"--dry-run")),
         ["hooks", rest @ ..] => hooks_cmd(rest),
         ["hook", rest @ ..] => hook_event(rest),
         ["theme", rest @ ..] => theme(rest),
@@ -213,14 +217,16 @@ fn dispatch(argv: &[&str]) -> i32 {
         ["preset", rest @ ..] => preset(rest),
         ["toggle", rest @ ..] => toggle(rest),
         ["animations", rest @ ..] => animations(rest),
-        ["waybar", rest @ ..] => waybar(rest),
-        ["notif", rest @ ..] => notif(rest),
-        ["osd", rest @ ..] => osd(rest),
+        // Omarchy 4 replaced these with the Quickshell shell; editing their old
+        // config files there would write something nothing reads.
+        ["waybar", rest @ ..] => gate(Component::Waybar).unwrap_or_else(|| waybar(rest)),
+        ["notif", rest @ ..] => gate(Component::Mako).unwrap_or_else(|| notif(rest)),
+        ["osd", rest @ ..] => gate(Component::Swayosd).unwrap_or_else(|| osd(rest)),
         ["niri", rest @ ..] => niri(rest),
         ["nova", rest @ ..] => nova(rest),
         ["keybind", rest @ ..] => keybind_cli(rest),
-        ["idle", rest @ ..] => idle(rest),
-        ["lock", rest @ ..] => lock(rest),
+        ["idle", rest @ ..] => gate(Component::Hypridle).unwrap_or_else(|| idle(rest)),
+        ["lock", rest @ ..] => gate(Component::Hypridle).unwrap_or_else(|| lock(rest)),
         ["wallpaper", rest @ ..] => wallpaper(rest),
         ["battery", rest @ ..] => battery(rest),
         ["update", rest @ ..] => update(rest),
@@ -340,6 +346,20 @@ fn doctor(with_deps: bool, quiet: bool) -> i32 {
             &caps.hyprland_version
         }
     );
+    println!(
+        "  hypr config     {}",
+        match caps.config_provider.as_str() {
+            "" => "unknown".to_string(),
+            other => format!(
+                "{other}{}",
+                if caps.hypr_lua_mode() {
+                    "  (Omarchy 4 — ~/.config/hypr/*.lua)"
+                } else {
+                    "  (~/.config/hypr/*.conf)"
+                }
+            ),
+        }
+    );
     println!("  current theme   {theme}");
     println!("  capabilities");
     println!(
@@ -362,6 +382,45 @@ fn doctor(with_deps: bool, quiet: bool) -> i32 {
         "    video wallpapers (mpvpaper)                  {}",
         mark(caps.video_wallpapers)
     );
+
+    // Screens that drive software Omarchy 4 replaced with the Quickshell shell.
+    let replaced: Vec<&str> = [
+        (Component::Waybar, "bar"),
+        (Component::Mako, "notifications"),
+        (Component::Swayosd, "osd"),
+        (Component::Hypridle, "idle/lock"),
+    ]
+    .iter()
+    .filter(|(c, _)| !c.present())
+    .map(|(_, label)| *label)
+    .collect();
+    if !replaced.is_empty() {
+        println!();
+        println!("  these screens are unavailable on this machine:");
+        println!("    {}", replaced.join(", "));
+        println!("    their software isn't installed — the Omarchy shell took over.");
+    }
+
+    // Blocks left behind by the Omarchy 3 → 4 config move. Inert, but they read
+    // as if Studio were still managing those values.
+    let stale = studio_core::modules::migrate::stale(
+        &paths,
+        if caps.hypr_lua_mode() {
+            studio_core::omarchy::Dialect::Lua
+        } else {
+            studio_core::omarchy::Dialect::Hyprlang
+        },
+    );
+    if !stale.is_empty() {
+        let blocks: usize = stale.iter().map(|s| s.sections.len()).sum();
+        println!();
+        println!(
+            "  ⚠ {blocks} Studio block(s) still sit in {} pre-Omarchy-4 .conf file(s),",
+            stale.len()
+        );
+        println!("    which this Hyprland no longer reads. Clean up with:");
+        println!("      omarchy-studio migrate");
+    }
 
     // An untested Omarchy is a warning, never a refusal — see `version_fit`.
     if let Some(w) = fit.warning() {
@@ -3120,6 +3179,61 @@ fn monitor(args: &[&str]) -> i32 {
             println!("flashed each monitor's name for 2s.");
             0
         }
+        ["modes", name] => {
+            let Some(m) = live.iter().find(|m| &m.name == name) else {
+                eprintln!("no monitor named `{name}` — see `monitor list`");
+                return 2;
+            };
+            let modes = m.modes();
+            if modes.is_empty() {
+                eprintln!("{name} reports no modes (Hyprland too old to list them?)");
+                return 1;
+            }
+            let current = mon::Mode {
+                width: m.width,
+                height: m.height,
+                refresh: m.refresh_rate,
+            };
+            for mode in &modes {
+                let tag = if mode.matches(&current) {
+                    "  [current]"
+                } else {
+                    ""
+                };
+                println!("{}{tag}", mode.label());
+            }
+            0
+        }
+        ["mode", name, spec, rest @ ..] | ["rate", name, spec, rest @ ..] => {
+            let dry_run = rest.contains(&"--dry-run");
+            let Some(m) = live.iter().find(|m| &m.name == name) else {
+                eprintln!("no monitor named `{name}` — see `monitor list`");
+                return 2;
+            };
+            let Some(req) = mon::ModeRequest::parse(spec) else {
+                eprintln!("can't read `{spec}` — try 3440x1440@100, 3440x1440, 100, or preferred");
+                return 2;
+            };
+            let resolved = match m.resolve_mode(req) {
+                Ok(r) => r,
+                Err(msg) => {
+                    eprintln!("{msg}");
+                    eprintln!("see `monitor modes {name}` for the full list");
+                    return 2;
+                }
+            };
+            let mut layout = mon::Layout::from_monitors(&live);
+            layout.set_mode(name, resolved);
+            let shown = resolved
+                .map(|r| r.label())
+                .unwrap_or_else(|| "preferred".into());
+            monitor_write(
+                &paths,
+                &layout,
+                &format!("monitor mode {name} {shown}"),
+                dry_run,
+            )
+        }
         ["scale", name, value, rest @ ..] => {
             let dry_run = rest.contains(&"--dry-run");
             let Ok(scale) = value.parse::<f64>() else {
@@ -3155,15 +3269,17 @@ fn monitor(args: &[&str]) -> i32 {
         }
         _ => {
             eprintln!(
-                "usage: monitor list | identify | scale <name> <f> [--dry-run] | apply [--dry-run]"
+                "usage: monitor list | identify | modes <name>\n       \
+                 monitor mode <name> <WxH[@Hz]|Hz|preferred> [--dry-run]\n       \
+                 monitor scale <name> <f> [--dry-run] | apply [--dry-run]"
             );
             2
         }
     }
 }
 
-/// Render the layout into monitors.conf and (unless dry-run) snapshot, write,
-/// and reload Hyprland.
+/// Render the layout into the user's monitors file (`.lua` on Omarchy 4,
+/// `.conf` before it) and, unless dry-run, snapshot, write and reload Hyprland.
 fn monitor_write(
     paths: &OmarchyPaths,
     layout: &studio_core::modules::monitors::Layout,
@@ -3171,10 +3287,11 @@ fn monitor_write(
     dry_run: bool,
 ) -> i32 {
     use studio_core::modules::monitors as mon;
-    let path = mon::conf_path(paths);
+    let dialect = studio_core::omarchy::Dialect::probe(&RealRunner);
+    let path = mon::user_path(paths, dialect);
     if dry_run {
         println!("would write {}:\n", path.display());
-        println!("{}", layout.render_body());
+        println!("{}", layout.body_for(dialect));
         return 0;
     }
     // The pipeline snapshots and rolls back; don't also record here.
@@ -4034,17 +4151,83 @@ fn hook_event(args: &[&str]) -> i32 {
     }
 }
 
+/// Refuse a module whose component isn't installed, explaining why. `None` when
+/// the component is present and the module should run normally.
+fn gate(c: Component) -> Option<i32> {
+    let reason = c.unavailable_reason()?;
+    eprintln!("{reason}");
+    Some(3)
+}
+
+// ── Omarchy 3 → 4 cleanup ────────────────────────────────────────────────────
+
+/// Remove Studio's managed blocks from the `.conf` files Omarchy 4 no longer
+/// reads. Inert on Omarchy 3, where those files are the live config.
+fn migrate(dry_run: bool) -> i32 {
+    use studio_core::modules::migrate;
+    let Some(paths) = omarchy() else { return 4 };
+    let dialect = studio_core::omarchy::Dialect::probe(&RealRunner);
+
+    if !dialect.is_lua() {
+        println!("Nothing to do — this machine's Hyprland reads .conf files,");
+        println!("which is where Studio writes. (Omarchy 4 moved to .lua.)");
+        return 0;
+    }
+
+    let stale = migrate::stale(&paths, dialect);
+    if stale.is_empty() {
+        println!("Nothing to clean up — no Studio blocks left in the old .conf files.");
+        return 0;
+    }
+
+    println!("Studio blocks still sitting in files Omarchy 4 no longer reads:");
+    for item in &stale {
+        println!("  {}", item.file.display());
+        for s in &item.sections {
+            println!("      {s}");
+        }
+    }
+    println!();
+
+    if dry_run {
+        println!("--dry-run: nothing written.");
+        return 0;
+    }
+
+    let store = match history() {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    match migrate::apply(&paths, &store, &RealRunner) {
+        Ok(files) if files.is_empty() => {
+            println!("Nothing changed.");
+            0
+        }
+        Ok(files) => {
+            println!(
+                "Cleaned {} file(s). Your own lines were left alone.",
+                files.len()
+            );
+            println!("undo with: omarchy-studio snapshot undo");
+            0
+        }
+        Err(e) => report_apply_error(e, "the old config files were"),
+    }
+}
+
 // ── menu integration ─────────────────────────────────────────────────────────
 
 fn install_integration() -> i32 {
     let Some(paths) = omarchy() else { return 4 };
     let store = history().ok();
-    let file = studio_core::integration::managed_file(&paths);
+    // Includes the dead pre-Quattro menu.sh when it's still on disk, so its
+    // cleanup is captured by the snapshot and stays undoable.
+    let files = studio_core::integration::managed_files(&paths);
     if let Some(s) = &store {
         let _ = s.record(
             SnapshotKind::Pre,
             "before install-integration",
-            std::slice::from_ref(&file),
+            &files,
             "integration",
             &[],
         );
@@ -4116,12 +4299,12 @@ fn uninstall() -> i32 {
     }
 
     if studio_core::integration::is_installed(&paths) {
-        let file = studio_core::integration::managed_file(&paths);
+        let files = studio_core::integration::managed_files(&paths);
         if let Ok(s) = history() {
             let _ = s.record(
                 SnapshotKind::Pre,
                 "before uninstall",
-                std::slice::from_ref(&file),
+                &files,
                 "integration",
                 &[],
             );

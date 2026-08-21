@@ -19,9 +19,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::cmd::{find_in_path, Cmd, CommandRunner};
-use crate::configfs::{CommentStyle, ManagedBlock};
+use crate::configfs::lua;
+use crate::configfs::ManagedBlock;
 use crate::error::Result;
-use crate::omarchy::OmarchyPaths;
+use crate::omarchy::{Dialect, OmarchyPaths};
 
 /// The upstream repository — what `hyprpm add` is pointed at.
 pub const REPO: &str = "https://github.com/yayuuu/hyprland-scroll-overview.git";
@@ -36,12 +37,14 @@ const QUICK: Duration = Duration::from_secs(20);
 
 /// Where the plugin's settings live — a Studio-managed block in the user's own
 /// hypr config, never a vendored Omarchy file.
-fn conf_path(paths: &OmarchyPaths) -> PathBuf {
-    paths.hypr_config().join("scrolloverview.conf")
+fn conf_path_for(paths: &OmarchyPaths, dialect: Dialect) -> PathBuf {
+    paths
+        .hypr_config()
+        .join(format!("scrolloverview.{}", dialect.ext()))
 }
 
-fn block() -> ManagedBlock {
-    ManagedBlock::new("scrolloverview", CommentStyle::Hash)
+fn block_for(dialect: Dialect) -> ManagedBlock {
+    ManagedBlock::new("scrolloverview", dialect.comment_style())
 }
 
 /// How far along the install is. Drives what the UI offers.
@@ -322,6 +325,36 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// Render the settings block body for a dialect.
+    pub fn render_for(&self, dialect: Dialect) -> String {
+        if dialect.is_lua() {
+            return format!(
+                "-- Managed by Omarchy Studio — ScrollOverview by {AUTHOR} ({LICENSE}).\n\
+                 -- Upstream: {REPO}\n{}",
+                lua::config_call(&[
+                    (
+                        format!("plugin.{PLUGIN}.scale"),
+                        lua::Value::Float(self.scale)
+                    ),
+                    (
+                        format!("plugin.{PLUGIN}.layout"),
+                        lua::Value::Str(self.layout.clone())
+                    ),
+                    (
+                        format!("plugin.{PLUGIN}.workspace_gap"),
+                        lua::Value::Int(self.workspace_gap)
+                    ),
+                    (format!("plugin.{PLUGIN}.blur"), lua::Value::Bool(self.blur)),
+                    (
+                        format!("plugin.{PLUGIN}.gesture_distance"),
+                        lua::Value::Int(self.gesture_distance)
+                    ),
+                ])
+            );
+        }
+        self.render()
+    }
+
     /// Render the `plugin { scrolloverview { … } }` block body.
     pub fn render(&self) -> String {
         format!(
@@ -343,11 +376,24 @@ impl Settings {
     /// Read back what's in the managed block, falling back to defaults for
     /// anything absent so a partially hand-edited block still loads.
     pub fn load(paths: &OmarchyPaths) -> Self {
+        Self::load_for(paths, Dialect::Hyprlang)
+    }
+
+    /// As [`Settings::load`], for a given dialect.
+    pub fn load_for(paths: &OmarchyPaths, dialect: Dialect) -> Self {
         let mut s = Self::default();
-        let Ok(text) = std::fs::read_to_string(conf_path(paths)) else {
+        let Ok(text) = std::fs::read_to_string(conf_path_for(paths, dialect)) else {
             return s;
         };
-        let Some(body) = block().extract(&text) else {
+        let Some(body) = block_for(dialect).extract(&text) else {
+            return s;
+        };
+        // Lua values are quoted and comma-terminated, so they need the real
+        // reader rather than the `k = v` line split hyprlang gets away with.
+        if dialect.is_lua() {
+            for (key, value) in lua::parse_config_call(body) {
+                s.set_field(key.rsplit('.').next().unwrap_or(&key), &value);
+            }
             return s;
         };
         for line in body.lines() {
@@ -355,37 +401,51 @@ impl Settings {
             let Some((k, v)) = line.split_once('=') else {
                 continue;
             };
-            let (k, v) = (k.trim(), v.trim());
-            match k {
-                "scale" => {
-                    if let Ok(f) = v.parse() {
-                        s.scale = f;
-                    }
-                }
-                "layout" => s.layout = v.to_string(),
-                "workspace_gap" => {
-                    if let Ok(n) = v.parse() {
-                        s.workspace_gap = n;
-                    }
-                }
-                "blur" => s.blur = v == "true",
-                "gesture_distance" => {
-                    if let Ok(n) = v.parse() {
-                        s.gesture_distance = n;
-                    }
-                }
-                _ => {}
-            }
+            s.set_field(k.trim(), v.trim());
         }
         s
     }
 
+    /// Apply one `key = value` pair, ignoring anything unrecognised so a
+    /// hand-edited block keeps what it does set and defaults the rest.
+    fn set_field(&mut self, key: &str, value: &str) {
+        match key {
+            "scale" => {
+                if let Ok(f) = value.parse() {
+                    self.scale = f;
+                }
+            }
+            "layout" => self.layout = value.to_string(),
+            "workspace_gap" => {
+                if let Ok(n) = value.parse() {
+                    self.workspace_gap = n;
+                }
+            }
+            "blur" => self.blur = value == "true",
+            "gesture_distance" => {
+                if let Ok(n) = value.parse() {
+                    self.gesture_distance = n;
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Plan the settings file as a pipeline edit (E1), writing nothing.
     pub fn plan(&self, paths: &OmarchyPaths) -> Option<crate::engine::FileEdit> {
-        let path = conf_path(paths);
+        self.plan_for(paths, Dialect::Hyprlang)
+    }
+
+    /// As [`Settings::plan`], for a given dialect.
+    pub fn plan_for(
+        &self,
+        paths: &OmarchyPaths,
+        dialect: Dialect,
+    ) -> Option<crate::engine::FileEdit> {
+        let path = conf_path_for(paths, dialect);
         let on_disk = std::fs::read_to_string(&path).ok();
         let existing = on_disk.clone().unwrap_or_default();
-        let updated = block().upsert(&existing, &self.render());
+        let updated = block_for(dialect).upsert(&existing, &self.render_for(dialect));
         (updated != existing)
             .then(|| crate::engine::FileEdit::new(path, on_disk.as_deref(), updated))
     }
@@ -418,20 +478,58 @@ impl Settings {
 /// The line that has to be sourced for the settings to apply, and whether it
 /// already is. Hyprland only reads files something `source =`s.
 pub fn source_line(paths: &OmarchyPaths) -> String {
-    format!("source = {}", conf_path(paths).display())
+    source_line_for(paths, Dialect::Hyprlang)
+}
+
+/// Hyprland only runs config something pulls in. On hyprlang that's a
+/// `source =` line; on Lua it's a `require` — the bootstrap puts `~/.config`
+/// on `package.path`, so `hypr.scrolloverview` resolves to our settings file.
+pub fn source_line_for(paths: &OmarchyPaths, dialect: Dialect) -> String {
+    if dialect.is_lua() {
+        format!("require(\"hypr.{PLUGIN}\")")
+    } else {
+        format!("source = {}", conf_path_for(paths, dialect).display())
+    }
+}
+
+/// The entry-point file the source/require line goes into.
+fn entry_path(paths: &OmarchyPaths, dialect: Dialect) -> PathBuf {
+    paths
+        .hypr_config()
+        .join(format!("hyprland.{}", dialect.ext()))
 }
 
 pub fn is_sourced(paths: &OmarchyPaths) -> bool {
-    let needle = conf_path(paths).display().to_string();
-    std::fs::read_to_string(paths.hypr_config().join("hyprland.conf"))
+    is_sourced_for(paths, Dialect::Hyprlang)
+}
+
+pub fn is_sourced_for(paths: &OmarchyPaths, dialect: Dialect) -> bool {
+    let needle = if dialect.is_lua() {
+        format!("hypr.{PLUGIN}")
+    } else {
+        conf_path_for(paths, dialect).display().to_string()
+    };
+    std::fs::read_to_string(entry_path(paths, dialect))
         .map(|c| c.contains(&needle))
         .unwrap_or(false)
 }
 
 /// `~/.config/hypr/autostart.conf` — where the user's own `exec-once` lines
 /// live, and thus where the plugin-autoload line belongs.
-fn autostart_path(paths: &OmarchyPaths) -> PathBuf {
-    paths.hypr_config().join("autostart.conf")
+fn autostart_path_for(paths: &OmarchyPaths, dialect: Dialect) -> PathBuf {
+    paths
+        .hypr_config()
+        .join(format!("autostart.{}", dialect.ext()))
+}
+
+/// The Lua form of the autoload line — Omarchy's own helper for "run this once
+/// when Hyprland starts".
+fn autoload_line_for(dialect: Dialect) -> String {
+    if dialect.is_lua() {
+        "o.exec_on_start(\"hyprpm reload -n\")".to_string()
+    } else {
+        AUTOLOAD_LINE.to_string()
+    }
 }
 
 /// hyprpm plugins are built and enabled, but nothing loads them at boot — so
@@ -441,30 +539,34 @@ fn autostart_path(paths: &OmarchyPaths) -> PathBuf {
 /// documented way to load enabled plugins.
 const AUTOLOAD_LINE: &str = "exec-once = hyprpm reload -n";
 
-fn autoload_block() -> ManagedBlock {
-    ManagedBlock::new("plugin-autoload", CommentStyle::Hash)
+fn autoload_block_for(dialect: Dialect) -> ManagedBlock {
+    ManagedBlock::new("plugin-autoload", dialect.comment_style())
 }
 
 /// Is the plugin-autoload line present?
 pub fn autoloads(paths: &OmarchyPaths) -> bool {
-    std::fs::read_to_string(autostart_path(paths))
+    autoloads_for(paths, Dialect::Hyprlang)
+}
+
+pub fn autoloads_for(paths: &OmarchyPaths, dialect: Dialect) -> bool {
+    std::fs::read_to_string(autostart_path_for(paths, dialect))
         .map(|c| c.contains("hyprpm reload"))
         .unwrap_or(false)
 }
 
 /// Plan the autoload `exec-once` into autostart.conf.
-fn plan_autoload(paths: &OmarchyPaths) -> Option<crate::engine::FileEdit> {
-    let path = autostart_path(paths);
+fn plan_autoload_for(paths: &OmarchyPaths, dialect: Dialect) -> Option<crate::engine::FileEdit> {
+    let path = autostart_path_for(paths, dialect);
     let on_disk = std::fs::read_to_string(&path).unwrap_or_default();
     // Nothing to do if the user (or Omarchy) already loads plugins.
-    if on_disk.contains("hyprpm reload") && !autoload_block().contains(&on_disk) {
+    if on_disk.contains("hyprpm reload") && !autoload_block_for(dialect).contains(&on_disk) {
         return None;
     }
-    let updated = autoload_block().upsert(&on_disk, AUTOLOAD_LINE);
+    let updated = autoload_block_for(dialect).upsert(&on_disk, &autoload_line_for(dialect));
     (updated != on_disk).then(|| {
         crate::engine::FileEdit::new(
             path,
-            std::fs::read_to_string(autostart_path(paths))
+            std::fs::read_to_string(autostart_path_for(paths, dialect))
                 .ok()
                 .as_deref(),
             updated,
@@ -479,10 +581,14 @@ fn plan_autoload(paths: &OmarchyPaths) -> Option<crate::engine::FileEdit> {
 /// line goes in its own managed block, appended last so it wins over anything
 /// Omarchy sourced earlier.
 pub fn plan_source(paths: &OmarchyPaths) -> Option<crate::engine::FileEdit> {
-    let path = paths.hypr_config().join("hyprland.conf");
+    plan_source_for(paths, Dialect::Hyprlang)
+}
+
+pub fn plan_source_for(paths: &OmarchyPaths, dialect: Dialect) -> Option<crate::engine::FileEdit> {
+    let path = entry_path(paths, dialect);
     let on_disk = std::fs::read_to_string(&path).ok()?;
-    let src = ManagedBlock::new("scrolloverview-source", CommentStyle::Hash);
-    let updated = src.upsert(&on_disk, &source_line(paths));
+    let src = ManagedBlock::new("scrolloverview-source", dialect.comment_style());
+    let updated = src.upsert(&on_disk, &source_line_for(paths, dialect));
     (updated != on_disk)
         .then(|| crate::engine::FileEdit::new(path, Some(on_disk.as_str()), updated))
 }
@@ -498,16 +604,17 @@ pub fn ensure_sourced(
     store: &crate::snapshot::SnapshotStore,
     runner: &dyn CommandRunner,
 ) -> Result<bool> {
+    let dialect = Dialect::probe(runner);
     let mut edits = Vec::new();
     // Seed the settings file first if it isn't there yet.
-    if !conf_path(paths).exists() {
-        edits.extend(Settings::load(paths).plan(paths));
+    if !conf_path_for(paths, dialect).exists() {
+        edits.extend(Settings::load_for(paths, dialect).plan_for(paths, dialect));
     }
-    edits.extend(plan_source(paths));
+    edits.extend(plan_source_for(paths, dialect));
     // Also make the plugin load on boot — without this every reboot errors
     // until it's loaded by hand (exec-once can't create a file it references,
     // but hyprpm reload has no such dependency, so it's safe to add alone).
-    edits.extend(plan_autoload(paths));
+    edits.extend(plan_autoload_for(paths, dialect));
     if edits.is_empty() {
         return Ok(false);
     }
@@ -590,17 +697,19 @@ mod tests {
             blur: true,
             gesture_distance: 250,
         };
-        let edit = want.plan(&p).expect("a fresh file is a change");
+        let edit = want
+            .plan_for(&p, Dialect::Hyprlang)
+            .expect("a fresh file is a change");
         std::fs::write(&edit.file, &edit.new_content).unwrap();
-        assert_eq!(Settings::load(&p), want);
+        assert_eq!(Settings::load_for(&p, Dialect::Hyprlang), want);
         // Idempotent: writing the same settings again is not a change.
-        assert!(want.plan(&p).is_none());
+        assert!(want.plan_for(&p, Dialect::Hyprlang).is_none());
     }
 
     #[test]
     fn the_block_credits_the_plugin_author() {
         // The credit lives in the file the user actually reads, not just docs.
-        let body = Settings::default().render();
+        let body = Settings::default().render_for(Dialect::Hyprlang);
         assert!(body.contains(AUTHOR), "{body}");
         assert!(body.contains(LICENSE), "{body}");
         assert!(body.contains(REPO), "{body}");
@@ -610,13 +719,14 @@ mod tests {
     fn a_hand_edited_block_keeps_what_it_sets_and_defaults_the_rest() {
         let dir = tmpdir("partial");
         let p = paths(&dir);
-        let path = conf_path(&p);
+        let path = conf_path_for(&p, Dialect::Hyprlang);
         std::fs::write(
             &path,
-            block().upsert("", "plugin {\n  scrolloverview {\n    scale = 0.8\n  }\n}"),
+            block_for(Dialect::Hyprlang)
+                .upsert("", "plugin {\n  scrolloverview {\n    scale = 0.8\n  }\n}"),
         )
         .unwrap();
-        let s = Settings::load(&p);
+        let s = Settings::load_for(&p, Dialect::Hyprlang);
         assert_eq!(s.scale, 0.8, "the value they set wins");
         assert_eq!(s.layout, "vertical", "the rest fall back to defaults");
     }
@@ -644,10 +754,14 @@ mod tests {
         assert!(!autoloads(&p), "nothing loads plugins to begin with");
         // Apply just the autoload edit (source needs a runner; this is the
         // half that fixes the reboot errors).
-        let edit = plan_autoload(&p).expect("a missing autoload line is a change");
+        let edit =
+            plan_autoload_for(&p, Dialect::Hyprlang).expect("a missing autoload line is a change");
         std::fs::write(&edit.file, &edit.new_content).unwrap();
         assert!(autoloads(&p), "now loads on boot");
-        assert!(plan_autoload(&p).is_none(), "idempotent");
+        assert!(
+            plan_autoload_for(&p, Dialect::Hyprlang).is_none(),
+            "idempotent"
+        );
     }
 
     #[test]
@@ -661,7 +775,10 @@ mod tests {
         )
         .unwrap();
         assert!(autoloads(&p));
-        assert!(plan_autoload(&p).is_none(), "their line is enough");
+        assert!(
+            plan_autoload_for(&p, Dialect::Hyprlang).is_none(),
+            "their line is enough"
+        );
     }
 
     #[test]
@@ -693,5 +810,130 @@ mod tests {
         assert!(msg.contains("hyprpm update"), "{msg}");
         // And it says why Studio can't just do it.
         assert!(msg.contains("password"), "{msg}");
+    }
+}
+
+/// Omarchy 4: settings as `hl.config`, and a `require` where hyprlang used
+/// `source =`.
+#[cfg(test)]
+mod lua_tests {
+    use super::*;
+
+    fn tmpdir(tag: &str) -> OmarchyPaths {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "omarchy-studio-so-lua-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join(".config/hypr")).unwrap();
+        OmarchyPaths {
+            system: root.join("share/omarchy"),
+            config: root.join(".config/omarchy"),
+            state: root.join(".local/state/omarchy"),
+        }
+    }
+
+    #[test]
+    fn settings_render_as_a_nested_plugin_table() {
+        let out = Settings::default().render_for(Dialect::Lua);
+        assert!(out.contains("-- Managed by Omarchy Studio"));
+        assert!(out.contains("plugin = {"));
+        assert!(out.contains("scrolloverview = {"));
+        assert!(out.contains("layout = \"vertical\""));
+        assert!(out.contains("workspace_gap = 100"));
+        assert!(out.contains("blur = false"));
+        assert!(!out.contains("plugin {"), "no hyprlang syntax");
+    }
+
+    /// Hyprland only runs config something pulls in. On Lua that's `require`,
+    /// which resolves through the `~/.config` entry the Omarchy bootstrap adds
+    /// to `package.path` (verified against the running compositor).
+    #[test]
+    fn the_entry_line_is_a_require_not_a_source() {
+        let p = tmpdir("require");
+        assert_eq!(
+            source_line_for(&p, Dialect::Lua),
+            "require(\"hypr.scrolloverview\")"
+        );
+        assert!(source_line_for(&p, Dialect::Hyprlang).starts_with("source = "));
+    }
+
+    #[test]
+    fn source_and_autoload_land_in_the_lua_entry_files() {
+        let p = tmpdir("entry");
+        std::fs::write(
+            p.hypr_config().join("hyprland.lua"),
+            "require(\"default.hypr.omarchy\")\n",
+        )
+        .unwrap();
+
+        let edit = plan_source_for(&p, Dialect::Lua).expect("a change");
+        assert_eq!(edit.file, p.hypr_config().join("hyprland.lua"));
+        assert!(edit
+            .new_content
+            .contains("-- >>> omarchy-studio:scrolloverview-source"));
+        assert!(edit
+            .new_content
+            .contains("require(\"hypr.scrolloverview\")"));
+
+        let auto = plan_autoload_for(&p, Dialect::Lua).expect("a change");
+        assert_eq!(auto.file, p.hypr_config().join("autostart.lua"));
+        assert!(auto
+            .new_content
+            .contains("o.exec_on_start(\"hyprpm reload -n\")"));
+        assert!(
+            !auto.new_content.contains("exec-once ="),
+            "no hyprlang syntax"
+        );
+    }
+
+    #[test]
+    fn settings_round_trip_through_the_lua_block() {
+        let p = tmpdir("roundtrip");
+        let want = Settings {
+            scale: 0.75,
+            layout: "horizontal".into(),
+            workspace_gap: 40,
+            blur: true,
+            gesture_distance: 250,
+        };
+        let edit = want.plan_for(&p, Dialect::Lua).expect("a change");
+        std::fs::write(&edit.file, &edit.new_content).unwrap();
+        assert_eq!(edit.file, p.hypr_config().join("scrolloverview.lua"));
+
+        assert_eq!(Settings::load_for(&p, Dialect::Lua), want);
+        assert!(want.plan_for(&p, Dialect::Lua).is_none(), "idempotent");
+    }
+
+    #[test]
+    fn the_settings_block_is_valid_lua() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let source = Settings::default().render_for(Dialect::Lua);
+        let Ok(mut child) = Command::new("luac")
+            .args(["-p", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        else {
+            eprintln!("skipping: no luac on PATH");
+            return;
+        };
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(source.as_bytes())
+            .expect("write");
+        let out = child.wait_with_output().expect("luac");
+        assert!(
+            out.status.success(),
+            "invalid Lua:\n{source}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }

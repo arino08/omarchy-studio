@@ -115,6 +115,12 @@ pub struct Capabilities {
     /// Parsed from `hyprctl version`, e.g. `0.55.2`. Empty = hyprctl absent
     /// or not in a Hyprland session (e.g. SSH).
     pub hyprland_version: String,
+    /// Which config dialect the *running* compositor loaded, from
+    /// `hyprctl systeminfo` (`configProvider: lua` on Omarchy 4). Empty when
+    /// unknown — an old Hyprland that doesn't report it, or no session.
+    /// Authoritative in a way file-existence checks are not: this machine keeps
+    /// both `hyprland.conf` and `hyprland.lua` on disk, and only one is live.
+    pub config_provider: String,
     /// `hyprctl configerrors` supported — enables post-apply verification. [gate]
     pub has_configerrors: bool,
     /// `default/themed/` template engine present (Omarchy ≥ 3.x theme model).
@@ -143,6 +149,13 @@ impl Capabilities {
             .and_then(|o| parse_hyprland_version(&o.stdout))
             .unwrap_or_default();
 
+        let config_provider = runner
+            .run(&Cmd::new("hyprctl").arg("systeminfo"))
+            .ok()
+            .filter(|o| o.ok())
+            .and_then(|o| parse_config_provider(&o.stdout))
+            .unwrap_or_default();
+
         let has_configerrors = runner
             .run(&Cmd::new("hyprctl").arg("configerrors"))
             .map(|o| o.ok())
@@ -160,18 +173,38 @@ impl Capabilities {
         Self {
             omarchy_version,
             hyprland_version,
+            config_provider,
             has_configerrors,
             has_templates: paths.system.join("default/themed").is_dir(),
             has_hooks: paths.system.join("bin/omarchy-hook").is_file(),
-            tui_float_rule: std::fs::read_to_string(
-                paths.system.join("default/hypr/apps/system.conf"),
-            )
-            .map(|s| s.contains("TUI.float"))
-            .unwrap_or(false),
+            // Omarchy 4 moved this rule from apps/system.conf to apps/system.lua;
+            // check both so the probe doesn't report a missing rule that is
+            // actually present (and would send us installing a duplicate).
+            tui_float_rule: [
+                "default/hypr/apps/system.lua",
+                "default/hypr/apps/system.conf",
+            ]
+            .iter()
+            .any(|f| {
+                std::fs::read_to_string(paths.system.join(f))
+                    .map(|s| s.contains("TUI.float"))
+                    .unwrap_or(false)
+            }),
             video_wallpapers: find_in_path("mpvpaper-rs").is_some()
                 || find_in_path("mpvpaper").is_some(),
             omarchy_dirty,
         }
+    }
+}
+
+impl Capabilities {
+    /// Is Hyprland running the Lua config dialect (Omarchy 4 "Quattro")?
+    ///
+    /// Studio's hyprlang writers target `~/.config/hypr/*.conf`, which a
+    /// Lua-mode Hyprland never reads — writing them would report success and
+    /// change nothing. Modules branch on this instead of guessing from paths.
+    pub fn hypr_lua_mode(&self) -> bool {
+        self.config_provider.eq_ignore_ascii_case("lua")
     }
 }
 
@@ -186,6 +219,128 @@ fn parse_hyprland_version(stdout: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Parse the JSON stanzas `hyprctl -j --batch "getoption …"` emits into
+/// `colon:key -> Studio's string form`.
+///
+/// Each stanza names the option and carries exactly one typed field, so the
+/// type is discovered rather than assumed. Gap options come back as a `css`
+/// quad ("5 5 5 5"); Studio edits them as a single number, so the first
+/// component is taken.
+pub fn parse_getoptions(stdout: &str) -> std::collections::BTreeMap<String, String> {
+    use crate::configfs::jsonc::JsoncDoc;
+
+    let mut out = std::collections::BTreeMap::new();
+    for stanza in stdout.split("\n\n") {
+        let stanza = stanza.trim();
+        if stanza.is_empty() {
+            continue;
+        }
+        let Ok(doc) = JsoncDoc::parse(stanza) else {
+            continue;
+        };
+        let Some(name) = doc.get("option").map(|v| unquote(&v)) else {
+            continue;
+        };
+        let value = if let Some(v) = doc.get("int") {
+            v.trim().to_string()
+        } else if let Some(v) = doc.get("bool") {
+            v.trim().to_string()
+        } else if let Some(v) = doc.get("float") {
+            // `0.500000` → `0.5`, matching what Kind::validate produces.
+            match v.trim().parse::<f64>() {
+                Ok(f) => format!("{f}"),
+                Err(_) => v.trim().to_string(),
+            }
+        } else if let Some(v) = doc.get("str") {
+            unquote(&v)
+        } else if let Some(v) = doc.get("css") {
+            unquote(&v)
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            continue;
+        };
+        if !value.is_empty() {
+            out.insert(name, value);
+        }
+    }
+    out
+}
+
+fn unquote(raw: &str) -> String {
+    let t = raw.trim();
+    t.strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .unwrap_or(t)
+        .to_string()
+}
+
+/// Which config dialect Studio reads and writes for Hyprland.
+///
+/// Omarchy 4 ("Quattro") switched the compositor to Lua; before it, hyprlang.
+/// The two are not interchangeable — a `.conf` file is simply never read by a
+/// Lua-mode Hyprland — so every module that writes Hyprland config resolves
+/// this first and picks its file, comment style and renderer from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    /// `key = value` lines in `~/.config/hypr/*.conf` (Omarchy ≤ 3.x).
+    Hyprlang,
+    /// `hl.config({…})` calls in `~/.config/hypr/*.lua` (Omarchy 4+).
+    Lua,
+}
+
+impl Dialect {
+    /// Ask the running compositor which dialect it loaded. Falls back to
+    /// hyprlang when it can't be determined (no session, or a Hyprland too old
+    /// to report it) — the conservative choice, since that is what every
+    /// Omarchy before 4 used.
+    pub fn probe(runner: &dyn CommandRunner) -> Dialect {
+        let provider = runner
+            .run(&Cmd::new("hyprctl").arg("systeminfo"))
+            .ok()
+            .filter(|o| o.ok())
+            .and_then(|o| parse_config_provider(&o.stdout))
+            .unwrap_or_default();
+        if provider.eq_ignore_ascii_case("lua") {
+            Dialect::Lua
+        } else {
+            Dialect::Hyprlang
+        }
+    }
+
+    pub fn is_lua(self) -> bool {
+        self == Dialect::Lua
+    }
+
+    /// The extension of the user config files this dialect is written to.
+    pub fn ext(self) -> &'static str {
+        match self {
+            Dialect::Hyprlang => "conf",
+            Dialect::Lua => "lua",
+        }
+    }
+
+    /// The comment syntax used to delimit Studio's managed blocks.
+    pub fn comment_style(self) -> crate::configfs::CommentStyle {
+        match self {
+            Dialect::Hyprlang => crate::configfs::CommentStyle::Hash,
+            Dialect::Lua => crate::configfs::CommentStyle::DashDash,
+        }
+    }
+}
+
+/// `hyprctl systeminfo` reports the loaded dialect on one line:
+/// `configProvider: lua`. Absent on Hyprland versions that predate it.
+fn parse_config_provider(stdout: &str) -> Option<String> {
+    stdout
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("configProvider:"))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// Components with an `omarchy-restart-*` primitive (spec 02 §2).
@@ -215,6 +370,52 @@ impl Component {
     }
 
     /// Process name for the post-restart alive check, where one applies.
+    /// The binary this component *is*, for a plain presence check.
+    ///
+    /// Omarchy 4 dropped Waybar, Mako, SwayOSD, hypridle and Walker; the shell
+    /// (Quickshell) took over the bar, notifications, the OSD, idle and the
+    /// launcher. When the binary is absent, editing its config file writes
+    /// something nothing will ever read — so the modules that own these say so
+    /// instead.
+    pub fn binary(self) -> &'static str {
+        match self {
+            Component::Waybar => "waybar",
+            Component::Mako => "mako",
+            Component::Swayosd => "swayosd-server",
+            Component::Hypridle => "hypridle",
+            Component::Walker => "walker",
+            Component::Terminal => "foot",
+            Component::Btop => "btop",
+        }
+    }
+
+    /// Is this component installed at all?
+    pub fn present(self) -> bool {
+        find_in_path(self.binary()).is_some()
+    }
+
+    /// A one-line explanation for a component Omarchy 4 replaced, or `None`
+    /// when it is installed and editable as usual.
+    pub fn unavailable_reason(self) -> Option<String> {
+        if self.present() {
+            return None;
+        }
+        let replacement = match self {
+            Component::Waybar => "the Omarchy shell's bar (~/.config/omarchy/shell.json)",
+            Component::Mako => "the Omarchy shell's notifications",
+            Component::Swayosd => "the Omarchy shell's on-screen display",
+            Component::Hypridle => "the Omarchy shell's idle handling",
+            Component::Walker => "the Omarchy shell's launcher",
+            _ => return Some(format!("{} isn't installed.", self.binary())),
+        };
+        Some(format!(
+            "{} isn't installed — Omarchy 4 replaced it with {replacement}. \
+             Studio can't edit it here, and writing its old config file would \
+             change nothing.",
+            self.binary()
+        ))
+    }
+
     pub fn process_name(self) -> Option<&'static str> {
         match self {
             Component::Waybar => Some("waybar"),
@@ -280,6 +481,21 @@ pub mod cmds {
     /// the text form is the only readable keymap on that version.
     pub fn binds_text() -> Cmd {
         Cmd::new("hyprctl").arg("binds")
+    }
+
+    /// Read many options' *effective* values in one exec, as JSON stanzas.
+    /// `names` are Hyprland's colon form (`decoration:blur:size`).
+    ///
+    /// This is how Studio reads current values on Omarchy 4: the values live in
+    /// Lua now, and rather than parse a Turing-complete config we ask the
+    /// compositor what it actually ended up with. Correct on either dialect.
+    pub fn hypr_getoptions(names: &[String]) -> Cmd {
+        let script = names
+            .iter()
+            .map(|n| format!("getoption {n}"))
+            .collect::<Vec<_>>()
+            .join(" ; ");
+        Cmd::new("hyprctl").arg("-j").arg("--batch").arg(script)
     }
 
     /// Apply a single setting live, without writing any file — the look & feel
@@ -466,6 +682,145 @@ mod tests {
         assert!(caps.has_hooks);
         assert!(caps.tui_float_rule);
         assert!(!caps.omarchy_dirty);
+        // No systeminfo scripted → unknown provider, and we must not guess Lua.
+        assert_eq!(caps.config_provider, "");
+        assert!(!caps.hypr_lua_mode());
+    }
+
+    /// An Omarchy 4 install: Lua defaults, and a compositor reporting the Lua
+    /// config provider.
+    fn fake_omarchy_quattro(tag: &str) -> OmarchyPaths {
+        let paths = fake_omarchy(tag);
+        std::fs::remove_file(paths.system.join("default/hypr/apps/system.conf")).unwrap();
+        std::fs::write(paths.system.join("version"), "4.0.0\n").unwrap();
+        std::fs::write(
+            paths.system.join("default/hypr/apps/system.lua"),
+            "o.window(\"(org.omarchy.terminal|TUI.float)\", { float = true })\n",
+        )
+        .unwrap();
+        paths
+    }
+
+    #[test]
+    fn detects_lua_mode_and_finds_the_float_rule_in_its_new_home() {
+        let paths = fake_omarchy_quattro("quattro");
+        let stub = StubRunner::default()
+            .with_ok(
+                "hyprctl version",
+                "Hyprland 0.56.2 built from branch v0.56.2 at commit abc\n",
+            )
+            .with_ok(
+                "hyprctl systeminfo",
+                "Hyprland 0.56.2\nconfigProvider: lua\n\nLibraries:\n",
+            )
+            .with_ok("hyprctl configerrors", "")
+            .with_ok(git_status_display(&paths), "");
+
+        let caps = Capabilities::probe(&paths, &stub);
+        assert_eq!(caps.config_provider, "lua");
+        assert!(caps.hypr_lua_mode());
+        assert!(
+            caps.tui_float_rule,
+            "the rule lives in apps/system.lua on Omarchy 4"
+        );
+    }
+
+    /// Verbatim `hyprctl -j --batch "getoption …"` output from a Hyprland
+    /// 0.56.2 / Omarchy 4 session — including the css-quad form gaps use and
+    /// an option the user hasn't set.
+    const REAL_GETOPTIONS: &str = r#"{"option": "general:gaps_in", "css": "5 5 5 5", "set": true }
+
+
+{"option": "decoration:rounding", "int": 0, "set": true }
+
+
+{"option": "general:layout", "str": "dwindle", "set": true }
+
+
+{"option": "decoration:dim_strength", "float": 0.500000, "set": false }
+
+
+{"option": "general:resize_on_border", "bool": false, "set": true }
+"#;
+
+    #[test]
+    fn parses_real_batch_getoption_output() {
+        let got = parse_getoptions(REAL_GETOPTIONS);
+        assert_eq!(got.get("general:gaps_in").map(String::as_str), Some("5"));
+        assert_eq!(
+            got.get("decoration:rounding").map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            got.get("general:layout").map(String::as_str),
+            Some("dwindle")
+        );
+        // 0.500000 normalises to the form Kind::validate would produce.
+        assert_eq!(
+            got.get("decoration:dim_strength").map(String::as_str),
+            Some("0.5")
+        );
+        assert_eq!(
+            got.get("general:resize_on_border").map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(got.len(), 5);
+    }
+
+    #[test]
+    fn getoption_parser_skips_junk_without_panicking() {
+        assert!(parse_getoptions("").is_empty());
+        assert!(parse_getoptions("not json at all").is_empty());
+        // A stanza with no recognised typed field contributes nothing.
+        assert!(parse_getoptions(r#"{"option": "x:y", "set": false }"#).is_empty());
+    }
+
+    #[test]
+    fn builds_a_single_batch_command_for_many_options() {
+        let cmd = cmds::hypr_getoptions(&[
+            "general:gaps_in".to_string(),
+            "decoration:rounding".to_string(),
+        ]);
+        assert_eq!(
+            cmd.display(),
+            "hyprctl -j --batch getoption general:gaps_in ; getoption decoration:rounding"
+        );
+    }
+
+    /// A component Omarchy 4 dropped must explain itself rather than let a
+    /// module write a config file nothing reads.
+    #[test]
+    fn a_replaced_component_names_what_took_over() {
+        // `present()` reads the real PATH, so assert on the message shape for
+        // whichever side this machine is on.
+        for (c, expect) in [
+            (Component::Waybar, "shell.json"),
+            (Component::Mako, "notifications"),
+            (Component::Swayosd, "on-screen display"),
+        ] {
+            match c.unavailable_reason() {
+                Some(msg) => {
+                    assert!(msg.contains(c.binary()), "names the binary: {msg}");
+                    assert!(msg.contains(expect), "names the replacement: {msg}");
+                }
+                None => assert!(c.present(), "no reason given, so it must be installed"),
+            }
+        }
+    }
+
+    #[test]
+    fn hyprlang_provider_is_not_lua_mode() {
+        assert_eq!(
+            parse_config_provider("Hyprland 0.55\nconfigProvider: hyprlang\n").as_deref(),
+            Some("hyprlang")
+        );
+        let caps = Capabilities {
+            config_provider: "hyprlang".into(),
+            ..Default::default()
+        };
+        assert!(!caps.hypr_lua_mode());
+        // A Hyprland too old to report the line leaves it empty.
+        assert_eq!(parse_config_provider("Hyprland 0.44\n"), None);
     }
 
     #[test]

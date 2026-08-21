@@ -45,7 +45,7 @@ use ratatui::Frame;
 use studio_core::cmd::{CommandRunner, RealRunner};
 use studio_core::modules::themes::ThemeStore;
 use studio_core::modules::update;
-use studio_core::omarchy::{cmds, OmarchyPaths};
+use studio_core::omarchy::{cmds, Component, OmarchyPaths};
 use studio_core::snapshot::{SnapshotKind, SnapshotStore};
 
 use screens::animations::{AnimAction, AnimationsScreen};
@@ -660,11 +660,15 @@ impl App {
                 AnimAction::None => {}
                 AnimAction::Apply(name) => self.apply_animation(&name),
             },
+            // A screen whose component is gone shows an explanation, not an
+            // editor — so it must not act on edit keys either.
+            Screen::Waybar if unavailable(Component::Waybar).is_some() => {}
             Screen::Waybar => match self.waybar.handle(key) {
                 WaybarAction::None => {}
                 WaybarAction::Apply => self.apply_waybar(),
                 WaybarAction::Retarget(path) => self.retarget_waybar(path),
             },
+            Screen::Notifications if unavailable(Component::Mako).is_some() => {}
             Screen::Notifications => match self.notifications.handle(key) {
                 NotifAction::None => {}
                 NotifAction::Save => self.apply_notifications(),
@@ -672,6 +676,7 @@ impl App {
                 NotifAction::Test(urgency) => self.notif_test(&urgency),
                 NotifAction::OsdTest => self.osd_test(),
             },
+            Screen::LockIdle if unavailable(Component::Hypridle).is_some() => {}
             Screen::LockIdle => match self.lockidle.handle(key) {
                 LockIdleAction::None => {}
                 LockIdleAction::Save => self.apply_lockidle(),
@@ -1065,12 +1070,16 @@ impl App {
         }
     }
 
-    /// Persist an edited monitor layout to monitors.conf (managed block +
+    /// Persist an edited monitor layout to the user's monitors file (managed block +
     /// hotplug fallback), snapshot-backed, then reload Hyprland.
     fn monitors_save(&mut self, layout: studio_core::modules::monitors::Layout) {
         use studio_core::modules::monitors as mon;
-        let path = mon::conf_path(&self.paths);
-        let updated = mon::render_conf(&mon::read_conf(&self.paths), &layout);
+        // Omarchy 4 reads monitors.lua; writing monitors.conf there changes
+        // nothing at all, so the dialect picks both the file and the syntax.
+        let dialect = studio_core::omarchy::Dialect::probe(&RealRunner);
+        let path = mon::user_path(&self.paths, dialect);
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let updated = mon::render_for(&existing, &layout, dialect);
         let store = SnapshotStore::open_or_init(
             studio_core::studio_state_dir().join("history"),
             Box::new(RealRunner),
@@ -1086,7 +1095,7 @@ impl App {
         }
         if let Err(e) = studio_core::configfs::atomic_write(&path, &updated) {
             self.toast = Some(Toast {
-                text: format!("couldn't write monitors.conf: {}", brief(e)),
+                text: format!("couldn't write {}: {}", path.display(), brief(e)),
                 ok: false,
             });
             return;
@@ -2462,9 +2471,21 @@ impl App {
             Screen::Keybinds => self.keybinds.render(f, area, &self.skin),
             Screen::LookFeel => self.looknfeel.render(f, area, &self.skin),
             Screen::Animations => self.animations.render(f, area, &self.skin),
-            Screen::Waybar => self.waybar.render(f, area, &self.skin),
-            Screen::Notifications => self.notifications.render(f, area, &self.skin),
-            Screen::LockIdle => self.lockidle.render(f, area, &self.skin),
+            // Omarchy 4 replaced these with the Quickshell shell. Rendering the
+            // usual editor there would show an empty list and quietly invite
+            // edits to a file nothing reads, so say what happened instead.
+            Screen::Waybar => match unavailable(Component::Waybar) {
+                Some(msg) => render_unavailable(f, area, &self.skin, "Bar", &msg),
+                None => self.waybar.render(f, area, &self.skin),
+            },
+            Screen::Notifications => match unavailable(Component::Mako) {
+                Some(msg) => render_unavailable(f, area, &self.skin, "Notifications", &msg),
+                None => self.notifications.render(f, area, &self.skin),
+            },
+            Screen::LockIdle => match unavailable(Component::Hypridle) {
+                Some(msg) => render_unavailable(f, area, &self.skin, "Lock & Idle", &msg),
+                None => self.lockidle.render(f, area, &self.skin),
+            },
             Screen::Snapshots => self.snapshots.render(f, area, &self.skin),
             Screen::Wallpapers => self
                 .wallpapers
@@ -2735,6 +2756,43 @@ impl CommandPalette {
 }
 
 /// One-line rendering of a core error for a toast (no debug spew).
+/// The reason a screen's component is unavailable, or `None` when it's usable.
+/// Cached per process: this reads `PATH`, and it can't change under a running
+/// TUI.
+fn unavailable(c: Component) -> Option<String> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<&'static str, Option<String>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = cache.lock().expect("unavailable cache");
+    map.entry(c.binary())
+        .or_insert_with(|| c.unavailable_reason())
+        .clone()
+}
+
+/// A screen that can't do anything here, and why.
+fn render_unavailable(f: &mut Frame, area: Rect, skin: &Skin, title: &str, reason: &str) {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!("{title} isn't available on this system"),
+            skin.accent_bold(),
+        )),
+        Line::from(""),
+    ];
+    for l in crate::tui::screens::doctor::wrap_words(
+        reason,
+        area.width.saturating_sub(4).max(20) as usize,
+    ) {
+        lines.push(Line::from(Span::styled(l, skin.body())));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Everything else in Studio still works.",
+        skin.dim(),
+    )));
+    f.render_widget(ratatui::widgets::Paragraph::new(lines), area);
+}
+
 pub(crate) fn brief(e: studio_core::StudioError) -> String {
     use studio_core::StudioError::*;
     match e {

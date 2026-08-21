@@ -13,9 +13,10 @@
 
 use std::path::PathBuf;
 
-use crate::configfs::{CommentStyle, ManagedBlock};
+use crate::configfs::lua;
+use crate::configfs::ManagedBlock;
 use crate::error::Result;
-use crate::omarchy::OmarchyPaths;
+use crate::omarchy::{Dialect, OmarchyPaths};
 
 /// A tweak's current state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +36,9 @@ impl State {
 pub struct Ctx {
     pub paths: OmarchyPaths,
     pub home: PathBuf,
+    /// Which Hyprland config dialect this machine reads — decides which file a
+    /// hypr-backed tweak writes and in what syntax.
+    pub dialect: Dialect,
 }
 
 impl Ctx {
@@ -42,6 +46,7 @@ impl Ctx {
         Ok(Self {
             paths: OmarchyPaths::discover()?,
             home: PathBuf::from(std::env::var_os("HOME").unwrap_or_default()),
+            dialect: Dialect::probe(&crate::cmd::RealRunner),
         })
     }
 }
@@ -92,8 +97,9 @@ fn plan_hypr_block(
     section: &str,
     body: &str,
     on: bool,
+    dialect: Dialect,
 ) -> Option<crate::engine::FileEdit> {
-    let block = ManagedBlock::new(section, CommentStyle::Hash);
+    let block = ManagedBlock::new(section, dialect.comment_style());
     // `None` for a file that doesn't exist yet — the pipeline's hash guard
     // reads it the same way, and treating absent as empty makes it reject.
     let on_disk = std::fs::read_to_string(&path).ok();
@@ -164,9 +170,9 @@ pub fn apply(
     Ok(files)
 }
 
-fn hypr_block_present(path: &std::path::Path, section: &str) -> bool {
+fn hypr_block_present(path: &std::path::Path, section: &str, dialect: Dialect) -> bool {
     std::fs::read_to_string(path)
-        .map(|c| ManagedBlock::new(section, CommentStyle::Hash).contains(&c))
+        .map(|c| ManagedBlock::new(section, dialect.comment_style()).contains(&c))
         .unwrap_or(false)
 }
 
@@ -180,7 +186,9 @@ struct CapsEscape;
 impl CapsEscape {
     const SECTION: &'static str = "tweak-caps-escape";
     fn path(ctx: &Ctx) -> PathBuf {
-        ctx.paths.hypr_config().join("input.conf")
+        ctx.paths
+            .hypr_config()
+            .join(format!("input.{}", ctx.dialect.ext()))
     }
 }
 
@@ -195,17 +203,26 @@ impl Tweak for CapsEscape {
         "Remap Caps Lock to Escape (overrides Omarchy's compose default)"
     }
     fn state(&self, ctx: &Ctx) -> State {
-        if hypr_block_present(&Self::path(ctx), Self::SECTION) {
+        if hypr_block_present(&Self::path(ctx), Self::SECTION, ctx.dialect) {
             State::On
         } else {
             State::Off
         }
     }
     fn plan(&self, ctx: &Ctx, on: bool) -> Result<Vec<crate::engine::FileEdit>> {
-        let body = "input {\n  kb_options = caps:escape\n}";
-        Ok(plan_hypr_block(Self::path(ctx), Self::SECTION, body, on)
-            .into_iter()
-            .collect())
+        let body = if ctx.dialect.is_lua() {
+            lua::config_call(&[(
+                "input.kb_options".to_string(),
+                lua::Value::Str("caps:escape".into()),
+            )])
+        } else {
+            "input {\n  kb_options = caps:escape\n}".to_string()
+        };
+        Ok(
+            plan_hypr_block(Self::path(ctx), Self::SECTION, &body, on, ctx.dialect)
+                .into_iter()
+                .collect(),
+        )
     }
     fn set(&self, ctx: &Ctx, on: bool) -> Result<Vec<PathBuf>> {
         write_edits(&self.plan(ctx, on)?)
@@ -220,7 +237,9 @@ struct InactiveTransparency;
 impl InactiveTransparency {
     const SECTION: &'static str = "tweak-transparency";
     fn path(ctx: &Ctx) -> PathBuf {
-        ctx.paths.hypr_config().join("looknfeel.conf")
+        ctx.paths
+            .hypr_config()
+            .join(format!("looknfeel.{}", ctx.dialect.ext()))
     }
 }
 
@@ -235,17 +254,26 @@ impl Tweak for InactiveTransparency {
         "Dim unfocused windows to 95% opacity (active stays solid)"
     }
     fn state(&self, ctx: &Ctx) -> State {
-        if hypr_block_present(&Self::path(ctx), Self::SECTION) {
+        if hypr_block_present(&Self::path(ctx), Self::SECTION, ctx.dialect) {
             State::On
         } else {
             State::Off
         }
     }
     fn plan(&self, ctx: &Ctx, on: bool) -> Result<Vec<crate::engine::FileEdit>> {
-        let body = "windowrule = opacity 1.0 0.95, match:class .*";
-        Ok(plan_hypr_block(Self::path(ctx), Self::SECTION, body, on)
-            .into_iter()
-            .collect())
+        // Omarchy 4 applies its own default opacity through a tag in
+        // default/hypr/windows.lua; the user's looknfeel.lua is required after
+        // it, so this rule lands last and wins.
+        let body = if ctx.dialect.is_lua() {
+            "o.window(\".*\", { opacity = \"1.0 0.95\" })".to_string()
+        } else {
+            "windowrule = opacity 1.0 0.95, match:class .*".to_string()
+        };
+        Ok(
+            plan_hypr_block(Self::path(ctx), Self::SECTION, &body, on, ctx.dialect)
+                .into_iter()
+                .collect(),
+        )
     }
     fn set(&self, ctx: &Ctx, on: bool) -> Result<Vec<PathBuf>> {
         write_edits(&self.plan(ctx, on)?)
@@ -328,7 +356,11 @@ mod tests {
             config: root.join("cfg/omarchy"),
             state: root.join("cfg/state"),
         };
-        Ctx { paths, home: root }
+        Ctx {
+            paths,
+            home: root,
+            dialect: Dialect::Hyprlang,
+        }
     }
 
     #[test]
@@ -414,5 +446,115 @@ mod tests {
         // revert must not delete a dir with captures in it
         t.set(&c, false).unwrap();
         assert!(shot.is_file());
+    }
+}
+
+/// Omarchy 4: the hypr-backed tweaks write `.lua`.
+#[cfg(test)]
+mod lua_tests {
+    use super::*;
+
+    fn ctx(tag: &str) -> Ctx {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "omarchy-studio-tweaks-lua-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join(".config/hypr")).unwrap();
+        Ctx {
+            paths: OmarchyPaths {
+                system: root.join("share/omarchy"),
+                config: root.join(".config/omarchy"),
+                state: root.join(".local/state/omarchy"),
+            },
+            home: root,
+            dialect: Dialect::Lua,
+        }
+    }
+
+    #[test]
+    fn caps_escape_writes_input_lua() {
+        let c = ctx("caps");
+        let tweak = find("caps-escape").unwrap();
+        assert_eq!(tweak.state(&c), State::Off);
+
+        tweak.set(&c, true).unwrap();
+        let path = c.paths.hypr_config().join("input.lua");
+        assert!(path.exists(), "writes input.lua");
+        assert!(!c.paths.hypr_config().join("input.conf").exists());
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("-- >>> omarchy-studio:tweak-caps-escape"));
+        assert!(text.contains("kb_options = \"caps:escape\""));
+        assert_eq!(tweak.state(&c), State::On);
+
+        tweak.set(&c, false).unwrap();
+        assert_eq!(tweak.state(&c), State::Off);
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("caps:escape"));
+    }
+
+    #[test]
+    fn transparency_uses_the_o_window_helper() {
+        let c = ctx("opacity");
+        let tweak = find("inactive-transparency").unwrap();
+        tweak.set(&c, true).unwrap();
+
+        let text = std::fs::read_to_string(c.paths.hypr_config().join("looknfeel.lua")).unwrap();
+        assert!(text.contains("o.window(\".*\", { opacity = \"1.0 0.95\" })"));
+        assert!(!text.contains("windowrule ="), "no hyprlang syntax");
+        assert_eq!(tweak.state(&c), State::On);
+    }
+
+    #[test]
+    fn a_lua_tweak_leaves_the_users_own_lines_alone() {
+        let c = ctx("coexist");
+        let path = c.paths.hypr_config().join("input.lua");
+        let users = "-- mine\nhl.config({\n  input = {\n    sensitivity = 0.2,\n  },\n})\n";
+        std::fs::write(&path, users).unwrap();
+
+        let tweak = find("caps-escape").unwrap();
+        tweak.set(&c, true).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().starts_with(users));
+
+        tweak.set(&c, false).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), users);
+    }
+
+    #[test]
+    fn emitted_tweak_bodies_are_valid_lua() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let c = ctx("valid");
+        for id in ["caps-escape", "inactive-transparency"] {
+            let edits = find(id).unwrap().plan(&c, true).unwrap();
+            let body = &edits[0].new_content;
+            let Ok(mut child) = Command::new("luac")
+                .args(["-p", "-"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+            else {
+                eprintln!("skipping: no luac on PATH");
+                return;
+            };
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(body.as_bytes())
+                .expect("write");
+            let out = child.wait_with_output().expect("luac");
+            assert!(
+                out.status.success(),
+                "{id} emitted invalid Lua:\n{body}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
     }
 }

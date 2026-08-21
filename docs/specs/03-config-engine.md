@@ -6,14 +6,17 @@ The trust core. Everything here is `studio-core::configfs` + `studio-core::snaps
 
 | Dialect | Files | Strategy | Crate |
 |---|---|---|---|
-| hyprlang | `~/.config/hypr/*.conf` | **Line CST** (§2) — full parse, comment-preserving edits | hand-rolled |
+| hyprlang | `~/.config/hypr/*.conf` (Omarchy ≤ 3) | **Line CST** (§2) — full parse, comment-preserving edits | hand-rolled |
+| Lua | `~/.config/hypr/*.lua` (Omarchy 4+) | **Emit-only** (§2a) — managed block of `hl.*` calls | hand-rolled |
 | TOML | `colors.toml`, `walker/config.toml`, `swayosd/config.toml`, Studio's own | lossless document edit | `toml_edit` |
 | JSONC | `waybar/config.jsonc` | CST with comment/whitespace tokens (§3) | `jsonc-parser` (CST mode) or hand-rolled tokenizer if insufficient |
 | INI (mako flavor) | generated `themed/mako.ini.tpl` | Studio owns the file → simple line model | hand-rolled |
 | CSS | `waybar/style.css`, `swayosd/style.css` | **managed blocks only** (§4) — never a real CSS parse | hand-rolled |
-| bash | `extensions/menu.sh` | managed block only (spec 02 §3.1) | hand-rolled |
+| JSONC | `extensions/omarchy-menu.jsonc` | one member only (spec 02 §3.1) | span CST (§3) |
 
 Principle: parse fully only what we must *understand* (hyprlang, JSONC, TOML). For everything else, own a clearly-marked region and treat the rest as opaque text.
+
+Which Hyprland dialect is in play is resolved by `omarchy::Dialect::probe`, which asks the running compositor (`hyprctl systeminfo` → `configProvider: lua`). That is authoritative in a way a file-existence check is not: an upgraded machine keeps both `hyprland.conf` and `hyprland.lua`, and only one is live. Writing the wrong one is silently inert — the compositor simply never reads it — so every module that writes Hyprland config resolves the dialect first and picks its file, comment style (`#` vs `--`) and renderer from it.
 
 ## 2. Hyprlang line CST
 
@@ -31,6 +34,21 @@ pub enum HyprLine {
 ```
 
 Operations: `get(path)`, `set(path, value)` (in-place edit preserving alignment; else append in the right category, creating it if needed), `remove`, `append_bind(BindLine)`, `find_bind(chord)`. Round-trip invariant: `parse(s).to_string() == s` for **every** file in Omarchy's `default/hypr/` and stock user configs (golden tests, spec 09).
+
+## 2a. Lua emission (Omarchy 4)
+
+Omarchy 4 loads the user's Lua modules *after* its own defaults, and a later `hl.config({…})` deep-merges over an earlier one. A managed block appended to the end of a user file therefore wins, exactly as a managed block of hyprlang lines did — the write model carries over unchanged, only the rendering differs.
+
+Studio **emits** Lua and never parses arbitrary Lua. Two consequences:
+
+- **Reading effective values** goes through `hyprctl -j --batch "getoption …"` — one exec for a whole schema, typed per option, and authoritative on either dialect. Gap options come back as a `css` quad; the first component is taken.
+- **Reading back Studio's own block** uses a strict reader that understands only the shape `config_call` emits, proven its exact inverse by round-trip tests. Anything unrecognised is skipped rather than guessed at, so a hand-edited block degrades to "not overridden" instead of a wrong value.
+
+Rendering is deterministic (keys sort, formatting fixed), so rewriting an unchanged block is a no-op and diffs stay legible. Emitted blocks are syntax-checked by the real `luac` in the golden suite.
+
+Call forms in use, each verified against the running compositor rather than assumed: `hl.config{}` for settings, `hl.monitor{}` for displays (`disabled = true` turns one off — not `disable`, not `enabled`), `hl.curve` / `hl.animation` for animation feels, `o.bind` / `hl.unbind` for keys, `o.window` for window rules, and `require("hypr.<name>")` where hyprlang used `source =`.
+
+**Keybinds are the one lossy case.** In Lua mode `hyprctl binds` reports every bind's dispatcher as `__lua` — an opaque callback id — so a bind read from the runtime carries no reproducible action. To move an action onto another key, Studio finds the `o.bind(...)` that declared it in `$OMARCHY_PATH/default/hypr/bindings/*.lua` (or the user's `bindings.lua`) and re-emits that action argument verbatim. Chords Omarchy generates in a `for` loop have no literal to match; those refuse with an explanation rather than writing a bind that would do nothing.
 
 **Layering model** (read-side): to attribute a setting/bind to its source, the engine reads the same file list Hyprland does, in order: `default/hypr/*.conf` (via the user `hyprland.conf` source list) → theme `hyprland.conf` → user files → toggles. Effective value = last write; each value carries `SourceRef { file, line, layer }`. Studio only ever *writes* to the user layer (or theme files it owns).
 

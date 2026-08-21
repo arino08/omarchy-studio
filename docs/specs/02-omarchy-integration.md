@@ -22,7 +22,7 @@ pub struct OmarchyPaths {
 | `user_templates()` | `~/.config/omarchy/themed/` | user `*.tpl` overrides (win over built-in) |
 | `builtin_templates()` | `$OMARCHY_PATH/default/themed/` | `{{ key }}`, `{{ key_strip }}`, `{{ key_rgb }}` |
 | `hooks_dir()` | `~/.config/omarchy/hooks/` | `<event>` file + `<event>.d/*` |
-| `menu_ext()` | `~/.config/omarchy/extensions/menu.sh` | single file, sourced by omarchy-menu |
+| `menu_ext()` | `~/.config/omarchy/extensions/omarchy-menu.jsonc` | single JSONC file, merged by the Quickshell menu plugin (Omarchy 4+) |
 | `elephant_menus()` | `~/.config/elephant/menus/` | Walker Lua providers |
 | `user_backgrounds(theme)` | `~/.config/omarchy/backgrounds/<theme>/` | user wallpaper additions |
 | `toggles()` | `~/.local/state/omarchy/toggles/hypr/` | dynamic flag confs sourced by Hyprland |
@@ -58,25 +58,30 @@ Execution: `Cmd` runs with a 10 s default timeout, captured stdout/stderr, env `
 
 ## 3. Menu integration (FR10.1/FR10.2)
 
-### 3.1 `extensions/menu.sh` managed block
+### 3.1 `extensions/omarchy-menu.jsonc` row
 
-`omarchy-menu` sources **one** user file. Studio manages a marker-delimited block and never touches anything outside it:
+Omarchy 4 ("Quattro") replaced the bash `omarchy-menu` with a Quickshell plugin. It merges **one** user JSONC file over its own defaults at startup, and hot-reloads it on save. Studio declares a single row there and leaves every other member — and the file's shipped help comments — byte-for-byte alone:
 
-```bash
-# >>> omarchy-studio managed — do not edit inside (edits are overwritten) >>>
-show_style_menu() {
-  local options="Studio\n$(_omarchy_studio_orig_style_options)"
-  ...dispatch: "Studio" → omarchy-launch-floating-terminal-with-presentation omarchy-studio
-# <<< omarchy-studio managed <<<
+```jsonc
+"style.studio": {"icon":"󰏘","label":"Studio","aliases":["studio","omarchy-studio"],"action":"omarchy-launch-floating-terminal-with-presentation omarchy-studio"}
 ```
 
-Install algorithm (idempotent):
-1. File absent → create with header comment + block.
-2. File present, markers found → replace block content only.
-3. File present, no markers → append block; **warn** if the file already redefines `show_style_menu` (we then chain via function-rename trick: save original as `_omarchy_studio_prev_style_menu` and call it for non-Studio selections).
-4. Uninstall removes exactly the block (and the file if Studio created it and it's otherwise empty).
+The id is dotted, so the parent (`style`) is inferred and the row lands in the Style submenu. Declaring a row is **additive**, unlike the pre-4 mechanism below, so stock Style entries added by a later Omarchy still appear without Studio being reinstalled.
 
-The block's actual menu shape (entries → deep-links like `omarchy-studio keybinds`) is defined in spec 07 §6.
+Install algorithm (idempotent):
+1. File absent/blank → create `{}` and insert the row.
+2. Key already present → replace its value in place (never a second copy).
+3. Key absent → append after the last member, matching its indentation. A comment-only stub gets the row without a stray separating comma.
+4. Uninstall removes exactly that member, by span rather than by comma-split chunk, so a preceding comment block survives.
+5. Either direction also clears the dead pre-4 block (§3.1.1).
+
+Both files are snapshotted before a change (`integration::managed_files`), so the migration stays undoable.
+
+#### 3.1.1 Pre-Quattro `extensions/menu.sh` (removed)
+
+Through Omarchy 3.x, `omarchy-menu` was bash and sourced `extensions/menu.sh`; Studio managed a marked block there that redefined `show_style_menu`. **Nothing sources that file in Omarchy 4** — which is why the entry silently vanished from every menu after the update. Studio no longer writes it, and install/uninstall delete its managed block (and the file, when Studio's block was all it held), leaving any of the user's own overrides in place.
+
+The row's deep-links (entries like `omarchy-studio keybinds`) are defined in spec 07 §6.
 
 ### 3.2 Elephant provider
 

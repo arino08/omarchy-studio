@@ -29,6 +29,7 @@ pub mod keybinds;
 pub mod lockidle;
 pub mod looknfeel;
 pub mod mako;
+pub mod migrate;
 pub mod monitors;
 pub mod nova;
 pub mod power;

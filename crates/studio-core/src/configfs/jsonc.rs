@@ -206,6 +206,78 @@ impl JsoncDoc {
         Ok(())
     }
 
+    /// Is `key` a member of the object at `path` (empty path = the root object)?
+    /// Matches the key literally, so a dotted key like `style.studio` — one
+    /// member, not a nested path — is found where `get` would walk into `style`.
+    pub fn has_member(&self, path: &str, key: &str) -> bool {
+        let node = if path.is_empty() {
+            Some(&self.root)
+        } else {
+            self.resolve(path)
+        };
+        matches!(node, Some(Node::Object { members, .. })
+            if members.iter().any(|m| m.key == key))
+    }
+
+    /// Remove the member `key` from the object at `path` (empty path = the root
+    /// object). No-op when the key is absent. Cuts the key and value spans only,
+    /// so surrounding comments — including a help block that leads the object —
+    /// survive, as does every other member.
+    pub fn remove_member(&mut self, path: &str, key: &str) -> Result<(), String> {
+        let vspan = {
+            let node = if path.is_empty() {
+                &self.root
+            } else {
+                self.resolve(path)
+                    .ok_or_else(|| format!("{path} not found"))?
+            };
+            let Node::Object { members, .. } = node else {
+                return Err(format!("{path} is not an object"));
+            };
+            match members.iter().find(|m| m.key == key) {
+                Some(m) => m.value.span(),
+                None => return Ok(()),
+            }
+        };
+
+        // Cut from the key's own quote to the end of its value. Working from
+        // spans rather than comma-split chunks is what keeps a preceding comment
+        // block — the help text in Omarchy's stub file — out of the removal.
+        let quoted = format!("\"{key}\"");
+        let Some(start) = self.src[..vspan.0].rfind(&quoted) else {
+            return Ok(());
+        };
+        let mut start = start;
+        let mut end = vspan.1;
+
+        // Take the separating comma with it: the one that follows, or — when
+        // this was the last member — the one that precedes.
+        let after = self.src[end..]
+            .find(|c: char| !c.is_whitespace())
+            .map(|off| end + off);
+        match after {
+            Some(i) if self.src.as_bytes()[i] == b',' => end = i + 1,
+            _ => {
+                let before = self.src[..start].trim_end_matches([' ', '\t', '\r', '\n']);
+                if before.ends_with(',') {
+                    start = before.len() - 1;
+                }
+            }
+        }
+
+        // Drop the blank line the member leaves behind, but never the newline
+        // that terminates whatever sits above it.
+        let trimmed = self.src[..start].trim_end_matches([' ', '\t']);
+        if trimmed.ends_with('\n') {
+            start = trimmed.len() - 1;
+        } else {
+            start = trimmed.len();
+        }
+
+        self.splice((start, end), "");
+        Ok(())
+    }
+
     /// Insert (or replace) a member `"key": value` in the object at `path`
     /// (empty path = the root object). When the key already exists its value is
     /// replaced in place; otherwise the member is appended after the last one,
@@ -214,7 +286,11 @@ impl JsoncDoc {
     pub fn insert_member(&mut self, path: &str, key: &str, raw_value: &str) -> Result<(), String> {
         enum Plan {
             Replace((usize, usize)),
-            Append((usize, usize)),
+            /// Span of the object, plus whether it already holds a member. An
+            /// object with none (a comment-only stub like Omarchy's shipped
+            /// `omarchy-menu.jsonc`) must not get a separating comma — there is
+            /// nothing to separate, and the comma would land inside a comment.
+            Append((usize, usize), bool),
         }
         let plan = {
             let node = if path.is_empty() {
@@ -228,12 +304,12 @@ impl JsoncDoc {
             };
             match members.iter().find(|m| m.key == key) {
                 Some(m) => Plan::Replace(m.value.span()),
-                None => Plan::Append(*span),
+                None => Plan::Append(*span, !members.is_empty()),
             }
         };
         match plan {
             Plan::Replace(vspan) => self.splice(vspan, raw_value),
-            Plan::Append(span) => {
+            Plan::Append(span, has_members) => {
                 let inner_span = (span.0 + 1, span.1 - 1);
                 let inner = self.src[inner_span.0..inner_span.1].to_string();
                 let mut chunks = split_top_level(&inner);
@@ -266,7 +342,7 @@ impl JsoncDoc {
                 let base: String = indent.chars().filter(|c| matches!(c, ' ' | '\t')).collect();
                 let value = raw_value.replace('\n', &format!("\n{base}"));
                 chunks.push(format!("{indent}\"{key}\": {value}{trailing}"));
-                let out = chunks.join(",");
+                let out = chunks.join(if has_members { "," } else { "" });
                 self.splice(inner_span, &out);
             }
         }
