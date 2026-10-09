@@ -508,16 +508,19 @@ fn dotted_name_end(b: &[u8], i: usize) -> Option<usize> {
     }
 }
 
-/// The call whose callee name spans `start..name_end`, if a `(` follows it.
-fn call_at(text: &str, start: usize, name_end: usize) -> Option<(Call, usize)> {
-    let b = text.as_bytes();
+/// The `(` after the callee name ending at `name_end`, if one follows it.
+fn open_paren(b: &[u8], name_end: usize) -> Option<usize> {
     let mut open = name_end;
     while b.get(open).is_some_and(|c| c.is_ascii_whitespace()) {
         open += 1;
     }
-    if b.get(open) != Some(&b'(') {
-        return None;
-    }
+    (b.get(open) == Some(&b'(')).then_some(open)
+}
+
+/// The call whose callee name spans `start..name_end`, if a `(` follows it.
+fn call_at(text: &str, start: usize, name_end: usize) -> Option<(Call, usize)> {
+    let b = text.as_bytes();
+    let open = open_paren(b, name_end)?;
     let close = matching_paren(b, open)?;
     Some((
         Call {
@@ -534,12 +537,15 @@ fn call_at(text: &str, start: usize, name_end: usize) -> Option<(Call, usize)> {
 /// managed keybinds block. Comments, whitespace and `;` between statements
 /// are skipped; a statement may span any number of lines.
 ///
-/// `Err((line, source))` names the first statement that isn't a plain call —
-/// an assignment, a `for` loop, an unbalanced paren — so a caller can refuse
-/// rather than silently drop it.
-pub fn parse_call_statements(text: &str) -> Result<Vec<Call>, (usize, String)> {
+/// The second list names, as `(line, source)`, each statement that isn't a
+/// plain call — an assignment, a `for` loop, an unbalanced paren — so a caller
+/// can refuse rather than silently drop it. Reading resumes on the line after
+/// one, except after a call whose parens never close: nothing past that can
+/// be told apart.
+pub fn parse_call_statements(text: &str) -> (Vec<Call>, Vec<(usize, String)>) {
     let b = text.as_bytes();
     let mut out = Vec::new();
+    let mut errors = Vec::new();
     let mut i = 0;
     while i < b.len() {
         if b[i].is_ascii_whitespace() || b[i] == b';' {
@@ -550,16 +556,21 @@ pub fn parse_call_statements(text: &str) -> Result<Vec<Call>, (usize, String)> {
             i = skip_lexeme(b, i).unwrap_or(b.len());
             continue;
         }
-        let call = dotted_name_end(b, i).and_then(|end| call_at(text, i, end));
-        let Some((call, next)) = call else {
+        let name_end = dotted_name_end(b, i);
+        let Some((call, next)) = name_end.and_then(|end| call_at(text, i, end)) else {
             let line = line_of(text, i);
             let source = text.lines().nth(line - 1).unwrap_or_default().trim();
-            return Err((line, source.to_string()));
+            errors.push((line, source.to_string()));
+            if name_end.and_then(|end| open_paren(b, end)).is_some() {
+                break;
+            }
+            i = text[i..].find('\n').map_or(b.len(), |n| i + n + 1);
+            continue;
         };
         out.push(call);
         i = next;
     }
-    Ok(out)
+    (out, errors)
 }
 
 /// Every call to `callee` anywhere in arbitrary Lua source — inside loops,
@@ -940,7 +951,8 @@ mod tests {
                     \thl.plugin.scrolloverview.overview(\"toggle\") -- )\n\
                     end);\n\
                     hl.unbind(\"SUPER + F\")";
-        let calls = parse_call_statements(body).unwrap();
+        let (calls, errors) = parse_call_statements(body);
+        assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].callee, "o.bind");
         assert_eq!(calls[0].line, 2);
@@ -954,22 +966,40 @@ mod tests {
 
     #[test]
     fn a_statement_that_is_not_a_call_is_named_by_line() {
-        assert_eq!(
-            parse_call_statements("hl.unbind(\"A\")\nlocal x = 1\n"),
-            Err((2, "local x = 1".to_string()))
+        // Every one is named, and the calls around them are still read.
+        let (calls, errors) = parse_call_statements(
+            "hl.unbind(\"A\")\nlocal x = 1\nhl.unbind(\"B\")\nlocal y = 2\nhl.unbind(\"C\")",
         );
-        // An unbalanced call is reported where it starts, not truncated.
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[2].line, 5);
+        assert_eq!(
+            errors,
+            [
+                (2, "local x = 1".to_string()),
+                (4, "local y = 2".to_string())
+            ]
+        );
+        // An unbalanced call is reported where it starts, not truncated, and
+        // nothing after it is read.
         assert_eq!(
             parse_call_statements("\n\no.bind(\"A\", \"b\", function()\n  x()\n"),
-            Err((3, "o.bind(\"A\", \"b\", function()".to_string()))
+            (
+                Vec::new(),
+                vec![(3, "o.bind(\"A\", \"b\", function()".to_string())]
+            )
         );
         // A call that's then indexed or called again isn't a plain statement.
-        assert!(parse_call_statements("o.bind(\"A\", \"b\", \"c\").x = 1").is_err());
+        assert_eq!(
+            parse_call_statements("o.bind(\"A\", \"b\", \"c\").x = 1")
+                .1
+                .len(),
+            1
+        );
     }
 
     #[test]
     fn long_strings_and_comments_hide_their_brackets() {
-        let calls = parse_call_statements("--[[ ) ]] f([[ ) , ]], --[==[ ( ]==] 2)").unwrap();
+        let (calls, _) = parse_call_statements("--[[ ) ]] f([[ ) , ]], --[==[ ( ]==] 2)");
         assert_eq!(calls[0].args, vec!["[[ ) , ]]", "--[==[ ( ]==] 2"]);
     }
 
