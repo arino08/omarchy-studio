@@ -685,45 +685,38 @@ impl Layout {
     /// `y` — this reorders the row, it doesn't touch vertical offsets, so a
     /// stacked/staggered layout isn't flattened by a horizontal move).
     ///
-    /// `live` supplies the physical width/height the move needs (a pending
-    /// mode change in this layout hasn't necessarily hit `hyprctl` yet).
-    /// Returns `false` when `name` is already at that edge, or unknown.
-    pub fn move_horizontal(&mut self, live: &[Monitor], name: &str, dir: i64) -> bool {
+    /// Widths come from `rects`, so a pending mode/scale edit counts and a
+    /// disabled display is neither in the row nor reserves space in it.
+    /// The error is user-facing: an unknown or disabled `name`, or one that is
+    /// already at that edge.
+    pub fn move_horizontal(
+        &mut self,
+        live: &[Monitor],
+        name: &str,
+        dir: i64,
+    ) -> std::result::Result<(), String> {
+        self.require_rect(name, live)?;
         // Left-to-right order by current x, ties broken by name so the order
         // is deterministic when two displays start at the same position.
-        let mut order: Vec<usize> = (0..self.monitors.len()).collect();
-        order.sort_by(|&a, &b| {
-            self.monitors[a]
-                .x
-                .cmp(&self.monitors[b].x)
-                .then_with(|| self.monitors[a].name.cmp(&self.monitors[b].name))
-        });
-        let Some(pos) = order.iter().position(|&i| self.monitors[i].name == name) else {
-            return false;
-        };
+        let mut row = self.rects(live);
+        row.sort_by(|(an, a), (bn, b)| a.x.cmp(&b.x).then_with(|| an.cmp(bn)));
+        let pos = row
+            .iter()
+            .position(|(n, _)| n == name)
+            .ok_or_else(|| format!("no display named `{name}` — see `monitor list`"))?;
         let target = pos as i64 + dir;
-        if target < 0 || target as usize >= order.len() {
-            return false;
+        if target < 0 || target as usize >= row.len() {
+            let edge = if dir < 0 { "leftmost" } else { "rightmost" };
+            return Err(format!("{name} is already the {edge} display"));
         }
-        order.swap(pos, target as usize);
+        row.swap(pos, target as usize);
 
-        // Re-pack x left-to-right in the new order, at each display's own
-        // (possibly just-edited) scale and transform.
         let mut x = 0i32;
-        for &i in &order {
-            let s = &mut self.monitors[i];
-            let w = live
-                .iter()
-                .find(|m| m.name == s.name)
-                .map(|m| {
-                    let scale = s.scale.parse().unwrap_or(m.scale);
-                    effective_size(m.width, m.height, scale, s.transform).0
-                })
-                .unwrap_or(0);
-            s.x = x;
-            x += w as i32;
+        for (n, r) in &row {
+            self.set_position(n, x, r.y);
+            x += r.w as i32;
         }
-        true
+        Ok(())
     }
 
     /// Point one display at a mode (`None` = `preferred`). False when no
@@ -1337,7 +1330,7 @@ mod tests {
     fn move_horizontal_swaps_two_touching_displays() {
         let mons = parse(TWO).unwrap();
         let mut layout = Layout::from_monitors(&mons);
-        assert!(layout.move_horizontal(&mons, "eDP-1", 1));
+        layout.move_horizontal(&mons, "eDP-1", 1).unwrap();
         assert_eq!(layout.monitors[0].name, "eDP-1");
         assert_eq!(layout.monitors[0].x, 1920, "eDP-1 moved to the right slot");
         assert_eq!(layout.monitors[1].x, 0, "HDMI-A-1 took the left slot");
@@ -1350,10 +1343,12 @@ mod tests {
         let mons = parse(TWO).unwrap();
         let mut layout = Layout::from_monitors(&mons);
         // eDP-1 is already leftmost.
-        assert!(!layout.move_horizontal(&mons, "eDP-1", -1));
+        let err = layout.move_horizontal(&mons, "eDP-1", -1).unwrap_err();
+        assert!(err.contains("already the leftmost"), "{err}");
         assert_eq!(layout.monitors[0].x, 0, "unchanged");
         // HDMI-A-1 is already rightmost.
-        assert!(!layout.move_horizontal(&mons, "HDMI-A-1", 1));
+        let err = layout.move_horizontal(&mons, "HDMI-A-1", 1).unwrap_err();
+        assert!(err.contains("already the rightmost"), "{err}");
         assert_eq!(layout.monitors[1].x, 1920, "unchanged");
     }
 
@@ -1361,7 +1356,8 @@ mod tests {
     fn move_horizontal_unknown_name_is_a_no_op() {
         let mons = parse(TWO).unwrap();
         let mut layout = Layout::from_monitors(&mons);
-        assert!(!layout.move_horizontal(&mons, "DP-99", 1));
+        let err = layout.move_horizontal(&mons, "DP-99", 1).unwrap_err();
+        assert!(err.contains("no display named `DP-99`"), "{err}");
     }
 
     #[test]
@@ -1374,11 +1370,53 @@ mod tests {
         let mut layout = Layout::from_monitors(&mons);
         // Row is eDP-1(0) · HDMI-A-1(1920) · DP-3(3840), each 1920 wide.
         // Move DP-3 (rightmost) one step left, past HDMI-A-1.
-        assert!(layout.move_horizontal(&mons, "DP-3", -1));
+        layout.move_horizontal(&mons, "DP-3", -1).unwrap();
         let by_name = |n: &str| layout.monitors.iter().find(|m| m.name == n).unwrap().x;
         assert_eq!(by_name("eDP-1"), 0);
         assert_eq!(by_name("DP-3"), 1920);
         assert_eq!(by_name("HDMI-A-1"), 3840);
+    }
+
+    #[test]
+    fn move_horizontal_packs_at_a_pending_mode() {
+        let (live, mut layout) = desk();
+        // Row is HDMI-A-1(0, 3440 wide) · eDP-1(3440). Pick a larger laptop
+        // mode that hasn't been applied yet: 2880x1800 @1.5 is 1920 wide.
+        layout.set_mode(
+            "eDP-1",
+            Some(Mode {
+                width: 2880,
+                height: 1800,
+                refresh: 120.0,
+            }),
+        );
+        layout.move_horizontal(&live, "eDP-1", -1).unwrap();
+        assert_eq!(layout.monitors[0].x, 0);
+        assert_eq!(layout.monitors[1].x, 1920, "packed at the pending width");
+        assert!(layout.check(&live).is_empty());
+    }
+
+    #[test]
+    fn move_horizontal_skips_a_disabled_display_mid_row() {
+        let mut mons = parse(TWO).unwrap();
+        for (name, x) in [("DP-3", 3840), ("DP-4", 5760)] {
+            let mut m = mons[1].clone();
+            m.name = name.into();
+            m.x = x;
+            mons.push(m);
+        }
+        let mut layout = Layout::from_monitors(&mons);
+        // Row is eDP-1(0) · HDMI-A-1(off) · DP-3(3840) · DP-4(5760).
+        layout.monitors[1].disabled = true;
+        layout.move_horizontal(&mons, "DP-4", -1).unwrap();
+        let by_name = |n: &str| layout.monitors.iter().find(|m| m.name == n).unwrap().x;
+        assert_eq!(by_name("eDP-1"), 0);
+        assert_eq!(by_name("DP-4"), 1920, "no gap left for the off display");
+        assert_eq!(by_name("DP-3"), 3840);
+        assert!(layout.check(&mons).is_empty());
+
+        let err = layout.move_horizontal(&mons, "HDMI-A-1", 1).unwrap_err();
+        assert!(err.contains("is disabled"), "{err}");
     }
 
     /// A laptop panel and an ultrawide side by side — the desk this crate's

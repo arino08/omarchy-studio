@@ -3771,12 +3771,8 @@ fn monitor(args: &[&str]) -> i32 {
                 _ => None,
             };
             if let Some(delta) = delta {
-                if !live.iter().any(|m| &m.name == name) {
-                    eprintln!("no monitor named `{name}` — see `monitor list`");
-                    return 2;
-                }
-                if !layout.move_horizontal(&live, name, delta) {
-                    eprintln!("{name} is already the {spec}most display");
+                if let Err(e) = layout.move_horizontal(&live, name, delta) {
+                    eprintln!("{e}");
                     return 2;
                 }
             } else {

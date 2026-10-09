@@ -182,7 +182,7 @@ impl MonitorsScreen {
 
     /// Reorder the selected display one step left/right in the row, keeping
     /// it touching its new neighbor. `notice` explains a refusal (already at
-    /// that edge) the same way a rate/resolution refusal does.
+    /// that edge, or disabled) the same way a rate/resolution refusal does.
     fn move_horizontal(&mut self, dir: i64) {
         let Some(name) = self
             .layout
@@ -192,12 +192,12 @@ impl MonitorsScreen {
         else {
             return;
         };
-        if self.layout.move_horizontal(&self.live, &name, dir) {
-            self.dirty = true;
-            self.notice = None;
-        } else {
-            let edge = if dir < 0 { "leftmost" } else { "rightmost" };
-            self.notice = Some(format!("{name} is already the {edge} display"));
+        match self.layout.move_horizontal(&self.live, &name, dir) {
+            Ok(()) => {
+                self.dirty = true;
+                self.notice = None;
+            }
+            Err(e) => self.notice = Some(e),
         }
     }
 
