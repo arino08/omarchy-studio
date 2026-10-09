@@ -7,9 +7,13 @@
 //! managed block appended to the end of a user file wins, exactly as a managed
 //! block of hyprlang lines did, so the write model carries over unchanged.
 //!
-//! Only emission lives here. Studio never needs to *parse* arbitrary Lua: the
+//! Mostly emission lives here. Studio never needs to *evaluate* Lua: the
 //! effective value of a setting is read back from `hyprctl getoption`, which is
-//! authoritative regardless of which dialect produced it.
+//! authoritative regardless of which dialect produced it. What it does read is
+//! lexical — its own managed blocks ([`parse_config_call`],
+//! [`parse_call_statements`]) and `o.bind(…)` calls in binding sources
+//! ([`find_calls`]) — with strings, comments and multi-line arguments stepped
+//! over, and [`same_tokens`] to prove a re-rendered statement lost nothing.
 //!
 //! Rendering is deterministic — keys sort, formatting is fixed — so rewriting an
 //! unchanged block is a no-op and diffs stay legible.
@@ -330,6 +334,94 @@ fn unrender_value(value: &str) -> String {
     out
 }
 
+/// Where the long bracket opening at `i` (`[[`, `[=[`, `[==[`…) ends, plus its
+/// level — `None` when `i` isn't one.
+fn long_bracket_open(b: &[u8], i: usize) -> Option<(usize, usize)> {
+    if b.get(i) != Some(&b'[') {
+        return None;
+    }
+    let mut j = i + 1;
+    while b.get(j) == Some(&b'=') {
+        j += 1;
+    }
+    (b.get(j) == Some(&b'[')).then_some((j + 1, j - i - 1))
+}
+
+/// The index just past the long bracket closing at `level`, searching from
+/// `from`; the end of input when it's unterminated.
+fn long_bracket_close(b: &[u8], from: usize, level: usize) -> usize {
+    for i in from..b.len() {
+        if b[i] == b']' {
+            let eq = b[i + 1..].iter().take_while(|&&c| c == b'=').count();
+            if eq == level && b.get(i + 1 + level) == Some(&b']') {
+                return i + 2 + level;
+            }
+        }
+    }
+    b.len()
+}
+
+/// If a string literal or comment starts at `i`, the index just past it
+/// (the end of input when it's unterminated). These are the lexemes inside
+/// which brackets, commas and quotes mean nothing.
+fn skip_lexeme(b: &[u8], i: usize) -> Option<usize> {
+    match b[i] {
+        b'"' | b'\'' => {
+            let quote = b[i];
+            let mut j = i + 1;
+            while j < b.len() {
+                match b[j] {
+                    b'\\' => j += 2,
+                    c if c == quote => return Some(j + 1),
+                    _ => j += 1,
+                }
+            }
+            Some(b.len())
+        }
+        b'[' => long_bracket_open(b, i).map(|(body, level)| long_bracket_close(b, body, level)),
+        b'-' if b.get(i + 1) == Some(&b'-') => {
+            if let Some((body, level)) = long_bracket_open(b, i + 2) {
+                return Some(long_bracket_close(b, body, level));
+            }
+            let mut j = i + 2;
+            while j < b.len() && b[j] != b'\n' {
+                j += 1;
+            }
+            Some(j)
+        }
+        _ => None,
+    }
+}
+
+/// The index of the `)` matching the `(` at `open`, stepping over nested
+/// brackets, strings and comments — newlines included, so a multi-line
+/// `function() … end` argument stays inside its call. `None` if unbalanced.
+fn matching_paren(b: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut i = open;
+    while i < b.len() {
+        if let Some(next) = skip_lexeme(b, i) {
+            i = next;
+            continue;
+        }
+        match b[i] {
+            b'(' | b'{' | b'[' => depth += 1,
+            b')' | b'}' | b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return (b[i] == b')').then_some(i);
+                }
+                if depth < 0 {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Split a Lua argument list on its *top-level* commas, returning each argument
 /// with surrounding whitespace trimmed.
 ///
@@ -342,26 +434,11 @@ pub fn split_args(text: &str) -> Vec<String> {
     let b = text.as_bytes();
     let (mut out, mut start, mut i, mut depth) = (Vec::new(), 0usize, 0usize, 0i32);
     while i < b.len() {
+        if let Some(next) = skip_lexeme(b, i) {
+            i = next;
+            continue;
+        }
         match b[i] {
-            b'"' | b'\'' => {
-                let quote = b[i];
-                i += 1;
-                while i < b.len() {
-                    match b[i] {
-                        b'\\' => i += 2,
-                        c if c == quote => {
-                            i += 1;
-                            break;
-                        }
-                        _ => i += 1,
-                    }
-                }
-            }
-            b'-' if i + 1 < b.len() && b[i + 1] == b'-' => {
-                while i < b.len() && b[i] != b'\n' {
-                    i += 1;
-                }
-            }
             b'(' | b'{' | b'[' => {
                 depth += 1;
                 i += 1;
@@ -388,17 +465,273 @@ pub fn split_args(text: &str) -> Vec<String> {
     out
 }
 
-/// The unescaped contents of `text` if it is a single quoted Lua string, else
-/// `None` — the test for "is this argument a plain command string or a
-/// dispatcher expression?".
-pub fn as_string_literal(text: &str) -> Option<String> {
-    let t = text.trim();
-    let inner = t.strip_prefix('"').and_then(|v| v.strip_suffix('"'))?;
-    // A closing quote in the middle means this is not one single literal.
-    if inner.contains('"') && !inner.contains("\\\"") {
-        return None;
+/// A function-call statement found in Lua source: `callee(args…)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Call {
+    /// The dotted name called, e.g. `o.bind`.
+    pub callee: String,
+    /// Each top-level argument's source, trimmed.
+    pub args: Vec<String>,
+    /// The whole call's source, from the callee to the closing paren.
+    pub text: String,
+    /// 1-based line the call starts on.
+    pub line: usize,
+}
+
+fn is_name_start(c: u8) -> bool {
+    c.is_ascii_alphabetic() || c == b'_'
+}
+
+fn is_name_char(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_'
+}
+
+fn line_of(text: &str, at: usize) -> usize {
+    text[..at].matches('\n').count() + 1
+}
+
+/// Read a dotted name (`hl.plugin.x`) at `i`, returning where it ends.
+fn dotted_name_end(b: &[u8], i: usize) -> Option<usize> {
+    let mut j = i;
+    loop {
+        if !b.get(j).copied().is_some_and(is_name_start) {
+            return None;
+        }
+        while b.get(j).copied().is_some_and(is_name_char) {
+            j += 1;
+        }
+        if b.get(j) == Some(&b'.') {
+            j += 1;
+        } else {
+            return Some(j);
+        }
     }
-    Some(unrender_value(t))
+}
+
+/// The `(` after the callee name ending at `name_end`, if one follows it.
+fn open_paren(b: &[u8], name_end: usize) -> Option<usize> {
+    let mut open = name_end;
+    while b.get(open).is_some_and(|c| c.is_ascii_whitespace()) {
+        open += 1;
+    }
+    (b.get(open) == Some(&b'(')).then_some(open)
+}
+
+/// The call whose callee name spans `start..name_end`, if a `(` follows it.
+fn call_at(text: &str, start: usize, name_end: usize) -> Option<(Call, usize)> {
+    let b = text.as_bytes();
+    let open = open_paren(b, name_end)?;
+    let close = matching_paren(b, open)?;
+    Some((
+        Call {
+            callee: text[start..name_end].to_string(),
+            args: split_args(&text[open + 1..]),
+            text: text[start..=close].to_string(),
+            line: line_of(text, start),
+        },
+        close + 1,
+    ))
+}
+
+/// Read `text` as a chunk made *only* of call statements, such as Studio's
+/// managed keybinds block. Comments, whitespace and `;` between statements
+/// are skipped; a statement may span any number of lines.
+///
+/// The second list names, as `(line, source)`, each statement that isn't a
+/// plain call — an assignment, a `for` loop, an unbalanced paren — so a caller
+/// can refuse rather than silently drop it. Reading resumes on the line after
+/// one, except after a call whose parens never close: nothing past that can
+/// be told apart.
+pub fn parse_call_statements(text: &str) -> (Vec<Call>, Vec<(usize, String)>) {
+    let b = text.as_bytes();
+    let mut out = Vec::new();
+    let mut errors = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_whitespace() || b[i] == b';' {
+            i += 1;
+            continue;
+        }
+        if b[i] == b'-' && b.get(i + 1) == Some(&b'-') {
+            i = skip_lexeme(b, i).unwrap_or(b.len());
+            continue;
+        }
+        let name_end = dotted_name_end(b, i);
+        let Some((call, next)) = name_end.and_then(|end| call_at(text, i, end)) else {
+            let line = line_of(text, i);
+            let source = text.lines().nth(line - 1).unwrap_or_default().trim();
+            errors.push((line, source.to_string()));
+            if name_end.and_then(|end| open_paren(b, end)).is_some() {
+                break;
+            }
+            i = text[i..].find('\n').map_or(b.len(), |n| i + n + 1);
+            continue;
+        };
+        out.push(call);
+        i = next;
+    }
+    (out, errors)
+}
+
+/// Every call to `callee` anywhere in arbitrary Lua source — inside loops,
+/// functions, whatever — skipping strings and comments. A call whose parens
+/// never balance is skipped rather than truncated.
+pub fn find_calls(text: &str, callee: &str) -> Vec<Call> {
+    let b = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if let Some(next) = skip_lexeme(b, i) {
+            i = next;
+            continue;
+        }
+        let boundary = i == 0 || !(is_name_char(b[i - 1]) || matches!(b[i - 1], b'.' | b':'));
+        if boundary && is_name_start(b[i]) {
+            if let Some(end) = dotted_name_end(b, i) {
+                if &text[i..end] == callee {
+                    if let Some((call, next)) = call_at(text, i, end) {
+                        out.push(call);
+                        i = next;
+                        continue;
+                    }
+                }
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// A Lua token, as far as telling two pieces of source apart needs: strings
+/// compare by *value*, so `'x'` and `"x"` are the same token, and comments
+/// and whitespace vanish.
+#[derive(Debug, PartialEq)]
+enum Token {
+    Word(String),
+    Str(Vec<u8>),
+    Punct(u8),
+}
+
+fn tokens(text: &str) -> Vec<Token> {
+    let b = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+        } else if let Some(next) = skip_lexeme(b, i) {
+            if c != b'-' {
+                out.push(Token::Str(decode_string(&b[i..next])));
+            }
+            i = next;
+        } else if is_name_char(c) {
+            let start = i;
+            while i < b.len() && is_name_char(b[i]) {
+                i += 1;
+            }
+            out.push(Token::Word(text[start..i].to_string()));
+        } else {
+            out.push(Token::Punct(c));
+            i += 1;
+        }
+    }
+    out
+}
+
+/// The bytes a Lua string literal (quoted or long-bracket) denotes.
+fn decode_string(lit: &[u8]) -> Vec<u8> {
+    if let Some((body, level)) = long_bracket_open(lit, 0) {
+        let end = lit.len().saturating_sub(level + 2).max(body);
+        let mut inner = &lit[body..end];
+        // A newline straight after the opening bracket isn't part of the string.
+        if let Some(rest) = inner
+            .strip_prefix(b"\r\n")
+            .or_else(|| inner.strip_prefix(b"\n"))
+        {
+            inner = rest;
+        }
+        return inner.to_vec();
+    }
+    let inner = &lit[1..lit.len().saturating_sub(1).max(1)];
+    let mut out = Vec::with_capacity(inner.len());
+    let mut i = 0;
+    while i < inner.len() {
+        if inner[i] != b'\\' || i + 1 >= inner.len() {
+            out.push(inner[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        match inner[i] {
+            b'n' => out.push(b'\n'),
+            b't' => out.push(b'\t'),
+            b'r' => out.push(b'\r'),
+            b'a' => out.push(0x07),
+            b'b' => out.push(0x08),
+            b'f' => out.push(0x0c),
+            b'v' => out.push(0x0b),
+            b'x' => {
+                let hex = std::str::from_utf8(inner.get(i + 1..i + 3).unwrap_or_default())
+                    .ok()
+                    .and_then(|h| u8::from_str_radix(h, 16).ok());
+                if let Some(v) = hex {
+                    out.push(v);
+                    i += 2;
+                }
+            }
+            b'z' => {
+                while i + 1 < inner.len() && inner[i + 1].is_ascii_whitespace() {
+                    i += 1;
+                }
+            }
+            b'u' if inner.get(i + 1) == Some(&b'{') => {
+                let close = inner[i..].iter().position(|&c| c == b'}').map(|p| p + i);
+                let ch = close
+                    .and_then(|c| std::str::from_utf8(&inner[i + 2..c]).ok())
+                    .and_then(|h| u32::from_str_radix(h, 16).ok())
+                    .and_then(char::from_u32);
+                if let (Some(ch), Some(c)) = (ch, close) {
+                    out.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
+                    i = c;
+                }
+            }
+            d if d.is_ascii_digit() => {
+                let mut v = 0u32;
+                let mut n = 0;
+                while n < 3 && i < inner.len() && inner[i].is_ascii_digit() {
+                    v = v * 10 + u32::from(inner[i] - b'0');
+                    i += 1;
+                    n += 1;
+                }
+                out.push(v as u8);
+                continue;
+            }
+            other => out.push(other), // \\ \" \' and an escaped newline
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Do two pieces of Lua source say the same thing — the same tokens, with
+/// whitespace, comments and string-quoting style ignored? This is the test
+/// that a value Studio parsed and re-rendered lost nothing on the way.
+pub fn same_tokens(a: &str, b: &str) -> bool {
+    tokens(a) == tokens(b)
+}
+
+/// The contents of `text` if it is a single Lua string literal, else `None` —
+/// the test for "is this argument a plain command string or a dispatcher
+/// expression?". Concatenations (`"a" .. "b"`) and non-UTF-8 escapes are not
+/// single literals.
+pub fn as_string_literal(text: &str) -> Option<String> {
+    match tokens(text).as_slice() {
+        [Token::Str(bytes)] => String::from_utf8(bytes.clone()).ok(),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -609,6 +942,100 @@ mod tests {
             split_args(r#""SUPER + K", "Layout", "us,dk")"#),
             vec!["\"SUPER + K\"", "\"Layout\"", "\"us,dk\""]
         );
+    }
+
+    #[test]
+    fn reads_multi_line_call_statements_whole() {
+        let body = "-- header\n\
+                    o.bind(\"SUPER + G\", \"Overview\", function()\n\
+                    \thl.plugin.scrolloverview.overview(\"toggle\") -- )\n\
+                    end);\n\
+                    hl.unbind(\"SUPER + F\")";
+        let (calls, errors) = parse_call_statements(body);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].callee, "o.bind");
+        assert_eq!(calls[0].line, 2);
+        assert_eq!(
+            calls[0].args[2],
+            "function()\n\thl.plugin.scrolloverview.overview(\"toggle\") -- )\nend"
+        );
+        assert_eq!(calls[1].callee, "hl.unbind");
+        assert_eq!(calls[1].line, 5);
+    }
+
+    #[test]
+    fn a_statement_that_is_not_a_call_is_named_by_line() {
+        // Every one is named, and the calls around them are still read.
+        let (calls, errors) = parse_call_statements(
+            "hl.unbind(\"A\")\nlocal x = 1\nhl.unbind(\"B\")\nlocal y = 2\nhl.unbind(\"C\")",
+        );
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[2].line, 5);
+        assert_eq!(
+            errors,
+            [
+                (2, "local x = 1".to_string()),
+                (4, "local y = 2".to_string())
+            ]
+        );
+        // An unbalanced call is reported where it starts, not truncated, and
+        // nothing after it is read.
+        assert_eq!(
+            parse_call_statements("\n\no.bind(\"A\", \"b\", function()\n  x()\n"),
+            (
+                Vec::new(),
+                vec![(3, "o.bind(\"A\", \"b\", function()".to_string())]
+            )
+        );
+        // A call that's then indexed or called again isn't a plain statement.
+        assert_eq!(
+            parse_call_statements("o.bind(\"A\", \"b\", \"c\").x = 1")
+                .1
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn long_strings_and_comments_hide_their_brackets() {
+        let (calls, _) = parse_call_statements("--[[ ) ]] f([[ ) , ]], --[==[ ( ]==] 2)");
+        assert_eq!(calls[0].args, vec!["[[ ) , ]]", "--[==[ ( ]==] 2"]);
+    }
+
+    #[test]
+    fn finds_calls_in_arbitrary_source_but_not_in_strings_or_comments() {
+        let src = "for i = 1, 9 do\n  o.bind(\"SUPER + \" .. i, \"ws\", f(i))\nend\n\
+                   -- o.bind(\"no\")\nlocal s = \"o.bind('no')\"\nfoo.o.bind(\"no\")\n\
+                   o.bind(\"SUPER + G\", \"x\", function()\n  y()\nend)";
+        let calls = find_calls(src, "o.bind");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].line, 2);
+        assert_eq!(calls[1].line, 7);
+        assert_eq!(calls[1].args[2], "function()\n  y()\nend");
+    }
+
+    #[test]
+    fn token_comparison_ignores_layout_and_quote_style_only() {
+        assert!(same_tokens(
+            "o.bind(\"A\", 'b', function()\n\tx()\nend)",
+            "o.bind( \"A\",\"b\", function() x() end ) -- note"
+        ));
+        assert!(same_tokens("f(\"\\65\\x42\\u{43}\")", "f(\"ABC\")"));
+        assert!(same_tokens("f([[\nline]])", "f(\"line\")"));
+        assert!(!same_tokens(
+            "o.bind(\"A\", \"b\", function())",
+            "o.bind(\"A\", \"b\", function() end)"
+        ));
+        assert!(!same_tokens("f(\"a\", { x = 1 })", "f(\"a\")"));
+    }
+
+    #[test]
+    fn a_string_literal_is_exactly_one_string() {
+        assert_eq!(as_string_literal("'single'"), Some("single".into()));
+        assert_eq!(as_string_literal("\"a\\\"b\""), Some("a\"b".into()));
+        assert_eq!(as_string_literal("\"a\\\"b\" .. \"c\""), None);
+        assert_eq!(as_string_literal("\"a\" .. \"b\""), None);
     }
 
     #[test]
