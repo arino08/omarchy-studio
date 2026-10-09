@@ -21,7 +21,7 @@ use ratatui::Frame;
 
 use studio_core::cmd::CommandRunner;
 use studio_core::modules::scrolloverview::{self as sco, Settings, State};
-use studio_core::omarchy::OmarchyPaths;
+use studio_core::omarchy::{Dialect, OmarchyPaths};
 
 use crate::tui::theme::Skin;
 
@@ -84,6 +84,10 @@ impl Row {
 
 pub struct NiriScreen {
     state: State,
+    /// Is the plugin actually loaded into the running session? Diverges from
+    /// `state` after a Hyprland update stales the cached build — hyprpm still
+    /// calls it enabled, but nothing is loaded until `hyprpm reload -n` runs.
+    loaded: bool,
     /// `general.layout` from the config — dwindle/master is "hyprland mode",
     /// scrolling is "niri mode".
     mode: String,
@@ -100,11 +104,14 @@ pub struct NiriScreen {
 
 impl NiriScreen {
     pub fn load(paths: &OmarchyPaths, runner: &dyn CommandRunner) -> Self {
+        let dialect = Dialect::probe(runner);
+        let state = sco::state(runner);
         Self {
-            state: sco::state(runner),
+            state,
+            loaded: state == State::Enabled && sco::is_loaded(runner),
             mode: studio_core::modules::looknfeel::LookFeel::load(paths).value("general.layout"),
-            settings: Settings::load(paths),
-            set_up: sco::is_sourced(paths) && sco::autoloads(paths),
+            settings: Settings::load_for(paths, dialect),
+            set_up: sco::is_sourced_for(paths, dialect) && sco::autoloads_for(paths, dialect),
             bind: current_bind(paths),
             nav: sco::nav_binds_installed(paths),
             selected: 0,
@@ -280,6 +287,9 @@ impl NiriScreen {
                 "installed but off — run:  hyprpm enable {}",
                 sco::PLUGIN
             )),
+            State::Enabled if !self.loaded => v.push(
+                "enabled but not loaded this session — run `hyprpm reload -n` in a terminal".into(),
+            ),
             State::Enabled => {}
         }
         if !self.set_up {
@@ -333,6 +343,7 @@ mod tests {
         let _ = dir;
         NiriScreen {
             state: State::Enabled,
+            loaded: true,
             mode: "dwindle".into(),
             nav: true,
             settings: Settings::default(),
@@ -436,5 +447,22 @@ mod tests {
         assert!(s.notes().iter().any(|n| n.contains("SUPER+GRAVE")));
         s.bind = None;
         assert!(s.notes().iter().any(|n| n.contains("press b")));
+    }
+
+    #[test]
+    fn a_stale_build_notes_it_isnt_loaded_even_though_hyprpm_calls_it_enabled() {
+        // The reboot/rebuild trap: hyprpm's stored `enabled: true` survives a
+        // Hyprland update that broke the cached build.
+        let mut s = screen();
+        assert!(
+            !s.notes().iter().any(|n| n.contains("not loaded")),
+            "loaded: true shouldn't warn"
+        );
+        s.loaded = false;
+        assert!(
+            s.notes().iter().any(|n| n.contains("not loaded")),
+            "{:?}",
+            s.notes()
+        );
     }
 }

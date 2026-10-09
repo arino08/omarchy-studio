@@ -354,7 +354,12 @@ impl ConfigBind {
             .unwrap_or_else(|| "Omarchy Studio".to_string());
         // `o.bind` takes either a command string (wrapped in exec) or a
         // dispatcher value. Only the dispatchers Studio itself installs are
-        // mapped — anything else is refused rather than guessed at.
+        // mapped — anything else is refused rather than guessed at, with one
+        // exception: `namespace:method` (a plugin dispatcher — Hyprland's own
+        // registration convention, `HyprlandAPI::addDispatcherV2`) maps to a
+        // call into that plugin's `hl.plugin` table, exactly the form plugin
+        // READMEs document (e.g. ScrollOverview's own
+        // `hl.plugin.scrolloverview.overview("toggle all")`).
         let action = match self.dispatcher.as_str() {
             "exec" => {
                 if self.arg.trim().is_empty() {
@@ -367,9 +372,21 @@ impl ConfigBind {
             // an expression Omarchy wrote, so it goes out untouched.
             LUA_RAW_DISPATCHER => self.arg.clone(),
             other => {
-                return Err(format!(
-                    "{chord}: Studio can't write the `{other}` dispatcher on Omarchy 4."
-                ))
+                let Some((namespace, method)) = other.split_once(':') else {
+                    return Err(format!(
+                        "{chord}: Studio can't write the `{other}` dispatcher on Omarchy 4."
+                    ));
+                };
+                let arg = if self.arg.is_empty() {
+                    String::new()
+                } else {
+                    Value::Str(self.arg.clone()).render()
+                };
+                format!(
+                    "function() hl.plugin{}{}({arg}) end",
+                    crate::configfs::lua::render_member(namespace),
+                    crate::configfs::lua::render_member(method),
+                )
             }
         };
         Ok(format!(
@@ -649,9 +666,12 @@ fn parse_lua_overrides(body: &str) -> Vec<Override> {
             };
             let desc = crate::configfs::lua::as_string_literal(&args[1]).unwrap_or_default();
             // What the action *is* comes from its shape: a plain string literal
-            // is a command; `hl.dsp.layout("…")` is the one dispatcher Studio
-            // maps by name; anything else is an expression we emitted verbatim
-            // and read back the same way.
+            // is a command; `hl.dsp.layout("…")` is the one core dispatcher
+            // Studio maps by name; `function() hl.plugin.ns.method(…) end` is
+            // the plugin-dispatcher form [`ConfigBind::render_lua`] emits;
+            // anything else is an expression we emitted verbatim (recovered
+            // from the runtime by `resolve_lua_action`) and read back the same
+            // way.
             let (dispatcher, arg) = match crate::configfs::lua::as_string_literal(&args[2]) {
                 Some(cmd) => ("exec".to_string(), cmd),
                 None if args[2].starts_with("hl.dsp.layout(") => (
@@ -661,7 +681,8 @@ fn parse_lua_overrides(body: &str) -> Vec<Override> {
                         .next()
                         .unwrap_or_default(),
                 ),
-                None => (LUA_RAW_DISPATCHER.to_string(), args[2].clone()),
+                None => parse_lua_plugin_call(&args[2])
+                    .unwrap_or_else(|| (LUA_RAW_DISPATCHER.to_string(), args[2].clone())),
             };
             let (modmask, key) = split_lua_chord(&chord);
             out.push(Override::Set(ConfigBind {
@@ -714,6 +735,53 @@ fn lua_string_args(text: &str) -> Vec<String> {
         out.push(s);
     }
     out
+}
+
+/// The inverse of the plugin-dispatcher branch of [`ConfigBind::render_lua`]:
+/// `function() hl.plugin.ns.method("arg") end` → `("ns:method", "arg")`.
+/// `None` for anything else, so the caller falls back to storing the
+/// expression verbatim rather than guessing.
+fn parse_lua_plugin_call(expr: &str) -> Option<(String, String)> {
+    let inner = expr
+        .strip_prefix("function() hl.plugin")?
+        .strip_suffix(" end")?
+        .trim();
+    let paren = inner.find('(')?;
+    let members = split_lua_members(&inner[..paren])?;
+    let [namespace, method] = <[String; 2]>::try_from(members).ok()?;
+    let call_args = inner[paren..].strip_prefix('(')?.strip_suffix(')')?;
+    let arg = lua_string_args(call_args)
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    Some((format!("{namespace}:{method}"), arg))
+}
+
+/// Split a chain of `.name` / `["name"]` table accesses — the inverse of
+/// [`crate::configfs::lua::render_member`] — into its member names. `None` on
+/// anything that isn't exactly that shape.
+fn split_lua_members(mut s: &str) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    while !s.is_empty() {
+        if let Some(rest) = s.strip_prefix('.') {
+            let end = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            if end == 0 {
+                return None;
+            }
+            out.push(rest[..end].to_string());
+            s = &rest[end..];
+        } else if let Some(rest) = s.strip_prefix('[') {
+            let name = first_lua_string(rest)?;
+            let close = rest.find(']')?;
+            out.push(name);
+            s = &rest[close + 1..];
+        } else {
+            return None;
+        }
+    }
+    Some(out)
 }
 
 /// Load the effective keymap: run `hyprctl binds -j`, then attribute each bind
@@ -1554,6 +1622,65 @@ mod lua_dispatcher_tests {
     fn an_unmapped_dispatcher_is_refused_by_name() {
         let err = bind("movefocus", "l").render_lua().unwrap_err();
         assert!(err.contains("`movefocus`"), "names the dispatcher: {err}");
+    }
+
+    /// `namespace:method` dispatchers (Hyprland's own plugin-registration
+    /// convention, e.g. `scrolloverview:overview`) map to the plugin's
+    /// `hl.plugin` table — exactly the form the plugin's own README documents
+    /// (`hl.plugin.scrolloverview.overview("toggle all")`).
+    #[test]
+    fn a_plugin_dispatcher_calls_into_hl_plugin() {
+        assert_eq!(
+            bind("scrolloverview:overview", "toggle")
+                .render_lua()
+                .unwrap(),
+            "o.bind(\"SUPER + LEFT\", \"Scroll left\", \
+             function() hl.plugin.scrolloverview.overview(\"toggle\") end)"
+        );
+    }
+
+    /// A plugin dispatcher survives the write/read round trip as itself, not
+    /// as an opaque raw expression — `current_bind`-style lookups (`niri.rs`)
+    /// key off `dispatcher`, so losing this would make Studio think its own
+    /// bind was never installed.
+    #[test]
+    fn a_plugin_dispatcher_bind_reads_back_as_itself() {
+        let p = paths("plugin-roundtrip");
+        write_overrides_for(
+            &p,
+            &[Override::Set(bind("scrolloverview:overview", "toggle"))],
+            Dialect::Lua,
+        )
+        .unwrap();
+
+        let back = read_overrides_for(&p, Dialect::Lua);
+        match &back[0] {
+            Override::Set(cb) => {
+                assert_eq!(cb.dispatcher, "scrolloverview:overview");
+                assert_eq!(cb.arg, "toggle");
+            }
+            other => panic!("expected a bind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_plugin_dispatcher_with_no_arg_renders_and_reads_back() {
+        let empty = bind("scrolloverview:overview", "");
+        assert_eq!(
+            empty.render_lua().unwrap(),
+            "o.bind(\"SUPER + LEFT\", \"Scroll left\", \
+             function() hl.plugin.scrolloverview.overview() end)"
+        );
+        let p = paths("plugin-empty-arg");
+        write_overrides_for(&p, &[Override::Set(empty)], Dialect::Lua).unwrap();
+        let back = read_overrides_for(&p, Dialect::Lua);
+        match &back[0] {
+            Override::Set(cb) => {
+                assert_eq!(cb.dispatcher, "scrolloverview:overview");
+                assert_eq!(cb.arg, "");
+            }
+            other => panic!("expected a bind, got {other:?}"),
+        }
     }
 }
 

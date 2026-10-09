@@ -118,6 +118,19 @@ fn render_key(key: &str) -> String {
     }
 }
 
+/// A table member as it's *accessed*, not assigned: `.name` for a bare
+/// identifier, `["name"]` otherwise. Used for calls into a namespace table
+/// (`hl.plugin.scrolloverview.overview(...)`) rather than a `key = value`
+/// table literal, which is what [`render_key`] is for.
+pub fn render_member(name: &str) -> String {
+    let key = render_key(name);
+    if key.starts_with('[') {
+        key
+    } else {
+        format!(".{key}")
+    }
+}
+
 fn is_lua_keyword(word: &str) -> bool {
     matches!(
         word,
@@ -468,6 +481,13 @@ mod tests {
         assert_eq!(render_key("kb-layout"), "[\"kb-layout\"]");
         assert_eq!(render_key("end"), "[\"end\"]");
         assert_eq!(render_key("2fast"), "[\"2fast\"]");
+    }
+
+    #[test]
+    fn render_member_dots_an_identifier_and_brackets_the_rest() {
+        assert_eq!(render_member("scrolloverview"), ".scrolloverview");
+        assert_eq!(render_member("kb-layout"), "[\"kb-layout\"]");
+        assert_eq!(render_member("end"), "[\"end\"]");
     }
 
     #[test]

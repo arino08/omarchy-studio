@@ -56,7 +56,8 @@ pub enum State {
     NotAdded,
     /// Added and built, but not loaded into Hyprland.
     Disabled,
-    /// Loaded — niri mode is on.
+    /// hyprpm's persisted intent is on — not necessarily loaded into the
+    /// *running* session; see [`is_loaded`] for that.
     Enabled,
 }
 
@@ -90,6 +91,33 @@ pub fn state(runner: &dyn CommandRunner) -> State {
         return State::NotAdded;
     };
     parse_state(&out.stdout)
+}
+
+/// Is the plugin actually loaded into the *running* Hyprland session right
+/// now?
+///
+/// `hyprpm list`'s `enabled: true` is a persisted intent, not a live fact:
+/// after a compositor restart — or a headers mismatch that stops the plugin
+/// rebuilding — nothing reloads it until something runs `hyprpm reload -n`,
+/// and the two states genuinely diverge. Verified on the reference machine:
+/// `hyprpm list` said enabled while `hyprctl plugins list` said none were
+/// loaded, because the cached build predated a Hyprland update.
+pub fn is_loaded(runner: &dyn CommandRunner) -> bool {
+    let Ok(out) = runner.run(
+        &Cmd::new("hyprctl")
+            .arg("-j")
+            .arg("plugins")
+            .arg("list")
+            .timeout(QUICK),
+    ) else {
+        return false;
+    };
+    serde_json::from_str::<Vec<serde_json::Value>>(&out.stdout)
+        .map(|list| {
+            list.iter()
+                .any(|p| p.get("name").and_then(|n| n.as_str()) == Some(PLUGIN))
+        })
+        .unwrap_or(false)
 }
 
 /// Split out for testing: `hyprpm list` output → state.
@@ -452,13 +480,18 @@ impl Settings {
 
     /// Write through the apply pipeline, so a block Hyprland refuses is rolled
     /// back like every other change Studio makes.
+    ///
+    /// Probes the live dialect itself — writing to `scrolloverview.conf` on a
+    /// machine that actually reads `scrolloverview.lua` would land the edit
+    /// somewhere nothing sources, silently doing nothing.
     pub fn apply(
         &self,
         paths: &OmarchyPaths,
         store: &crate::snapshot::SnapshotStore,
         runner: &dyn CommandRunner,
     ) -> Result<()> {
-        let Some(edit) = self.plan(paths) else {
+        let dialect = Dialect::probe(runner);
+        let Some(edit) = self.plan_for(paths, dialect) else {
             return Ok(());
         };
         let plan = crate::engine::ApplyPlan {
@@ -634,6 +667,7 @@ pub fn ensure_sourced(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::StubRunner;
 
     fn paths(root: &std::path::Path) -> OmarchyPaths {
         std::fs::create_dir_all(root.join(".config/hypr")).unwrap();
@@ -684,6 +718,36 @@ mod tests {
             "→ Repository hyprland-plugins (by hyprwm):\n  │ Plugin hyprbars\n  └─ enabled: true\n";
         assert_eq!(parse_state(other), State::NotAdded);
         assert_eq!(parse_state(""), State::NotAdded);
+    }
+
+    #[test]
+    fn is_loaded_reads_hyprctls_live_plugin_list() {
+        let loaded = StubRunner::default().with_ok(
+            "hyprctl -j plugins list",
+            r#"[{"name":"scrolloverview","author":"yayuuu","version":"1.0"}]"#,
+        );
+        assert!(is_loaded(&loaded));
+
+        let other_plugin = StubRunner::default().with_ok(
+            "hyprctl -j plugins list",
+            r#"[{"name":"hyprbars","author":"hyprwm","version":"1.0"}]"#,
+        );
+        assert!(!is_loaded(&other_plugin));
+
+        let none = StubRunner::default().with_ok("hyprctl -j plugins list", "[]");
+        assert!(!is_loaded(&none));
+    }
+
+    /// The reboot/rebuild trap this guards: hyprpm's stored `enabled: true`
+    /// survives a Hyprland update that breaks the cached build, so `state()`
+    /// alone can't tell a user their overview has actually stopped working.
+    #[test]
+    fn enabled_and_loaded_genuinely_diverge() {
+        // hyprpm's stored state still calls it enabled…
+        assert_eq!(parse_state(LIST), State::Enabled);
+        // …but nothing is loaded in the running session.
+        let stale = StubRunner::default().with_ok("hyprctl -j plugins list", "[]");
+        assert!(!is_loaded(&stale));
     }
 
     #[test]
@@ -906,6 +970,45 @@ mod lua_tests {
 
         assert_eq!(Settings::load_for(&p, Dialect::Lua), want);
         assert!(want.plan_for(&p, Dialect::Lua).is_none(), "idempotent");
+    }
+
+    /// The bug this guards: `apply` used to always write `scrolloverview.conf`
+    /// no matter what the compositor actually reads, so a Quattro machine's
+    /// settings landed in a file nothing sources and silently did nothing.
+    #[test]
+    fn apply_probes_the_dialect_and_writes_the_lua_file() {
+        use crate::cmd::StubRunner;
+        let p = tmpdir("apply-probes");
+        let runner = StubRunner::default()
+            .with_ok(
+                "hyprctl systeminfo",
+                "Hyprland 0.56.2\nconfigProvider: lua\n\nLibraries:\n",
+            )
+            .with_ok("hyprctl reload", "")
+            .with_ok("hyprctl configerrors", "no errors were found\n");
+        let store = crate::snapshot::SnapshotStore::open_or_init(
+            p.config.join("history"),
+            Box::new(crate::cmd::RealRunner),
+        )
+        .unwrap();
+
+        let s = Settings {
+            scale: 0.7,
+            ..Settings::default()
+        };
+        s.apply(&p, &store, &runner).unwrap();
+
+        assert!(
+            conf_path_for(&p, Dialect::Lua).exists(),
+            "settings land in scrolloverview.lua on a lua-dialect machine"
+        );
+        assert!(
+            !conf_path_for(&p, Dialect::Hyprlang).exists(),
+            "never also writes the hyprlang file"
+        );
+        let on_disk = std::fs::read_to_string(conf_path_for(&p, Dialect::Lua)).unwrap();
+        assert!(on_disk.contains("scrolloverview = {"), "{on_disk}");
+        assert!(on_disk.contains("scale = 0.7"), "{on_disk}");
     }
 
     #[test]
