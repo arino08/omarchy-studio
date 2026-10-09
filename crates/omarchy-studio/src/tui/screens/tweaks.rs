@@ -58,6 +58,9 @@ impl TweaksScreen {
                         state: Default::default(),
                     },
                     home: Default::default(),
+                    // Unreachable fallback: Omarchy wasn't found, so nothing
+                    // will be written anyway.
+                    dialect: studio_core::omarchy::Dialect::Hyprlang,
                 },
                 items: Vec::new(),
                 states: Vec::new(),

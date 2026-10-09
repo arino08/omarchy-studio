@@ -329,6 +329,92 @@ impl ConfigBind {
         }
         line
     }
+
+    /// Render this bind as Omarchy 4 Lua.
+    ///
+    /// `o.bind(chord, description, command)` covers a command binding, which is
+    /// what Studio installs and what users create. It cannot cover a bind whose
+    /// action Studio can't see: in Lua mode Hyprland reports *every* bind's
+    /// dispatcher as `__lua` (an opaque callback id), so a bind read back from
+    /// `hyprctl binds` carries no reproducible action. Rather than emit a bind
+    /// that would silently do nothing, this reports why.
+    pub fn render_lua(&self) -> std::result::Result<String, String> {
+        use crate::configfs::lua::Value;
+        let chord = render_lua_chord(self.modmask, &self.key);
+        if self.dispatcher == LUA_OPAQUE_DISPATCHER {
+            return Err(format!(
+                "{chord}: Studio couldn't find where this key's action is defined, so it \
+                 can't move it to another chord — you can still disable a key, or bind \
+                 one to a command."
+            ));
+        }
+        let desc = self
+            .description
+            .clone()
+            .unwrap_or_else(|| "Omarchy Studio".to_string());
+        // `o.bind` takes either a command string (wrapped in exec) or a
+        // dispatcher value. Only the dispatchers Studio itself installs are
+        // mapped — anything else is refused rather than guessed at, with one
+        // exception: `namespace:method` (a plugin dispatcher — Hyprland's own
+        // registration convention, `HyprlandAPI::addDispatcherV2`) maps to a
+        // call into that plugin's `hl.plugin` table, exactly the form plugin
+        // READMEs document (e.g. ScrollOverview's own
+        // `hl.plugin.scrolloverview.overview("toggle all")`).
+        let action = match self.dispatcher.as_str() {
+            "exec" => {
+                if self.arg.trim().is_empty() {
+                    return Err(format!("{chord}: no command to bind."));
+                }
+                Value::Str(self.arg.clone()).render()
+            }
+            "layoutmsg" => format!("hl.dsp.layout({})", Value::Str(self.arg.clone()).render()),
+            // Recovered from the Lua sources by `resolve_lua_action` — already
+            // an expression Omarchy wrote, so it goes out untouched.
+            LUA_RAW_DISPATCHER => self.arg.clone(),
+            other => {
+                let Some((namespace, method)) = other.split_once(':') else {
+                    return Err(format!(
+                        "{chord}: Studio can't write the `{other}` dispatcher on Omarchy 4."
+                    ));
+                };
+                let arg = if self.arg.is_empty() {
+                    String::new()
+                } else {
+                    Value::Str(self.arg.clone()).render()
+                };
+                format!(
+                    "function() hl.plugin{}{}({arg}) end",
+                    crate::configfs::lua::render_member(namespace),
+                    crate::configfs::lua::render_member(method),
+                )
+            }
+        };
+        Ok(format!(
+            "o.bind({}, {}, {action})",
+            Value::Str(chord).render(),
+            Value::Str(desc).render(),
+        ))
+    }
+}
+
+/// What `hyprctl binds` reports for the dispatcher of *any* bind when Hyprland
+/// runs the Lua config — the real action sits behind a callback we can't read.
+pub const LUA_OPAQUE_DISPATCHER: &str = "__lua";
+
+/// A chord as Hyprland's Lua API spells it: `SUPER + SHIFT + T`, or a bare key
+/// when there are no modifiers. (hyprlang used `SUPER SHIFT, T`.)
+pub fn render_lua_chord(mask: u16, key: &str) -> String {
+    let mut parts = mask_to_mods(mask);
+    parts.push(key);
+    parts.join(" + ")
+}
+
+/// `hl.unbind("SUPER + T")` — cancels a lower-layer bind on this chord.
+pub fn render_lua_unbind(mask: u16, key: &str) -> String {
+    format!(
+        "hl.unbind({})",
+        crate::configfs::lua::Value::Str(render_lua_chord(mask, key)).render()
+    )
 }
 
 /// Render an `unbind = MODS, KEY` line that cancels a lower-layer bind.
@@ -395,6 +481,15 @@ impl Override {
             Override::Disable { modmask, key } => render_unbind(*modmask, key),
         }
     }
+
+    /// The Omarchy 4 form. `Err` carries a user-facing reason when the change
+    /// can't be expressed in Lua — see [`ConfigBind::render_lua`].
+    fn render_lua(&self) -> std::result::Result<String, String> {
+        match self {
+            Override::Set(cb) => cb.render_lua(),
+            Override::Disable { modmask, key } => Ok(render_lua_unbind(*modmask, key)),
+        }
+    }
 }
 
 /// Build the body of the managed override block from a list of user changes,
@@ -410,25 +505,70 @@ pub fn render_override_block(overrides: &[Override]) -> String {
 
 // ── persistence ──────────────────────────────────────────────────────────────
 
-use crate::configfs::{atomic_write, CommentStyle, ManagedBlock};
-use crate::omarchy::OmarchyPaths;
+use crate::configfs::{atomic_write, ManagedBlock};
+use crate::omarchy::{Dialect, OmarchyPaths};
 
 const BLOCK_SECTION: &str = "keybinds";
 
-fn override_block() -> ManagedBlock {
-    ManagedBlock::new(BLOCK_SECTION, CommentStyle::Hash)
+/// The managed-block body for these overrides, or `None` when there are none
+/// (the block should be removed). `Err` lists the changes that can't be
+/// expressed in this dialect — only possible on Lua, see
+/// [`ConfigBind::render_lua`].
+fn override_body(
+    overrides: &[Override],
+    dialect: Dialect,
+) -> std::result::Result<Option<String>, String> {
+    if overrides.is_empty() {
+        return Ok(None);
+    }
+    if dialect.is_lua() {
+        let mut lines = Vec::with_capacity(overrides.len());
+        let mut refused = Vec::new();
+        for o in overrides {
+            match o.render_lua() {
+                Ok(line) => lines.push(line),
+                Err(why) => refused.push(why),
+            }
+        }
+        if !refused.is_empty() {
+            return Err(refused.join("\n"));
+        }
+        return Ok(Some(format!(
+            "-- Managed by Omarchy Studio — your keybind changes live here.\n{}",
+            lines.join("\n")
+        )));
+    }
+    Ok(Some(format!(
+        "# Managed by Omarchy Studio — your keybind changes live here.\n{}",
+        render_override_block(overrides)
+    )))
 }
 
-/// The user's Hyprland bindings file — sourced last, so Studio's overrides
-/// there win over the Omarchy defaults (spec 05 §3).
+fn override_block_for(dialect: Dialect) -> ManagedBlock {
+    ManagedBlock::new(BLOCK_SECTION, dialect.comment_style())
+}
+
+/// The user's Hyprland bindings file — loaded last, so Studio's overrides
+/// there win over the Omarchy defaults (spec 05 §3). `bindings.lua` on
+/// Omarchy 4, `bindings.conf` before it.
 pub fn user_bindings_path(paths: &OmarchyPaths) -> std::path::PathBuf {
-    paths.hypr_config().join("bindings.conf")
+    user_bindings_path_for(paths, Dialect::Hyprlang)
+}
+
+pub fn user_bindings_path_for(paths: &OmarchyPaths, dialect: Dialect) -> std::path::PathBuf {
+    paths
+        .hypr_config()
+        .join(format!("bindings.{}", dialect.ext()))
 }
 
 /// Is a Studio override block present in the user's bindings file?
 pub fn overrides_installed(paths: &OmarchyPaths) -> bool {
-    std::fs::read_to_string(user_bindings_path(paths))
-        .map(|c| override_block().contains(&c))
+    overrides_installed_for(paths, Dialect::probe(&crate::cmd::RealRunner))
+}
+
+pub fn overrides_installed_for(paths: &OmarchyPaths, dialect: Dialect) -> bool {
+    std::fs::read_to_string(user_bindings_path_for(paths, dialect))
+        .map(|c| override_block_for(dialect).contains(&c))
         .unwrap_or(false)
 }
 
@@ -437,15 +577,29 @@ pub fn overrides_installed(paths: &OmarchyPaths) -> bool {
 /// The caller is responsible for snapshotting first and reloading after
 /// (the apply pipeline / CLI does both).
 pub fn write_overrides(paths: &OmarchyPaths, overrides: &[Override]) -> Result<std::path::PathBuf> {
-    let path = user_bindings_path(paths);
+    write_overrides_for(paths, overrides, Dialect::Hyprlang)
+}
+
+/// As [`write_overrides`], for a given dialect.
+///
+/// On Lua, an override Studio can't express is a hard error and *nothing* is
+/// written: a partial block would quietly drop the change the user asked for,
+/// which is precisely the failure mode this port exists to remove.
+pub fn write_overrides_for(
+    paths: &OmarchyPaths,
+    overrides: &[Override],
+    dialect: Dialect,
+) -> Result<std::path::PathBuf> {
+    let path = user_bindings_path_for(paths, dialect);
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    let block = override_block();
-    let updated = if overrides.is_empty() {
-        block.remove(&existing)
-    } else {
-        let header = "# Managed by Omarchy Studio — your keybind changes live here.";
-        let body = format!("{header}\n{}", render_override_block(overrides));
-        block.upsert(&existing, &body)
+    let block = override_block_for(dialect);
+    let body = override_body(overrides, dialect).map_err(|detail| StudioError::External {
+        cmd: "keybinds".into(),
+        detail,
+    })?;
+    let updated = match body {
+        Some(body) => block.upsert(&existing, &body),
+        None => block.remove(&existing),
     };
     atomic_write(&path, &updated)?;
     Ok(path)
@@ -453,13 +607,22 @@ pub fn write_overrides(paths: &OmarchyPaths, overrides: &[Override]) -> Result<s
 
 /// Read Studio's existing override block back into a list of [`Override`]s, so
 /// a fresh session inherits changes the user made earlier. Absent block → empty.
+/// Reads whichever bindings file this machine's Hyprland actually loads.
 pub fn read_overrides(paths: &OmarchyPaths) -> Vec<Override> {
-    let Ok(content) = std::fs::read_to_string(user_bindings_path(paths)) else {
+    read_overrides_for(paths, Dialect::probe(&crate::cmd::RealRunner))
+}
+
+/// As [`read_overrides`], for a given dialect.
+pub fn read_overrides_for(paths: &OmarchyPaths, dialect: Dialect) -> Vec<Override> {
+    let Ok(content) = std::fs::read_to_string(user_bindings_path_for(paths, dialect)) else {
         return Vec::new();
     };
-    let Some(body) = override_block().extract(&content) else {
+    let Some(body) = override_block_for(dialect).extract(&content) else {
         return Vec::new();
     };
+    if dialect.is_lua() {
+        return parse_lua_overrides(body);
+    }
     let doc = HyprDoc::parse(body);
     doc.binds()
         .iter()
@@ -478,6 +641,147 @@ pub fn read_overrides(paths: &OmarchyPaths) -> Vec<Override> {
             }
         })
         .collect()
+}
+
+/// Read back the Lua override block Studio wrote — the inverse of
+/// [`Override::render_lua`], and like the rest of Studio's Lua reading it
+/// understands only the shape we emit.
+fn parse_lua_overrides(body: &str) -> Vec<Override> {
+    let mut out = Vec::new();
+    for line in body.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("hl.unbind(") {
+            let Some(chord) = first_lua_string(rest) else {
+                continue;
+            };
+            let (modmask, key) = split_lua_chord(&chord);
+            out.push(Override::Disable { modmask, key });
+        } else if let Some(rest) = line.strip_prefix("o.bind(") {
+            let args = crate::configfs::lua::split_args(rest);
+            if args.len() < 3 {
+                continue;
+            }
+            let Some(chord) = crate::configfs::lua::as_string_literal(&args[0]) else {
+                continue;
+            };
+            let desc = crate::configfs::lua::as_string_literal(&args[1]).unwrap_or_default();
+            // What the action *is* comes from its shape: a plain string literal
+            // is a command; `hl.dsp.layout("…")` is the one core dispatcher
+            // Studio maps by name; `function() hl.plugin.ns.method(…) end` is
+            // the plugin-dispatcher form [`ConfigBind::render_lua`] emits;
+            // anything else is an expression we emitted verbatim (recovered
+            // from the runtime by `resolve_lua_action`) and read back the same
+            // way.
+            let (dispatcher, arg) = match crate::configfs::lua::as_string_literal(&args[2]) {
+                Some(cmd) => ("exec".to_string(), cmd),
+                None if args[2].starts_with("hl.dsp.layout(") => (
+                    "layoutmsg".to_string(),
+                    lua_string_args(&args[2])
+                        .into_iter()
+                        .next()
+                        .unwrap_or_default(),
+                ),
+                None => parse_lua_plugin_call(&args[2])
+                    .unwrap_or_else(|| (LUA_RAW_DISPATCHER.to_string(), args[2].clone())),
+            };
+            let (modmask, key) = split_lua_chord(&chord);
+            out.push(Override::Set(ConfigBind {
+                flags: "bind".into(),
+                modmask,
+                key,
+                description: Some(desc),
+                dispatcher,
+                arg,
+            }));
+        }
+    }
+    out
+}
+
+/// `"SUPER + SHIFT + T"` → (mask, `T`).
+fn split_lua_chord(chord: &str) -> (u16, String) {
+    let mut parts: Vec<&str> = chord.split('+').map(str::trim).collect();
+    let key = parts.pop().unwrap_or_default().to_string();
+    (mods_to_mask(&parts.join(" ")), key)
+}
+
+/// The first quoted Lua string in `text`, unescaped.
+fn first_lua_string(text: &str) -> Option<String> {
+    lua_string_args(text).into_iter().next()
+}
+
+/// Every top-level quoted Lua string in an argument list, in order.
+fn lua_string_args(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '"' {
+            continue;
+        }
+        let mut s = String::new();
+        loop {
+            match chars.next() {
+                None | Some('"') => break,
+                Some('\\') => match chars.next() {
+                    Some('n') => s.push('\n'),
+                    Some('t') => s.push('\t'),
+                    Some('r') => s.push('\r'),
+                    Some(other) => s.push(other),
+                    None => break,
+                },
+                Some(other) => s.push(other),
+            }
+        }
+        out.push(s);
+    }
+    out
+}
+
+/// The inverse of the plugin-dispatcher branch of [`ConfigBind::render_lua`]:
+/// `function() hl.plugin.ns.method("arg") end` → `("ns:method", "arg")`.
+/// `None` for anything else, so the caller falls back to storing the
+/// expression verbatim rather than guessing.
+fn parse_lua_plugin_call(expr: &str) -> Option<(String, String)> {
+    let inner = expr
+        .strip_prefix("function() hl.plugin")?
+        .strip_suffix(" end")?
+        .trim();
+    let paren = inner.find('(')?;
+    let members = split_lua_members(&inner[..paren])?;
+    let [namespace, method] = <[String; 2]>::try_from(members).ok()?;
+    let call_args = inner[paren..].strip_prefix('(')?.strip_suffix(')')?;
+    let arg = lua_string_args(call_args)
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    Some((format!("{namespace}:{method}"), arg))
+}
+
+/// Split a chain of `.name` / `["name"]` table accesses — the inverse of
+/// [`crate::configfs::lua::render_member`] — into its member names. `None` on
+/// anything that isn't exactly that shape.
+fn split_lua_members(mut s: &str) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    while !s.is_empty() {
+        if let Some(rest) = s.strip_prefix('.') {
+            let end = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            if end == 0 {
+                return None;
+            }
+            out.push(rest[..end].to_string());
+            s = &rest[end..];
+        } else if let Some(rest) = s.strip_prefix('[') {
+            let name = first_lua_string(rest)?;
+            let close = rest.find(']')?;
+            out.push(name);
+            s = &rest[close + 1..];
+        } else {
+            return None;
+        }
+    }
+    Some(out)
 }
 
 /// Load the effective keymap: run `hyprctl binds -j`, then attribute each bind
@@ -552,21 +856,29 @@ pub fn plan_overrides(
     paths: &OmarchyPaths,
     overrides: &[Override],
 ) -> Option<crate::engine::FileEdit> {
-    let path = user_bindings_path(paths);
+    plan_overrides_for(paths, overrides, Dialect::Hyprlang).unwrap_or(None)
+}
+
+/// As [`plan_overrides`], for a given dialect. `Err` when an override can't be
+/// expressed — the caller surfaces it instead of writing a partial block.
+pub fn plan_overrides_for(
+    paths: &OmarchyPaths,
+    overrides: &[Override],
+    dialect: Dialect,
+) -> std::result::Result<Option<crate::engine::FileEdit>, String> {
+    let path = user_bindings_path_for(paths, dialect);
     // `None` for a file that doesn't exist yet: the pipeline's hash guard
     // reads it the same way, and treating absent as empty would make the
     // guard reject the write.
     let on_disk = std::fs::read_to_string(&path).ok();
     let existing = on_disk.clone().unwrap_or_default();
-    let block = override_block();
-    let updated = if overrides.is_empty() {
-        block.remove(&existing)
-    } else {
-        let header = "# Managed by Omarchy Studio — your keybind changes live here.";
-        let body = format!("{header}\n{}", render_override_block(overrides));
-        block.upsert(&existing, &body)
+    let block = override_block_for(dialect);
+    let updated = match override_body(overrides, dialect)? {
+        Some(body) => block.upsert(&existing, &body),
+        None => block.remove(&existing),
     };
-    (updated != existing).then(|| crate::engine::FileEdit::new(path, on_disk.as_deref(), updated))
+    Ok((updated != existing)
+        .then(|| crate::engine::FileEdit::new(path, on_disk.as_deref(), updated)))
 }
 
 /// Apply through the pipeline: drift-check → pre-snapshot → hash-guarded write
@@ -579,8 +891,14 @@ pub fn apply_overrides(
     runner: &dyn crate::cmd::CommandRunner,
     summary: &str,
 ) -> Result<std::path::PathBuf> {
-    let path = user_bindings_path(paths);
-    let Some(edit) = plan_overrides(paths, overrides) else {
+    let dialect = Dialect::probe(runner);
+    let path = user_bindings_path_for(paths, dialect);
+    let planned =
+        plan_overrides_for(paths, overrides, dialect).map_err(|detail| StudioError::External {
+            cmd: "keybinds".into(),
+            detail,
+        })?;
+    let Some(edit) = planned else {
         return Ok(path); // nothing to do
     };
     let plan = crate::engine::ApplyPlan {
@@ -607,10 +925,17 @@ fn is_marked(o: &Override, desc: &str) -> bool {
 
 /// The Studio-owned bind carrying `desc` as its marker, if installed.
 pub fn find_marked(paths: &OmarchyPaths, desc: &str) -> Option<ConfigBind> {
-    read_overrides(paths).into_iter().find_map(|o| match o {
-        Override::Set(cb) if cb.description.as_deref() == Some(desc) => Some(cb),
-        _ => None,
-    })
+    find_marked_for(paths, desc, Dialect::probe(&crate::cmd::RealRunner))
+}
+
+/// As [`find_marked`], for a given dialect.
+pub fn find_marked_for(paths: &OmarchyPaths, desc: &str, dialect: Dialect) -> Option<ConfigBind> {
+    read_overrides_for(paths, dialect)
+        .into_iter()
+        .find_map(|o| match o {
+            Override::Set(cb) if cb.description.as_deref() == Some(desc) => Some(cb),
+            _ => None,
+        })
 }
 
 /// Bind `mods+key` to `exec` under the `desc` marker (replacing any previous
@@ -650,7 +975,9 @@ pub fn install_marked_dispatch(
         dispatcher: dispatcher.to_string(),
         arg: arg.to_string(),
     };
-    let mut overrides: Vec<Override> = read_overrides(paths)
+    // Read through the same runner we're about to write with, so the read and
+    // the write can't disagree about which dialect this machine uses.
+    let mut overrides: Vec<Override> = read_overrides_for(paths, Dialect::probe(runner))
         .into_iter()
         .filter(|o| !is_marked(o, desc))
         .collect();
@@ -667,7 +994,8 @@ pub fn remove_marked(
     store: &crate::snapshot::SnapshotStore,
     runner: &dyn crate::cmd::CommandRunner,
 ) -> Result<bool> {
-    let all = read_overrides(paths);
+    // Same runner for the read and the write — see install_marked_dispatch.
+    let all = read_overrides_for(paths, Dialect::probe(runner));
     let kept: Vec<Override> = all
         .iter()
         .filter(|o| !is_marked(o, desc))
@@ -889,7 +1217,7 @@ mod tests {
         let paths = fake_paths("write");
         let user = "# Application bindings\nbindd = SUPER, RETURN, Terminal, exec, foot\n";
         std::fs::write(user_bindings_path(&paths), user).unwrap();
-        assert!(!overrides_installed(&paths));
+        assert!(!overrides_installed_for(&paths, Dialect::Hyprlang));
 
         let overrides = vec![
             Override::Set(cb("SUPER", "B", "exec", "chromium")),
@@ -899,7 +1227,7 @@ mod tests {
             },
         ];
         write_overrides(&paths, &overrides).unwrap();
-        assert!(overrides_installed(&paths));
+        assert!(overrides_installed_for(&paths, Dialect::Hyprlang));
         let after = std::fs::read_to_string(user_bindings_path(&paths)).unwrap();
         assert!(after.contains("bindd = SUPER, RETURN, Terminal, exec, foot")); // user's bind kept
         assert!(after.contains("bind = SUPER, B, exec, chromium"));
@@ -912,7 +1240,7 @@ mod tests {
 
         // empty overrides removes the block, restoring the user's file exactly
         write_overrides(&paths, &[]).unwrap();
-        assert!(!overrides_installed(&paths));
+        assert!(!overrides_installed_for(&paths, Dialect::Hyprlang));
         assert_eq!(
             std::fs::read_to_string(user_bindings_path(&paths)).unwrap(),
             user
@@ -936,7 +1264,7 @@ mod tests {
         ];
         write_overrides(&paths, &written).unwrap();
 
-        let read = read_overrides(&paths);
+        let read = read_overrides_for(&paths, Dialect::Hyprlang);
         assert_eq!(read.len(), 2);
         match &read[0] {
             Override::Set(cb) => {
@@ -955,7 +1283,7 @@ mod tests {
         }
         // no block → empty
         std::fs::write(user_bindings_path(&paths), "# nothing here\n").unwrap();
-        assert!(read_overrides(&paths).is_empty());
+        assert!(read_overrides_for(&paths, Dialect::Hyprlang).is_empty());
     }
 
     #[test]
@@ -1033,5 +1361,543 @@ bindd\n\
         assert_eq!(binds.len(), 1);
         assert_eq!(binds[0].key, "T");
         assert!(parse_runtime_binds_text("").is_empty());
+    }
+}
+
+/// Omarchy 4: `hl.unbind` / `o.bind` in `bindings.lua`.
+#[cfg(test)]
+mod lua_tests {
+    use super::*;
+
+    fn fake_paths(tag: &str) -> OmarchyPaths {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "omarchy-studio-kb-lua-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join(".config/hypr")).unwrap();
+        OmarchyPaths {
+            system: root.join("share/omarchy"),
+            config: root.join(".config/omarchy"),
+            state: root.join(".local/state/omarchy"),
+        }
+    }
+
+    fn exec_bind(mask: u16, key: &str, desc: &str, cmd: &str) -> ConfigBind {
+        ConfigBind {
+            flags: "bind".into(),
+            modmask: mask,
+            key: key.into(),
+            description: Some(desc.into()),
+            dispatcher: "exec".into(),
+            arg: cmd.into(),
+        }
+    }
+
+    #[test]
+    fn chords_use_the_lua_plus_form() {
+        assert_eq!(
+            render_lua_chord(mods::SUPER | mods::SHIFT, "T"),
+            "SUPER + SHIFT + T"
+        );
+        assert_eq!(render_lua_chord(0, "XF86AudioMute"), "XF86AudioMute");
+        assert_eq!(
+            render_lua_unbind(mods::SUPER, "F"),
+            "hl.unbind(\"SUPER + F\")"
+        );
+    }
+
+    #[test]
+    fn a_command_bind_renders_as_o_bind() {
+        let bind = exec_bind(mods::SUPER, "B", "Browser", "chromium");
+        assert_eq!(
+            bind.render_lua().unwrap(),
+            "o.bind(\"SUPER + B\", \"Browser\", \"chromium\")"
+        );
+    }
+
+    /// The important refusal: on Omarchy 4 every runtime bind reports `__lua`,
+    /// so "move this action to another key" has nothing to copy. Studio must
+    /// say so rather than write a binding that does nothing.
+    #[test]
+    fn refuses_to_fake_an_opaque_lua_action() {
+        let mut bind = exec_bind(mods::SUPER, "W", "Close window", "");
+        bind.dispatcher = LUA_OPAQUE_DISPATCHER.into();
+        let err = bind.render_lua().unwrap_err();
+        assert!(err.contains("SUPER + W"));
+        assert!(err.contains("can't move it to another chord"));
+
+        let paths = fake_paths("refuse");
+        let err = write_overrides_for(&paths, &[Override::Set(bind)], Dialect::Lua).unwrap_err();
+        assert!(format!("{err:?}").contains("SUPER + W"));
+        assert!(
+            !paths.hypr_config().join("bindings.lua").exists(),
+            "nothing is written when part of the change can't be expressed"
+        );
+    }
+
+    #[test]
+    fn writes_unbind_and_bind_into_bindings_lua() {
+        let paths = fake_paths("write");
+        let overrides = vec![
+            Override::Disable {
+                modmask: mods::SUPER,
+                key: "F".into(),
+            },
+            Override::Set(exec_bind(mods::SUPER, "B", "Browser", "chromium")),
+        ];
+        let path = write_overrides_for(&paths, &overrides, Dialect::Lua).unwrap();
+        assert_eq!(path, paths.hypr_config().join("bindings.lua"));
+        assert!(!paths.hypr_config().join("bindings.conf").exists());
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("-- >>> omarchy-studio:keybinds"));
+        assert!(text.contains("hl.unbind(\"SUPER + F\")"));
+        assert!(text.contains("o.bind(\"SUPER + B\", \"Browser\", \"chromium\")"));
+        assert!(!text.contains("bind ="), "no hyprlang syntax");
+    }
+
+    #[test]
+    fn reads_its_own_lua_block_back() {
+        let paths = fake_paths("roundtrip");
+        let overrides = vec![
+            Override::Disable {
+                modmask: mods::SUPER | mods::SHIFT,
+                key: "Q".into(),
+            },
+            Override::Set(exec_bind(
+                mods::SUPER,
+                "B",
+                "Browser",
+                "chromium --new-window",
+            )),
+        ];
+        write_overrides_for(&paths, &overrides, Dialect::Lua).unwrap();
+
+        let back = read_overrides_for(&paths, Dialect::Lua);
+        assert_eq!(back.len(), 2);
+        match &back[0] {
+            Override::Disable { modmask, key } => {
+                assert_eq!(*modmask, mods::SUPER | mods::SHIFT);
+                assert_eq!(key, "Q");
+            }
+            other => panic!("expected a disable, got {other:?}"),
+        }
+        match &back[1] {
+            Override::Set(cb) => {
+                assert_eq!(cb.modmask, mods::SUPER);
+                assert_eq!(cb.key, "B");
+                assert_eq!(cb.description.as_deref(), Some("Browser"));
+                assert_eq!(cb.dispatcher, "exec");
+                assert_eq!(cb.arg, "chromium --new-window");
+            }
+            other => panic!("expected a bind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clearing_leaves_the_users_own_lua_untouched() {
+        let paths = fake_paths("clear");
+        let path = paths.hypr_config().join("bindings.lua");
+        let users =
+            "-- mine\nhl.unbind(\"ALT + SPACE\")\no.bind(\"SUPER + G\", \"Games\", \"steam\")\n";
+        std::fs::write(&path, users).unwrap();
+
+        write_overrides_for(
+            &paths,
+            &[Override::Set(exec_bind(
+                mods::SUPER,
+                "B",
+                "Browser",
+                "chromium",
+            ))],
+            Dialect::Lua,
+        )
+        .unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("chromium"));
+
+        write_overrides_for(&paths, &[], Dialect::Lua).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), users);
+    }
+
+    #[test]
+    fn a_command_with_quotes_survives_the_round_trip() {
+        let paths = fake_paths("quotes");
+        let cmd = r#"sh -c 'notify-send "hi there"'"#;
+        write_overrides_for(
+            &paths,
+            &[Override::Set(exec_bind(mods::SUPER, "N", "Note", cmd))],
+            Dialect::Lua,
+        )
+        .unwrap();
+        let back = read_overrides_for(&paths, Dialect::Lua);
+        match &back[0] {
+            Override::Set(cb) => assert_eq!(cb.arg, cmd),
+            other => panic!("expected a bind, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod lua_dispatcher_tests {
+    use super::*;
+
+    fn paths(tag: &str) -> OmarchyPaths {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "omarchy-studio-kb-dsp-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join(".config/hypr")).unwrap();
+        OmarchyPaths {
+            system: root.join("share/omarchy"),
+            config: root.join(".config/omarchy"),
+            state: root.join(".local/state/omarchy"),
+        }
+    }
+
+    fn bind(dispatcher: &str, arg: &str) -> ConfigBind {
+        ConfigBind {
+            flags: "bindd".into(),
+            modmask: mods::SUPER,
+            key: "LEFT".into(),
+            description: Some("Scroll left".into()),
+            dispatcher: dispatcher.into(),
+            arg: arg.into(),
+        }
+    }
+
+    /// The scrolling-layout nav binds Studio installs use `layoutmsg`; Hyprland
+    /// 0.56 accepts `hl.dsp.layout("focus l")` for it (verified against the
+    /// running compositor).
+    #[test]
+    fn layoutmsg_maps_to_hl_dsp_layout() {
+        assert_eq!(
+            bind("layoutmsg", "focus l").render_lua().unwrap(),
+            "o.bind(\"SUPER + LEFT\", \"Scroll left\", hl.dsp.layout(\"focus l\"))"
+        );
+    }
+
+    /// A dispatcher call's argument is a quoted string too, so the reader must
+    /// tell `hl.dsp.layout("focus l")` from a plain command of the same text.
+    #[test]
+    fn a_dispatcher_bind_reads_back_as_itself_not_as_a_command() {
+        let p = paths("roundtrip");
+        write_overrides_for(
+            &p,
+            &[
+                Override::Set(bind("layoutmsg", "focus l")),
+                Override::Set(ConfigBind {
+                    key: "B".into(),
+                    description: Some("Browser".into()),
+                    dispatcher: "exec".into(),
+                    arg: "chromium".into(),
+                    ..bind("exec", "chromium")
+                }),
+            ],
+            Dialect::Lua,
+        )
+        .unwrap();
+
+        let back = read_overrides_for(&p, Dialect::Lua);
+        assert_eq!(back.len(), 2);
+        match (&back[0], &back[1]) {
+            (Override::Set(a), Override::Set(b)) => {
+                assert_eq!(a.dispatcher, "layoutmsg");
+                assert_eq!(a.arg, "focus l");
+                assert_eq!(b.dispatcher, "exec");
+                assert_eq!(b.arg, "chromium");
+            }
+            other => panic!("expected two binds, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unmapped_dispatcher_is_refused_by_name() {
+        let err = bind("movefocus", "l").render_lua().unwrap_err();
+        assert!(err.contains("`movefocus`"), "names the dispatcher: {err}");
+    }
+
+    /// `namespace:method` dispatchers (Hyprland's own plugin-registration
+    /// convention, e.g. `scrolloverview:overview`) map to the plugin's
+    /// `hl.plugin` table — exactly the form the plugin's own README documents
+    /// (`hl.plugin.scrolloverview.overview("toggle all")`).
+    #[test]
+    fn a_plugin_dispatcher_calls_into_hl_plugin() {
+        assert_eq!(
+            bind("scrolloverview:overview", "toggle")
+                .render_lua()
+                .unwrap(),
+            "o.bind(\"SUPER + LEFT\", \"Scroll left\", \
+             function() hl.plugin.scrolloverview.overview(\"toggle\") end)"
+        );
+    }
+
+    /// A plugin dispatcher survives the write/read round trip as itself, not
+    /// as an opaque raw expression — `current_bind`-style lookups (`niri.rs`)
+    /// key off `dispatcher`, so losing this would make Studio think its own
+    /// bind was never installed.
+    #[test]
+    fn a_plugin_dispatcher_bind_reads_back_as_itself() {
+        let p = paths("plugin-roundtrip");
+        write_overrides_for(
+            &p,
+            &[Override::Set(bind("scrolloverview:overview", "toggle"))],
+            Dialect::Lua,
+        )
+        .unwrap();
+
+        let back = read_overrides_for(&p, Dialect::Lua);
+        match &back[0] {
+            Override::Set(cb) => {
+                assert_eq!(cb.dispatcher, "scrolloverview:overview");
+                assert_eq!(cb.arg, "toggle");
+            }
+            other => panic!("expected a bind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_plugin_dispatcher_with_no_arg_renders_and_reads_back() {
+        let empty = bind("scrolloverview:overview", "");
+        assert_eq!(
+            empty.render_lua().unwrap(),
+            "o.bind(\"SUPER + LEFT\", \"Scroll left\", \
+             function() hl.plugin.scrolloverview.overview() end)"
+        );
+        let p = paths("plugin-empty-arg");
+        write_overrides_for(&p, &[Override::Set(empty)], Dialect::Lua).unwrap();
+        let back = read_overrides_for(&p, Dialect::Lua);
+        match &back[0] {
+            Override::Set(cb) => {
+                assert_eq!(cb.dispatcher, "scrolloverview:overview");
+                assert_eq!(cb.arg, "");
+            }
+            other => panic!("expected a bind, got {other:?}"),
+        }
+    }
+}
+
+// ── recovering an action from the Lua sources ────────────────────────────────
+// On Omarchy 4 `hyprctl binds` reports every bind's dispatcher as `__lua`, so a
+// bind read from the runtime carries no reproducible action (see
+// [`LUA_OPAQUE_DISPATCHER`]). To move an action onto a different key, Studio
+// finds the `o.bind(...)` that declared it and re-emits its action argument
+// verbatim — the expression Omarchy itself wrote, whatever shape it has.
+
+/// A dispatcher marker meaning "`arg` is a raw Lua expression, emit it as-is".
+/// Only ever produced by [`resolve_lua_action`]; hyprlang never sees it.
+pub const LUA_RAW_DISPATCHER: &str = "__lua_raw";
+
+/// An action recovered from a Lua binding source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourcedAction {
+    pub description: String,
+    /// The action argument's Lua source, re-emittable verbatim.
+    pub action: String,
+}
+
+/// The Lua files that declare bindings, most specific first: the user's own
+/// overrides win over Omarchy's defaults, as they do at load time.
+fn lua_bind_sources(paths: &OmarchyPaths) -> Vec<std::path::PathBuf> {
+    let mut files = vec![user_bindings_path_for(paths, Dialect::Lua)];
+    let dir = paths.system.join("default/hypr/bindings");
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        let mut found: Vec<_> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "lua"))
+            .collect();
+        found.sort();
+        files.extend(found);
+    }
+    files
+}
+
+/// Find the action bound to `mask`+`key` in the Lua sources.
+///
+/// Returns `None` when no static `o.bind` declares that chord — most notably
+/// the workspace binds, which Omarchy generates in a `for` loop, so their
+/// chords never appear as literals to match.
+pub fn resolve_lua_action(paths: &OmarchyPaths, mask: u16, key: &str) -> Option<SourcedAction> {
+    let want = chord_id(mask, key);
+    for file in lua_bind_sources(paths) {
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        if let Some(found) = scan_lua_binds(&text, want.clone()) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Scan one Lua source for an `o.bind` declaring `want`.
+fn scan_lua_binds(text: &str, want: (u16, String)) -> Option<SourcedAction> {
+    for line in text.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("o.bind(") else {
+            continue;
+        };
+        let args = crate::configfs::lua::split_args(rest);
+        // chord, description, action — options are optional and ignored, since
+        // they describe how the key repeats, not what it does.
+        if args.len() < 3 {
+            continue;
+        }
+        let Some(chord) = crate::configfs::lua::as_string_literal(&args[0]) else {
+            continue;
+        };
+        let (mask, key) = split_lua_chord(&chord);
+        if chord_id(mask, &key) != want {
+            continue;
+        }
+        let description = crate::configfs::lua::as_string_literal(&args[1])
+            .unwrap_or_else(|| "Omarchy Studio".to_string());
+        return Some(SourcedAction {
+            description,
+            action: args[2].clone(),
+        });
+    }
+    None
+}
+
+/// Build the override that moves a resolved action onto a new chord.
+pub fn rebind_sourced(action: &SourcedAction, mask: u16, key: &str) -> ConfigBind {
+    ConfigBind {
+        flags: "bind".into(),
+        modmask: mask,
+        key: key.to_string(),
+        description: Some(action.description.clone()),
+        dispatcher: LUA_RAW_DISPATCHER.into(),
+        arg: action.action.clone(),
+    }
+}
+
+/// Recovering an action from the Lua sources, so a rebind is possible again.
+#[cfg(test)]
+mod lua_resolve_tests {
+    use super::*;
+
+    /// Verbatim lines from Omarchy 4's `default/hypr/bindings/tiling.lua`,
+    /// covering the action shapes that actually occur.
+    const TILING: &str = r#"
+o.bind("SUPER + W", "Close window", hl.dsp.window.close())
+o.bind("CTRL + ALT + DELETE", "Close all windows", "omarchy-hyprland-window-close-all")
+o.bind("SUPER + T", "Toggle window floating/tiling", hl.dsp.window.float({ action = "toggle" }))
+o.bind("SUPER + SHIFT + ALT + LEFT", "Move workspace to left monitor", hl.dsp.workspace.move({ monitor = "l" }))
+o.bind("XF86AudioMute", "Mute", "omarchy-audio-output-volume mute-toggle", { locked = true })
+"#;
+
+    #[test]
+    fn recovers_a_dispatcher_expression_verbatim() {
+        let found = scan_lua_binds(TILING, chord_id(mods::SUPER, "W")).expect("SUPER+W");
+        assert_eq!(found.description, "Close window");
+        assert_eq!(found.action, "hl.dsp.window.close()");
+    }
+
+    /// The action's own table must survive intact — splitting on the comma
+    /// inside `{ action = "toggle" }` would truncate it.
+    #[test]
+    fn recovers_an_expression_containing_a_table() {
+        let found = scan_lua_binds(TILING, chord_id(mods::SUPER, "T")).expect("SUPER+T");
+        assert_eq!(found.action, "hl.dsp.window.float({ action = \"toggle\" })");
+    }
+
+    /// Omarchy writes `SUPER + SHIFT + ALT`, Studio's mask order is
+    /// SUPER, CTRL, ALT, SHIFT — so matching has to be on the parsed mask, not
+    /// on the chord text.
+    #[test]
+    fn matches_regardless_of_how_the_modifiers_were_ordered() {
+        let want = chord_id(mods::SUPER | mods::ALT | mods::SHIFT, "LEFT");
+        let found = scan_lua_binds(TILING, want).expect("the reordered chord");
+        assert_eq!(found.action, "hl.dsp.workspace.move({ monitor = \"l\" })");
+    }
+
+    #[test]
+    fn recovers_a_plain_command_and_ignores_the_options_table() {
+        let found = scan_lua_binds(TILING, chord_id(0, "XF86AudioMute")).expect("mute");
+        assert_eq!(found.action, "\"omarchy-audio-output-volume mute-toggle\"");
+        assert!(scan_lua_binds(TILING, chord_id(mods::SUPER, "NOPE")).is_none());
+    }
+
+    #[test]
+    fn a_recovered_action_re_emits_verbatim_under_the_new_chord() {
+        let found = scan_lua_binds(TILING, chord_id(mods::SUPER, "T")).unwrap();
+        let bind = rebind_sourced(&found, mods::SUPER | mods::SHIFT, "G");
+        assert_eq!(
+            bind.render_lua().unwrap(),
+            "o.bind(\"SUPER + SHIFT + G\", \"Toggle window floating/tiling\", \
+             hl.dsp.window.float({ action = \"toggle\" }))"
+        );
+    }
+
+    #[test]
+    fn a_recovered_action_survives_the_write_read_round_trip() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "omarchy-studio-kb-resolve-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join(".config/hypr")).unwrap();
+        let paths = OmarchyPaths {
+            system: root.join("share/omarchy"),
+            config: root.join(".config/omarchy"),
+            state: root.join(".local/state/omarchy"),
+        };
+        let found = scan_lua_binds(TILING, chord_id(mods::SUPER, "T")).unwrap();
+        let bind = rebind_sourced(&found, mods::SUPER | mods::SHIFT, "G");
+        write_overrides_for(&paths, &[Override::Set(bind.clone())], Dialect::Lua).unwrap();
+
+        let back = read_overrides_for(&paths, Dialect::Lua);
+        match &back[0] {
+            Override::Set(cb) => {
+                assert_eq!(cb.dispatcher, LUA_RAW_DISPATCHER);
+                assert_eq!(cb.arg, found.action);
+                assert_eq!(cb.key, "G");
+            }
+            other => panic!("expected a bind, got {other:?}"),
+        }
+    }
+
+    /// Omarchy generates the workspace binds in a `for` loop, so no literal
+    /// chord exists to match — the documented gap.
+    #[test]
+    fn a_loop_generated_chord_is_honestly_unresolvable() {
+        let looped = "for workspace = 1, 10 do\n  o.bind(\"SUPER + \" .. key, \"Switch\", hl.dsp.focus({}))\nend\n";
+        assert!(scan_lua_binds(looped, chord_id(mods::SUPER, "code:10")).is_none());
+    }
+
+    /// Against the real Omarchy install, when there is one.
+    #[test]
+    fn resolves_against_the_installed_omarchy_if_present() {
+        let dir = std::path::Path::new("/usr/share/omarchy/default/hypr/bindings");
+        if !dir.is_dir() {
+            eprintln!("skipping: no Omarchy install");
+            return;
+        }
+        let paths = OmarchyPaths {
+            system: std::path::PathBuf::from("/usr/share/omarchy"),
+            config: std::path::PathBuf::from("/nonexistent"),
+            state: std::path::PathBuf::from("/nonexistent"),
+        };
+        // SUPER+W is "Close window" in every Omarchy 4 shipped so far.
+        if let Some(found) = resolve_lua_action(&paths, mods::SUPER, "W") {
+            assert!(
+                found.action.starts_with("hl.dsp.") || found.action.starts_with('"'),
+                "unexpected action shape: {}",
+                found.action
+            );
+            assert!(!found.description.is_empty());
+        }
     }
 }

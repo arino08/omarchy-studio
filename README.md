@@ -26,7 +26,7 @@ curl -sL https://raw.githubusercontent.com/arino08/omarchy-studio/main/install.s
 omarchy-studio
 ```
 
-> **Status: alpha, and honest about it.** Everything below is built, tested (361 tests, plus the TUI itself driven in a pty on every CI run) and drives the real Omarchy config on disk. v0.9.3 is the current release. Tested against Omarchy 3.8 / Hyprland 0.55 — Studio warns, but never refuses to run, on versions it hasn't seen.
+> **Status: alpha, and honest about it.** Everything below is built, tested (477 tests, plus the TUI itself driven in a pty on every CI run) and drives the real Omarchy config on disk. v0.9.3 is the current release; the Omarchy 4 support described here is newer than it. Tested against Omarchy 3.8 and 4.0 "Quattro" / Hyprland 0.55 and 0.56 — Studio warns, but never refuses to run, on versions it hasn't seen. On Quattro it writes Hyprland's new Lua config; the bar, notification and OSD screens are unavailable there, because Omarchy 4 replaced Waybar, Mako and SwayOSD with the Quickshell shell.
 
 ## Why
 
@@ -74,6 +74,7 @@ This is the part that matters, so it's not buried at the bottom:
 | **Notifications (mako)** | Behavior schema (timeouts, layout, urgency rules), do-not-disturb, live sample notifications | v0.5 |
 | **OSD (swayosd)** | Volume/brightness popup geometry, percentage, margins, self-test | v0.5 |
 | **Lock & Idle** | Retime the hypridle timeline (screensaver → lock → screen-off → suspend), hyprlock avatar/blur/dim | v0.5 |
+| **Omarchy 4 shell** | Bar layout on Quattro's Quickshell `omarchy-shell`: the Waybar rail screen becomes a real bar-layout editor there — reorder/move/add/remove widgets, flip position/transparency — wrapping Omarchy's own `omarchy bar`/`omarchy plugin` commands rather than hand-editing `shell.json`. Plus idle timers and shell-wide font/bar-size/spacing scale (`shell.toml`'s only non-colour knobs — everything else there is theme-derived colour, verified against the shipped template). Replaces the old Waybar/Notifications/OSD/Lock & Idle coverage on Omarchy 4, where those components don't exist. CLI `shell idle`/`shell bar`/`shell plugin`/`shell appearance` | — |
 | **Update survival** | Lifecycle hooks (`theme-set`, `post-update`) re-assert Studio's style blocks after theme changes and flag drift/clobbers after `omarchy-update` | v0.5 |
 | **Doctor** | One health view: system facts, capability probes, hook status, drift report — in the TUI and the CLI | v0.5 |
 | **Wallpapers** | Browse all four background sources (yours / theme / videos) with in-terminal previews (kitty / sixel / half-blocks), set/cycle/add/remove, `o` opens in imv/mpv | v0.6 |
@@ -83,7 +84,7 @@ This is the part that matters, so it's not buried at the bottom:
 | **Integrations** | Dependency health + companion-tool detection (Aether, Omarchist, matugen, hyprmon) with launch actions; "Open in Aether" appears in the wallpaper browser when installed | v0.6 |
 | **Power** | Battery charge thresholds on ThinkPads & friends (`charge_control_*_threshold`) — no TLP needed; CLI can persist them across reboots. Plus power profiles (switch & persist at login) and an AC/battery auto-switch udev rule shown for approval before any root write | v0.6 · v0.8 |
 | **Apps & services** | Remove bundled apps and web apps safely: a `pacman -Rs --print` **cascade preview** shows every orphaned dependency, enabled systemd units are disabled first, and pacman's refusal to break a dependency is surfaced as a blocker (never forced). Every removal is logged so `apps restore <id>` can reinstall it. No bulk-confirm bypass | v0.8 |
-| **Monitors** | Detect displays (`hyprctl monitors -j`), identify which panel is which, set resolution and refresh rate from the modes the panel actually advertises (asking a 100Hz display for 200Hz is refused with the list of what it can do, not silently dropped), adjust scale with the effective resolution shown live, disable a display, and **arrange the screens** against a proportional map of your desk — put the laptop below the ultrawide centred, or left of it bottom-aligned, with overlaps and unreachable screens called out before you save. Written to `monitors.conf` as a managed block with a hotplug fallback, snapshot-backed | v0.8 |
+| **Monitors** | Detect displays (`hyprctl monitors -j`), identify which panel is which, set resolution and refresh rate from the modes the panel actually advertises (asking a 100Hz display for 200Hz is refused with the list of what it can do, not silently dropped), adjust scale with the effective resolution shown live, disable a display, and **arrange the screens** against a proportional map of your desk — put the laptop below the ultrawide centred, or left of it bottom-aligned, with overlaps and unreachable screens called out before you save — or just **reorder a row** left/right (`←`/`→`). Written to `monitors.lua` on Omarchy 4 (`monitors.conf` before it) as a managed block with a hotplug fallback, snapshot-backed | v0.8 |
 | **Quick tweaks** | One-key reversible toggles (Caps→Escape, inactive-window transparency, screenshot/screencast folders…) — each a self-contained managed block, individually revertible, never touching Omarchy's vendored files | v0.8 |
 | **Nice Launcher** | Drive the Nice Launcher (Quickshell app-search overlay): visual mode (constellation / spotlight / orbital / grid), backdrop, animation toggles and providers written to `nova.json`, snapshot-backed; optional launch keybind through the managed keybinds block; launch or install it straight from the rail. CLI `nova show|mode|set|anim|providers|keybind|launch|install|uninstall` | — |
 | **Snapshots** | Browse every change Studio has ever made as a timeline with a live colored diff pane, and roll the whole tree back to any point — the restore is itself recorded, so it too can be undone. Only possible because the undo store is a real git repo. CLI `snapshot log`/`show <id>`/`restore <id>` | v0.9 |
@@ -147,6 +148,7 @@ omarchy-studio          # launch the full-screen cockpit
 | <kbd>t</kbd> | (wallpapers) craft a theme from the selected image |
 | <kbd>w</kbd> | (wallpapers) browse wallhaven.cc — enter sets, `t` themes |
 | <kbd>o</kbd> | (wallpapers) open in imv / mpv |
+| <kbd>p</kbd> | (monitors) placement mode — arrange the selected display against another on a live map |
 | <kbd>s</kbd> | save pending edits (snapshotted first) |
 | <kbd>U</kbd> | install a waiting update & restart |
 | <kbd>/</kbd> | search · <kbd>?</kbd> help · <kbd>q</kbd> quit |
@@ -231,6 +233,7 @@ omarchy-studio monitor scale <name> <f> [--dry-run]
 omarchy-studio monitor place <name> <left-of|right-of|above|below> <anchor> [--align start|center|end] [--dry-run]
 omarchy-studio monitor arrange <row|column> [<name>…] [--align …] [--dry-run]
 omarchy-studio monitor position <name> <XxY> [--dry-run]   # exact logical coords
+omarchy-studio monitor position <name> <left|right> [--dry-run]   # swap with the row neighbour
 omarchy-studio monitor normalize [--dry-run]     # re-origin the arrangement at 0,0
 omarchy-studio monitor check                     # warn about overlaps and unreachable screens
 omarchy-studio monitor apply [--dry-run]         # persist the current layout
@@ -258,6 +261,13 @@ omarchy-studio osd test
 omarchy-studio idle timeline
 omarchy-studio idle set <screensaver|lock|screen-off|suspend> <seconds>
 omarchy-studio lock show | avatar <path> | avatar list | size <px> | blur <n> | dim <0..1> | preview
+
+# Omarchy 4 shell (bar/plugins/idle — replaces Waybar/Notifications/OSD/Lock & Idle on Quattro)
+omarchy-studio shell idle show | set <screensaver|lock> <seconds>
+omarchy-studio shell bar list | catalog | position <top|bottom|left|right> | transparent <true|false|toggle>
+omarchy-studio shell bar move <id> [placement] | put <id> [placement] | set <id> <key> <value> [--json] [placement] | defaults
+omarchy-studio shell plugin list | enable <id> [placement] | disable <id>
+omarchy-studio shell appearance show | set <font-size|bar-size-horizontal|bar-size-vertical|bar-scale-with-font|spacing-scale|spacing-scale-with-font> <value>
 
 # Battery charge thresholds (ThinkPads & friends — no TLP needed)
 omarchy-studio battery [status]

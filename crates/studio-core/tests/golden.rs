@@ -181,3 +181,104 @@ mod jsonc {
         );
     }
 }
+
+/// The Lua emitter (Omarchy 4) must produce source the real Lua compiler
+/// accepts. String-equality unit tests only prove the output matches what we
+/// expected to write; these prove it actually parses.
+mod lua {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    use studio_core::configfs::lua::{config_call, named_table_call, table_call, Value};
+
+    /// `luac -p` (syntax-check only). Returns None when no Lua toolchain is
+    /// installed, so the suite still runs on a machine without one.
+    fn syntax_check(source: &str) -> Option<Result<(), String>> {
+        for bin in ["luac", "luac5.4", "luac5.3"] {
+            let spawned = Command::new(bin)
+                .args(["-p", "-"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn();
+            let Ok(mut child) = spawned else { continue };
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(source.as_bytes())
+                .expect("write source");
+            let out = child.wait_with_output().expect("luac run");
+            return Some(if out.status.success() {
+                Ok(())
+            } else {
+                Err(String::from_utf8_lossy(&out.stderr).to_string())
+            });
+        }
+        None
+    }
+
+    fn assert_valid_lua(source: &str) {
+        match syntax_check(source) {
+            None => eprintln!("skipping: no luac on PATH"),
+            Some(Ok(())) => {}
+            Some(Err(e)) => panic!("emitted invalid Lua:\n{source}\n\nluac said:\n{e}"),
+        }
+    }
+
+    #[test]
+    fn emitted_config_blocks_are_valid_lua() {
+        let entries: Vec<(String, Value)> = vec![
+            ("general.gaps_in".into(), Value::Int(6)),
+            ("general.layout".into(), Value::Str("dwindle".into())),
+            ("general.resize_on_border".into(), Value::Bool(true)),
+            ("decoration.rounding".into(), Value::Int(8)),
+            ("decoration.blur.enabled".into(), Value::Bool(true)),
+            ("decoration.blur.size".into(), Value::Int(8)),
+            ("decoration.dim_strength".into(), Value::Float(0.15)),
+            // A key that isn't a bare Lua identifier must still compile.
+            ("input.kb-layout".into(), Value::Str("us,dk".into())),
+            // As must a string carrying quotes and backslashes.
+            ("misc.note".into(), Value::Str("a\"b\\c".into())),
+        ];
+        assert_valid_lua(&config_call(&entries));
+    }
+
+    #[test]
+    fn emitted_monitor_and_curve_calls_are_valid_lua() {
+        let monitor = table_call(
+            "hl.monitor",
+            &[
+                ("output", Value::Str("eDP-1".into())),
+                ("mode", Value::Str("1920x1080@120.21".into())),
+                ("position", Value::Str("0x0".into())),
+                ("scale", Value::Float(1.5)),
+                ("transform", Value::Int(0)),
+            ],
+        );
+        let curve = named_table_call(
+            "hl.curve",
+            "easeOutQuint",
+            &[
+                ("type", Value::Str("bezier".into())),
+                (
+                    "points",
+                    Value::List(vec![
+                        Value::List(vec![Value::Float(0.23), Value::Int(1)]),
+                        Value::List(vec![Value::Float(0.32), Value::Int(1)]),
+                    ]),
+                ),
+            ],
+        );
+        let animation = table_call(
+            "hl.animation",
+            &[
+                ("leaf", Value::Str("windows".into())),
+                ("enabled", Value::Bool(true)),
+                ("speed", Value::Float(3.79)),
+                ("bezier", Value::Str("easeOutQuint".into())),
+                ("style", Value::Str("popin 87%".into())),
+            ],
+        );
+        assert_valid_lua(&format!("{monitor}\n{curve}\n{animation}\n"));
+    }
+}

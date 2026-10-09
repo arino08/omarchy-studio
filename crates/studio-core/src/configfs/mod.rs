@@ -7,6 +7,7 @@
 
 pub mod hyprlang;
 pub mod jsonc;
+pub mod lua;
 
 use std::path::Path;
 
@@ -81,6 +82,8 @@ pub enum CommentStyle {
     CBlock,
     /// `// …` — jsonc.
     DblSlash,
+    /// `-- …` — Lua (Omarchy 4 Hyprland config).
+    DashDash,
 }
 
 impl CommentStyle {
@@ -89,6 +92,7 @@ impl CommentStyle {
             CommentStyle::Hash => format!("# {inner}"),
             CommentStyle::CBlock => format!("/* {inner} */"),
             CommentStyle::DblSlash => format!("// {inner}"),
+            CommentStyle::DashDash => format!("-- {inner}"),
         }
     }
 }

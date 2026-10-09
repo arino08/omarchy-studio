@@ -306,6 +306,11 @@ pub fn keybind(paths: &OmarchyPaths) -> Option<ConfigBind> {
     keybinds::find_marked(paths, BIND_DESC)
 }
 
+/// As [`keybind`], reading the dialect the caller's runner reports.
+pub fn keybind_for(paths: &OmarchyPaths, dialect: crate::omarchy::Dialect) -> Option<ConfigBind> {
+    keybinds::find_marked_for(paths, BIND_DESC, dialect)
+}
+
 /// Bind `mods+key` to launch Nice Launcher (replacing any previous bind),
 /// through the shared keybinds override block — sourced last, so it wins over
 /// the Omarchy default on the same chord (e.g. SUPER+SPACE's Walker). Reloads
@@ -421,19 +426,19 @@ mod tests {
         )
         .unwrap();
 
-        assert!(keybind(&paths).is_none());
+        assert!(keybind_for(&paths, crate::omarchy::Dialect::Hyprlang).is_none());
         let bind = install_keybind(&paths, "SUPER", "SPACE", "/x/nova", &store, &runner).unwrap();
         assert_eq!(
             bind.render_line(),
             "bindd = SUPER, SPACE, Nice Launcher, exec, /x/nova"
         );
 
-        let found = keybind(&paths).expect("bind installed");
+        let found = keybind_for(&paths, crate::omarchy::Dialect::Hyprlang).expect("bind installed");
         assert_eq!(found.arg, "/x/nova");
 
         // reinstall with a new chord replaces, not duplicates
         install_keybind(&paths, "SUPER SHIFT", "N", "/x/nova", &store, &runner).unwrap();
-        let binds: Vec<_> = keybinds::read_overrides(&paths);
+        let binds: Vec<_> = keybinds::read_overrides_for(&paths, crate::omarchy::Dialect::Hyprlang);
         let nova_binds = binds
             .iter()
             .filter(
@@ -441,10 +446,15 @@ mod tests {
             )
             .count();
         assert_eq!(nova_binds, 1);
-        assert_eq!(keybind(&paths).unwrap().key, "N");
+        assert_eq!(
+            keybind_for(&paths, crate::omarchy::Dialect::Hyprlang)
+                .unwrap()
+                .key,
+            "N"
+        );
 
         assert!(remove_keybind(&paths, &store, &runner).unwrap());
-        assert!(keybind(&paths).is_none());
+        assert!(keybind_for(&paths, crate::omarchy::Dialect::Hyprlang).is_none());
         assert!(!remove_keybind(&paths, &store, &runner).unwrap());
     }
 }
