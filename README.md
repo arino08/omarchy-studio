@@ -26,7 +26,7 @@ curl -sL https://raw.githubusercontent.com/arino08/omarchy-studio/main/install.s
 omarchy-studio
 ```
 
-> **Status: alpha, and honest about it.** Everything below is built, tested (477 tests, plus the TUI itself driven in a pty on every CI run) and drives the real Omarchy config on disk. v0.9.3 is the current release; the Omarchy 4 support described here is newer than it. Tested against Omarchy 3.8 and 4.0 "Quattro" / Hyprland 0.55 and 0.56 — Studio warns, but never refuses to run, on versions it hasn't seen. On Quattro it writes Hyprland's new Lua config; the bar, notification and OSD screens are unavailable there, because Omarchy 4 replaced Waybar, Mako and SwayOSD with the Quickshell shell.
+> **Status: alpha, and honest about it.** Everything below is built, tested (487 tests, plus the TUI itself driven in a pty on every CI run) and drives the real Omarchy config on disk. v0.9.3 is the current release; the Omarchy 4 support described here is newer than it. Tested against Omarchy 3.8 and 4.0 "Quattro" / Hyprland 0.55 and 0.56 — Studio warns, but never refuses to run, on versions it hasn't seen. On Quattro it writes Hyprland's new Lua config; the bar, notification and OSD screens are unavailable there, because Omarchy 4 replaced Waybar, Mako and SwayOSD with the Quickshell shell.
 
 ## Why
 

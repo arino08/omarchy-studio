@@ -50,6 +50,8 @@ Call forms in use, each verified against the running compositor rather than assu
 
 **Keybinds are the one lossy case.** In Lua mode `hyprctl binds` reports every bind's dispatcher as `__lua` — an opaque callback id — so a bind read from the runtime carries no reproducible action. To move an action onto another key, Studio finds the `o.bind(...)` that declared it in `$OMARCHY_PATH/default/hypr/bindings/*.lua` (or the user's `bindings.lua`) and re-emits that action argument verbatim. Chords Omarchy generates in a `for` loop have no literal to match; those refuse with an explanation rather than writing a bind that would do nothing.
 
+**The managed keybinds block is rewritten only if it reads back exactly.** Every keybind write re-renders the whole `omarchy-studio:keybinds` block in `bindings.lua` from what Studio read out of it, so the reader works on whole call statements (a `function() … end` action may span lines), and each `o.bind`/`hl.unbind` it reads must re-render to the same Lua tokens (`configfs::lua::same_tokens`). If any statement in the block fails that — an options table, a computed chord, a non-call statement, unbalanced parens — the write is refused naming `bindings.lua:<line>`, and the file is left untouched.
+
 **Layering model** (read-side): to attribute a setting/bind to its source, the engine reads the same file list Hyprland does, in order: `default/hypr/*.conf` (via the user `hyprland.conf` source list) → theme `hyprland.conf` → user files → toggles. Effective value = last write; each value carries `SourceRef { file, line, layer }`. Studio only ever *writes* to the user layer (or theme files it owns).
 
 ## 3. Waybar JSONC
