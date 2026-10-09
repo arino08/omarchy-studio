@@ -2429,9 +2429,23 @@ fn keybind_remove(paths: &OmarchyPaths, chord: &str) -> i32 {
     let count = before.len();
     let overrides = without_chord(before, mask, &key);
     let rendered = keybinds::render_chord(mask, &key);
+    let unreadable = keybinds::unreadable_overrides(paths);
     if overrides.len() == count {
-        println!("no Studio override on {rendered} — nothing to remove");
-        return 0;
+        if unreadable.is_empty() {
+            println!("no Studio override on {rendered} — nothing to remove");
+            return 0;
+        }
+        eprintln!(
+            "no Studio override on {rendered} that Studio can read. It can't read these \
+             lines of its keybinds block — if one is {rendered}, edit it by hand:\n{}",
+            unreadable.join("\n")
+        );
+        return 1;
+    }
+    if overrides.is_empty() {
+        for line in &unreadable {
+            eprintln!("also dropping a line Studio couldn't read: {line}");
+        }
     }
     keybind_write(
         paths,
@@ -2444,9 +2458,13 @@ fn keybind_remove(paths: &OmarchyPaths, chord: &str) -> i32 {
 fn keybind_reset(paths: &OmarchyPaths) -> i32 {
     use studio_core::modules::keybinds;
     let count = keybinds::read_overrides(paths).len();
-    if count == 0 {
+    let unreadable = keybinds::unreadable_overrides(paths);
+    if count == 0 && unreadable.is_empty() {
         println!("no Studio keybind overrides to reset");
         return 0;
+    }
+    for line in &unreadable {
+        eprintln!("also dropping a line Studio couldn't read: {line}");
     }
     keybind_write(paths, &[], &format!("reset {count} keybind override(s)"))
 }

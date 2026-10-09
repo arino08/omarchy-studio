@@ -586,7 +586,8 @@ pub fn write_overrides(paths: &OmarchyPaths, overrides: &[Override]) -> Result<s
 /// written: a partial block would quietly drop the change the user asked for,
 /// which is precisely the failure mode this port exists to remove. So is an
 /// existing block holding a statement Studio can't read back exactly (see
-/// `lua_block_problem`) — rewriting it would mangle that statement.
+/// `lua_block_problem`) — rewriting it would mangle that statement. Removing
+/// the whole block (an empty list) is never refused.
 pub fn write_overrides_for(
     paths: &OmarchyPaths,
     overrides: &[Override],
@@ -599,12 +600,12 @@ pub fn write_overrides_for(
         cmd: "keybinds".into(),
         detail,
     };
-    if dialect.is_lua() {
+    let body = override_body(overrides, dialect).map_err(refuse)?;
+    if dialect.is_lua() && body.is_some() {
         if let Some(why) = lua_block_problem(&path, &existing) {
             return Err(refuse(why));
         }
     }
-    let body = override_body(overrides, dialect).map_err(refuse)?;
     let updated = match body {
         Some(body) => block.upsert(&existing, &body),
         None => block.remove(&existing),
@@ -684,22 +685,31 @@ fn parse_lua_overrides(body: &str) -> (Vec<Override>, Vec<(usize, String)>) {
 }
 
 /// One `hl.unbind(…)` / `o.bind(…)` statement as an [`Override`] — but only
-/// if rendering that override reproduces the statement token for token.
-/// Anything else (an options table, a computed chord, a call Studio never
-/// writes) is `None`, never an approximation.
+/// if rendering that override reproduces the statement: the same chord (any
+/// spelling of it, e.g. `"SHIFT + SUPER + X"`), then the remaining arguments
+/// token for token. Anything else (an options table, a computed chord, a call
+/// Studio never writes) is `None`, never an approximation.
 fn lua_override(call: &crate::configfs::lua::Call) -> Option<Override> {
     use crate::configfs::lua;
     let faithful = |o: Override| {
         let rendered = o.render_lua().ok()?;
-        lua::same_tokens(&call.text, &rendered).then_some(o)
+        let back = lua::parse_call_statements(&rendered).ok()?.pop()?;
+        let same = back.callee == call.callee
+            && back.args.len() == call.args.len()
+            && back.args[1..]
+                .iter()
+                .zip(&call.args[1..])
+                .all(|(a, b)| lua::same_tokens(a, b));
+        same.then_some(o)
     };
+    let chord = |arg: &str| lua_chord(&lua::as_string_literal(arg)?);
     match (call.callee.as_str(), call.args.as_slice()) {
-        ("hl.unbind", [chord]) => {
-            let (modmask, key) = split_lua_chord(&lua::as_string_literal(chord)?);
+        ("hl.unbind", [c]) => {
+            let (modmask, key) = chord(c)?;
             faithful(Override::Disable { modmask, key })
         }
-        ("o.bind", [chord, desc, action]) => {
-            let (modmask, key) = split_lua_chord(&lua::as_string_literal(chord)?);
+        ("o.bind", [c, desc, action]) => {
+            let (modmask, key) = chord(c)?;
             let desc = lua::as_string_literal(desc)?;
             let set = |dispatcher: String, arg: String| {
                 Override::Set(ConfigBind {
@@ -714,9 +724,9 @@ fn lua_override(call: &crate::configfs::lua::Call) -> Option<Override> {
             // What the action *is* comes from its shape: a plain string
             // literal is a command; `hl.dsp.layout("…")` is the one core
             // dispatcher Studio maps by name; `function() hl.plugin.ns.method(…)
-            // end` is the plugin-dispatcher form [`ConfigBind::render_lua`]
-            // emits. Anything else — including a multi-line function — is kept
-            // as the verbatim expression, which always re-renders faithfully.
+            // end` (however it's laid out) is the plugin-dispatcher form
+            // [`ConfigBind::render_lua`] emits. Anything else is kept as the
+            // verbatim expression, which always re-renders faithfully.
             let structured = if let Some(cmd) = lua::as_string_literal(action) {
                 Some(("exec".to_string(), cmd))
             } else if let Some(inner) = action
@@ -741,19 +751,10 @@ fn lua_override(call: &crate::configfs::lua::Call) -> Option<Override> {
 /// would silently rewrite or drop those statements — the bug where a
 /// multi-line `function() … end` bind came back as invalid `function())`.
 fn lua_block_problem(path: &std::path::Path, content: &str) -> Option<String> {
-    let body = override_block_for(Dialect::Lua).extract(content)?;
-    let (_, problems) = parse_lua_overrides(body);
-    if problems.is_empty() {
+    let lines = lua_block_unreadable(path, content);
+    if lines.is_empty() {
         return None;
     }
-    // `extract` hands back a slice of `content`, so its offset gives the line
-    // the body starts on.
-    let offset = body.as_ptr() as usize - content.as_ptr() as usize;
-    let first_line = content[..offset].matches('\n').count();
-    let lines: Vec<String> = problems
-        .iter()
-        .map(|(line, source)| format!("{}:{}: {source}", path.display(), first_line + line))
-        .collect();
     Some(format!(
         "Studio can't read back every line of its keybinds block, so it won't rewrite \
          the block (that would change or drop them):\n{}\nFix or remove {} by hand, \
@@ -767,11 +768,61 @@ fn lua_block_problem(path: &std::path::Path, content: &str) -> Option<String> {
     ))
 }
 
+/// Each statement in the Lua keybinds block of `content` that Studio can't
+/// read back, as `path:line: source` (the file line, 1-based).
+fn lua_block_unreadable(path: &std::path::Path, content: &str) -> Vec<String> {
+    let Some(body) = override_block_for(Dialect::Lua).extract(content) else {
+        return Vec::new();
+    };
+    // `extract` hands back a slice of `content`, so its offset gives the line
+    // the body starts on.
+    let offset = body.as_ptr() as usize - content.as_ptr() as usize;
+    let first_line = content[..offset].matches('\n').count();
+    parse_lua_overrides(body)
+        .1
+        .iter()
+        .map(|(line, source)| format!("{}:{}: {source}", path.display(), first_line + line))
+        .collect()
+}
+
+/// Statements in Studio's keybinds block that [`read_overrides`] skipped
+/// because it couldn't read them back, as `bindings.lua:<line>: source`.
+/// Always empty on hyprlang.
+pub fn unreadable_overrides(paths: &OmarchyPaths) -> Vec<String> {
+    unreadable_overrides_for(paths, Dialect::probe(&crate::cmd::RealRunner))
+}
+
+/// As [`unreadable_overrides`], for a given dialect.
+pub fn unreadable_overrides_for(paths: &OmarchyPaths, dialect: Dialect) -> Vec<String> {
+    if !dialect.is_lua() {
+        return Vec::new();
+    }
+    let path = user_bindings_path_for(paths, dialect);
+    std::fs::read_to_string(&path)
+        .map(|content| lua_block_unreadable(&path, &content))
+        .unwrap_or_default()
+}
+
 /// `"SUPER + SHIFT + T"` → (mask, `T`).
 fn split_lua_chord(chord: &str) -> (u16, String) {
     let mut parts: Vec<&str> = chord.split('+').map(str::trim).collect();
     let key = parts.pop().unwrap_or_default().to_string();
     (mods_to_mask(&parts.join(" ")), key)
+}
+
+/// As [`split_lua_chord`], but `None` unless [`render_lua_chord`] writes the
+/// same chord back: every modifier is one Studio knows and renders, and there
+/// is a key.
+fn lua_chord(chord: &str) -> Option<(u16, String)> {
+    let (mask, key) = split_lua_chord(chord);
+    let known = chord
+        .split('+')
+        .rev()
+        .skip(1)
+        .flat_map(str::split_whitespace)
+        .all(|m| mods_to_mask(m) != 0);
+    let (back_mask, back_key) = split_lua_chord(&render_lua_chord(mask, &key));
+    (known && back_mask == mask && back_key == key && !key.is_empty()).then_some((mask, key))
 }
 
 /// The first quoted Lua string in `text`, unescaped.
@@ -812,11 +863,17 @@ fn lua_string_args(text: &str) -> Vec<String> {
 /// expression verbatim rather than guessing.
 fn parse_lua_plugin_call(expr: &str) -> Option<(String, String)> {
     let inner = expr
-        .strip_prefix("function() hl.plugin")?
-        .strip_suffix(" end")?
+        .strip_prefix("function")?
+        .trim_start()
+        .strip_prefix('(')?
+        .trim_start()
+        .strip_prefix(')')?
+        .trim_start()
+        .strip_prefix("hl.plugin")?
+        .strip_suffix("end")?
         .trim();
     let paren = inner.find('(')?;
-    let members = split_lua_members(&inner[..paren])?;
+    let members = split_lua_members(inner[..paren].trim_end())?;
     let [namespace, method] = <[String; 2]>::try_from(members).ok()?;
     let call_args = inner[paren..].strip_prefix('(')?.strip_suffix(')')?.trim();
     let arg = if call_args.is_empty() {
@@ -942,13 +999,14 @@ pub fn plan_overrides_for(
     // guard reject the write.
     let on_disk = std::fs::read_to_string(&path).ok();
     let existing = on_disk.clone().unwrap_or_default();
-    if dialect.is_lua() {
+    let body = override_body(overrides, dialect)?;
+    if dialect.is_lua() && body.is_some() {
         if let Some(why) = lua_block_problem(&path, &existing) {
             return Err(why);
         }
     }
     let block = override_block_for(dialect);
-    let updated = match override_body(overrides, dialect)? {
+    let updated = match body {
         Some(body) => block.upsert(&existing, &body),
         None => block.remove(&existing),
     };
@@ -1688,8 +1746,11 @@ mod lua_tests {
         let check = |step: &str| {
             let text = std::fs::read_to_string(&path).unwrap();
             assert!(
-                text.contains(OVERVIEW_BIND),
-                "{step}: the overview bind was not kept verbatim:\n{text}"
+                text.contains(
+                    "o.bind(\"SUPER + G\", \"Toggle overview\", \
+                     function() hl.plugin.scrolloverview.overview(\"toggle\") end)"
+                ),
+                "{step}: the overview bind was not kept:\n{text}"
             );
             assert!(!text.contains("function())"), "{step}: mangled:\n{text}");
             assert_valid_lua(&text);
@@ -1698,6 +1759,11 @@ mod lua_tests {
         // add
         let mut overrides = read_overrides_for(&paths, Dialect::Lua);
         assert_eq!(overrides.len(), 2, "both binds read back");
+        // Read as the plugin dispatcher it is, so the niri screen finds it.
+        assert!(matches!(
+            &overrides[0],
+            Override::Set(cb) if cb.dispatcher == "scrolloverview:overview" && cb.arg == "toggle"
+        ));
         overrides.push(Override::Set(exec_bind(mods::SUPER, "E", "Editor", "nvim")));
         write_overrides_for(&paths, &overrides, Dialect::Lua).unwrap();
         check("add");
@@ -1750,6 +1816,9 @@ mod lua_tests {
             "hl.config({ general = { gaps_in = 2 } })",
             // A function that never closes.
             "o.bind(\"SUPER + G\", \"Overview\", function()",
+            // A modifier Studio doesn't know, or can't write back.
+            "o.bind(\"SUPER + HYPER + X\", \"x\", \"y\")",
+            "hl.unbind(\"MOD2 + X\")",
         ];
         for (n, bad) in cases.iter().enumerate() {
             let paths = fake_paths(&format!("refuse-unreadable-{n}"));
@@ -1774,11 +1843,72 @@ mod lua_tests {
             );
             let err = plan_overrides_for(&paths, &add, Dialect::Lua).unwrap_err();
             assert!(err.contains(&want), "case {bad:?}: {err}");
-            // Clearing the block would drop the statement too.
-            assert!(write_overrides_for(&paths, &[], Dialect::Lua).is_err());
-
             assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+            // The skipped statement is reported to whoever asks.
+            let unreadable = unreadable_overrides_for(&paths, Dialect::Lua);
+            assert_eq!(unreadable.len(), 1, "case {bad:?}: {unreadable:?}");
+            assert!(
+                unreadable[0].starts_with(&want),
+                "case {bad:?}: {unreadable:?}"
+            );
+
+            // Removing the whole block mangles nothing, so it is never refused.
+            assert!(plan_overrides_for(&paths, &[], Dialect::Lua)
+                .unwrap()
+                .is_some());
+            write_overrides_for(&paths, &[], Dialect::Lua).unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                !overrides_installed_for(&paths, Dialect::Lua),
+                "case {bad:?}"
+            );
+            assert!(text.contains("o.bind(\"SUPER + RETURN\", \"Terminal\", \"alacritty\")"));
+            assert!(unreadable_overrides_for(&paths, Dialect::Lua).is_empty());
         }
+    }
+
+    /// A chord is the same chord however it's spelled: hand-written
+    /// equivalents read back, don't block writes, and come out canonical.
+    #[test]
+    fn equivalent_chord_spellings_read_back_and_are_rewritten_canonically() {
+        let paths = fake_paths("chord-spellings");
+        let path = bindings_with_block(
+            &paths,
+            "o.bind(\"SHIFT + SUPER + X\", \"Thing\", \"foo\")\n\
+             hl.unbind(\"super+y\")\n\
+             o.bind(\"MOD4 + CONTROL + Z\", \"Other\", \"bar\")",
+        );
+        assert!(unreadable_overrides_for(&paths, Dialect::Lua).is_empty());
+        let mut overrides = read_overrides_for(&paths, Dialect::Lua);
+        let chords: Vec<_> = overrides
+            .iter()
+            .map(|o| match o {
+                Override::Set(cb) => chord_id(cb.modmask, &cb.key),
+                Override::Disable { modmask, key } => chord_id(*modmask, key),
+            })
+            .collect();
+        assert_eq!(
+            chords,
+            [
+                chord_id(mods::SUPER | mods::SHIFT, "X"),
+                chord_id(mods::SUPER, "y"),
+                chord_id(mods::SUPER | mods::CTRL, "Z"),
+            ]
+        );
+
+        overrides.push(Override::Set(exec_bind(mods::SUPER, "E", "Editor", "nvim")));
+        write_overrides_for(&paths, &overrides, Dialect::Lua).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        for want in [
+            "o.bind(\"SUPER + SHIFT + X\", \"Thing\", \"foo\")",
+            "hl.unbind(\"SUPER + y\")",
+            "o.bind(\"SUPER + CTRL + Z\", \"Other\", \"bar\")",
+            "o.bind(\"SUPER + E\", \"Editor\", \"nvim\")",
+        ] {
+            assert!(text.contains(want), "missing {want}:\n{text}");
+        }
+        assert_valid_lua(&text);
     }
 
     /// Hyprlang has no such statements and keeps its old behaviour.
