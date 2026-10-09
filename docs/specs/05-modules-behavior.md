@@ -12,7 +12,8 @@ Covers PRD M3–M8. All writes go through the apply pipeline (spec 01 §3); all 
 
 ### 1.2 Write side
 
-- User binds live **only** in `~/.config/hypr/bindings.conf`. New binds append to the Studio-managed section; binds that already exist as loose user lines are edited in place (line CST).
+- User binds live **only** in the user's bindings file — `bindings.conf` on Omarchy ≤ 3, `bindings.lua` on 4 (spec 03 §2a). New binds append to the Studio-managed section; binds that already exist as loose hyprlang user lines are edited in place (line CST).
+- On Omarchy 4, `hyprctl binds` reports every dispatcher as `__lua`, so moving an existing action onto a new chord means recovering its declaration from the Lua sources; a chord Omarchy generates in a loop can't be recovered and is refused with an explanation rather than written as a dead bind.
 - **Override a default:** write `unbind = MODS, KEY` + new `bind = …` pair (tagged with a trailing `# omarchy-studio: overrides <default file>` comment for attribution round-trip). **Disable** = `unbind` only. **Reset** = remove our pair; the sourced default resurfaces on reload.
 - Conflict check is pure: `fn conflicts(chord, submap) -> Option<ExistingBind>` over the effective set; UI offers Override / Pick another / Cancel.
 - Apply plan: write → `hyprctl reload` → verify `configerrors` empty → rollback on failure with the offending line mapped to the row (FR3.6).
@@ -23,7 +24,7 @@ Crossterm kitty-keyboard-protocol (all three Omarchy terminals support it) repor
 
 ## 2. Look & Feel (M4, v0.3)
 
-Schema-driven form (`data/schemas/looknfeel.toml`): `general:gaps_in/out`, `border_size`, `col.active_border` (theme-linked toggle ↔ custom), `decoration:rounding`, `blur:{enabled,size,passes,noise}`, `shadow:*`, `dim_inactive`, `active/inactive_opacity`, `general:layout` + dwindle/master sub-opts. Every field: `live = HyprctlKeyword(...)`, `target = hypr_user(looknfeel.conf)`.
+Schema-driven form (`data/schemas/looknfeel.toml`): `general:gaps_in/out`, `border_size`, `col.active_border` (theme-linked toggle ↔ custom), `decoration:rounding`, `blur:{enabled,size,passes,noise}`, `shadow:*`, `dim_inactive`, `active/inactive_opacity`, `general:layout` + dwindle/master sub-opts. Every field: `live = HyprctlKeyword(...)`, `target = hypr_user(looknfeel.{conf,lua})`. On Omarchy 4 the effective value is read from `hyprctl -j --batch getoption` rather than parsed out of the defaults file, since those are Lua.
 
 - **Live loop:** change → `hyprctl keyword` immediately (batched at 60 ms); footer shows "● previewing — s save · esc revert". Save = pipeline (write file + `hyprctl reload` + verify). Esc/quit = `hyprctl reload` (file truth restores). Crash-safety: a `preview-active` marker file is written on first keyword; startup finds it stale → offers reload.
 - Theme-linked colors: writing a custom border color inserts into user looknfeel.conf (wins over theme's `$activeBorderColor`); "re-link to theme" removes our line.
@@ -46,7 +47,7 @@ border     = { on = true, speed = 5 }
 ```
 
 Ship 8 (PRD FR4.3): omarchy-default (extracted from `default/hypr/looknfeel.conf` verbatim), snappy, silky, minimal, zoomy, slide, off-performance, battery-saver. `omarchy-default` is special: "reset to stock".
-- **Try** = translate preset → `hyprctl --batch keyword animation …,bezier …` (no write). **Apply** = render into the managed section of user `looknfeel.conf` (beziers first, then animation lines) via the pipeline.
+- **Try** = translate preset → `hyprctl --batch keyword animation …,bezier …` (no write). **Apply** = render into the managed section of the user's look & feel file via the pipeline — beziers then animation lines on hyprlang, `hl.curve` then `hl.animation` calls on Lua. Presets are defined structurally and rendered per dialect, so there is one definition rather than two.
 - **Bezier editor (FR4.4):** braille-canvas curve plot (ratatui Canvas), handles nudged with hjkl/arrows, animated dot preview along the curve, save as personal preset. Behind `--features bezier-editor` until v0.3 polish.
 
 ## 4. Waybar (M5, v0.4)

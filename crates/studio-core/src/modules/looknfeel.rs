@@ -11,10 +11,12 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use crate::cmd::{CommandRunner, RealRunner};
 use crate::configfs::hyprlang::HyprDoc;
-use crate::configfs::{atomic_write, CommentStyle, ManagedBlock};
+use crate::configfs::lua;
+use crate::configfs::{atomic_write, ManagedBlock};
 use crate::error::{Result, StudioError};
-use crate::omarchy::OmarchyPaths;
+use crate::omarchy::{Dialect, OmarchyPaths};
 
 /// The kind of a setting's value — drives validation and the editor widget.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -35,14 +37,21 @@ pub enum Target {
 }
 
 impl Target {
-    /// The user file this target writes to.
-    fn user_file(&self) -> &'static str {
+    /// The stem of the user file this target writes to; the extension comes
+    /// from the dialect (`looknfeel.conf` on Omarchy ≤ 3, `looknfeel.lua` on 4).
+    fn stem(&self) -> &'static str {
         match self {
-            Target::Looknfeel => "looknfeel.conf",
-            Target::Input => "input.conf",
+            Target::Looknfeel => "looknfeel",
+            Target::Input => "input",
         }
     }
-    /// The Omarchy default file to read base values from.
+    /// The user file this target writes to, for the given dialect.
+    fn user_file(&self, dialect: Dialect) -> String {
+        format!("{}.{}", self.stem(), dialect.ext())
+    }
+    /// The Omarchy default file to read base values from. Only meaningful for
+    /// hyprlang: the Lua defaults are code, and are read back through
+    /// `hyprctl getoption` instead of parsed.
     fn default_file(&self) -> &'static str {
         match self {
             Target::Looknfeel => "default/hypr/looknfeel.conf",
@@ -801,14 +810,17 @@ pub struct LookFeel {
     base: BTreeMap<String, String>,
     /// Studio's overrides, written to the managed block. Dotted key → value.
     overrides: BTreeMap<String, String>,
+    /// Which dialect this machine's Hyprland reads — decides the file we write,
+    /// the comment style of the block, and how its body is rendered.
+    dialect: Dialect,
 }
 
-fn block(target: Target) -> ManagedBlock {
-    ManagedBlock::new(target.block_name(), CommentStyle::Hash)
+fn block(target: Target, dialect: Dialect) -> ManagedBlock {
+    ManagedBlock::new(target.block_name(), dialect.comment_style())
 }
 
-fn user_path(paths: &OmarchyPaths, target: Target) -> PathBuf {
-    paths.hypr_config().join(target.user_file())
+fn user_path(paths: &OmarchyPaths, target: Target, dialect: Dialect) -> PathBuf {
+    paths.hypr_config().join(target.user_file(dialect))
 }
 
 fn default_path(paths: &OmarchyPaths, target: Target) -> PathBuf {
@@ -816,37 +828,90 @@ fn default_path(paths: &OmarchyPaths, target: Target) -> PathBuf {
 }
 
 impl LookFeel {
+    /// Load using the real command runner (probes the dialect, and on Omarchy 4
+    /// reads effective values from the compositor).
     pub fn load(paths: &OmarchyPaths) -> Self {
+        Self::load_with(paths, &RealRunner)
+    }
+
+    /// Load with an explicit runner, so tests can pin the dialect and the
+    /// effective values instead of depending on the host's compositor.
+    pub fn load_with(paths: &OmarchyPaths, runner: &dyn CommandRunner) -> Self {
+        let dialect = Dialect::probe(runner);
         let mut base = BTreeMap::new();
         let mut overrides = BTreeMap::new();
 
-        for &target in TARGETS {
-            // Base: the Omarchy default file overlaid by the user's own file,
-            // with our managed block stripped so we read the user's values not
-            // ours. A key can appear in either file (e.g. `misc` lives in both).
-            for path in [default_path(paths, target), user_path(paths, target)] {
-                if let Ok(text) = std::fs::read_to_string(&path) {
-                    let cleaned = block(target).remove(&text);
-                    let doc = HyprDoc::parse(&cleaned);
-                    for setting in SETTINGS {
-                        if let Some(v) = doc.get(setting.key) {
-                            base.insert(setting.key.to_string(), strip_inline_comment(&v));
-                        }
-                    }
-                }
-            }
-            // Overrides: whatever is in this target's managed block already.
-            if let Ok(text) = std::fs::read_to_string(user_path(paths, target)) {
-                if let Some(body) = block(target).extract(&text) {
-                    let doc = HyprDoc::parse(body);
-                    for e in doc.entries() {
-                        overrides.insert(e.dotted(), e.value);
+        // Base values. On Lua the config is code, so rather than parse it we ask
+        // the compositor for the values it actually resolved — authoritative,
+        // and one exec for the whole schema.
+        if dialect.is_lua() {
+            let names: Vec<String> = SETTINGS.iter().map(|s| colon_key(s.key)).collect();
+            if let Ok(out) = runner.run(&crate::omarchy::cmds::hypr_getoptions(&names)) {
+                if out.ok() {
+                    for (colon, value) in crate::omarchy::parse_getoptions(&out.stdout) {
+                        base.insert(colon.replace(':', "."), value);
                     }
                 }
             }
         }
 
-        Self { base, overrides }
+        for &target in TARGETS {
+            // Base (hyprlang): the Omarchy default file overlaid by the user's
+            // own file, with our managed block stripped so we read the user's
+            // values not ours. A key can appear in either file (e.g. `misc`).
+            if !dialect.is_lua() {
+                for path in [
+                    default_path(paths, target),
+                    user_path(paths, target, dialect),
+                ] {
+                    if let Ok(text) = std::fs::read_to_string(&path) {
+                        let cleaned = block(target, dialect).remove(&text);
+                        let doc = HyprDoc::parse(&cleaned);
+                        for setting in SETTINGS {
+                            if let Some(v) = doc.get(setting.key) {
+                                base.insert(setting.key.to_string(), strip_inline_comment(&v));
+                            }
+                        }
+                    }
+                }
+            }
+            // Overrides: whatever is in this target's managed block already.
+            if let Ok(text) = std::fs::read_to_string(user_path(paths, target, dialect)) {
+                if let Some(body) = block(target, dialect).extract(&text) {
+                    if dialect.is_lua() {
+                        for (key, value) in lua::parse_config_call(body) {
+                            overrides.insert(key, value);
+                        }
+                    } else {
+                        let doc = HyprDoc::parse(body);
+                        for e in doc.entries() {
+                            overrides.insert(e.dotted(), e.value);
+                        }
+                    }
+                }
+            }
+        }
+
+        // On Lua the base came from the live compositor, which already has our
+        // block applied — so a key we override reads back as its override and
+        // would look like the base too. Drop those, leaving base meaning
+        // "what it would be without Studio" as it does on hyprlang.
+        if dialect.is_lua() {
+            for key in overrides.keys() {
+                base.remove(key);
+            }
+        }
+
+        Self {
+            base,
+            overrides,
+            dialect,
+        }
+    }
+
+    /// The dialect this model was loaded for.
+    pub fn dialect(&self) -> Dialect {
+        self.dialect
     }
 
     /// The effective value shown to the user: override, else base, else the
@@ -931,15 +996,28 @@ impl LookFeel {
     /// the overrides whose settings belong to that target. Returns None when
     /// this target has no overrides (its block should be removed).
     pub fn render_block_body(&self, target: Target) -> Option<String> {
-        let entries: Vec<(Vec<String>, String)> = self
+        let mine: Vec<(&String, &String)> = self
             .overrides
             .iter()
             .filter(|(k, _)| lookup(k).map(|s| s.target) == Some(target))
-            .map(|(k, v)| (k.split('.').map(str::to_string).collect(), v.clone()))
             .collect();
-        if entries.is_empty() {
+        if mine.is_empty() {
             return None;
         }
+        if self.dialect.is_lua() {
+            let entries: Vec<(String, lua::Value)> = mine
+                .iter()
+                .map(|(k, v)| ((*k).clone(), lua_value(k, v)))
+                .collect();
+            return Some(format!(
+                "-- Managed by Omarchy Studio — your look & feel tweaks.\n{}",
+                lua::config_call(&entries)
+            ));
+        }
+        let entries: Vec<(Vec<String>, String)> = mine
+            .iter()
+            .map(|(k, v)| (k.split('.').map(str::to_string).collect(), (*v).clone()))
+            .collect();
         let mut out = String::from("# Managed by Omarchy Studio — your look & feel tweaks.\n");
         render_nested(&entries, 0, &mut out);
         Some(out.trim_end().to_string())
@@ -947,8 +1025,16 @@ impl LookFeel {
 
     /// The user files Studio may write for these settings — snapshot these
     /// before applying so undo restores every touched file.
-    pub fn managed_paths(paths: &OmarchyPaths) -> Vec<PathBuf> {
-        TARGETS.iter().map(|&t| user_path(paths, t)).collect()
+    pub fn managed_paths(paths: &OmarchyPaths, dialect: Dialect) -> Vec<PathBuf> {
+        TARGETS
+            .iter()
+            .map(|&t| user_path(paths, t, dialect))
+            .collect()
+    }
+
+    /// The files *this* model writes.
+    pub fn my_managed_paths(&self, paths: &OmarchyPaths) -> Vec<PathBuf> {
+        Self::managed_paths(paths, self.dialect)
     }
 
     /// Persist each target's managed block (a target with no overrides has its
@@ -956,11 +1042,11 @@ impl LookFeel {
     pub fn save(&self, paths: &OmarchyPaths) -> Result<Vec<PathBuf>> {
         let mut written = Vec::new();
         for &target in TARGETS {
-            let path = user_path(paths, target);
+            let path = user_path(paths, target, self.dialect);
             let existing = std::fs::read_to_string(&path).unwrap_or_default();
             let updated = match self.render_block_body(target) {
-                Some(body) => block(target).upsert(&existing, &body),
-                None => block(target).remove(&existing),
+                Some(body) => block(target, self.dialect).upsert(&existing, &body),
+                None => block(target, self.dialect).remove(&existing),
             };
             if updated != existing {
                 atomic_write(&path, &updated)?;
@@ -976,15 +1062,15 @@ impl LookFeel {
     pub fn plan(&self, paths: &OmarchyPaths) -> Vec<crate::engine::FileEdit> {
         let mut edits = Vec::new();
         for &target in TARGETS {
-            let path = user_path(paths, target);
+            let path = user_path(paths, target, self.dialect);
             // `None` for a file that doesn't exist yet — the pipeline's hash
             // guard reads the same way, and treating a missing file as empty
             // here would make the guard reject the write.
             let on_disk = std::fs::read_to_string(&path).ok();
             let existing = on_disk.clone().unwrap_or_default();
             let updated = match self.render_block_body(target) {
-                Some(body) => block(target).upsert(&existing, &body),
-                None => block(target).remove(&existing),
+                Some(body) => block(target, self.dialect).upsert(&existing, &body),
+                None => block(target, self.dialect).remove(&existing),
             };
             if updated != existing {
                 edits.push(crate::engine::FileEdit::new(
@@ -1036,6 +1122,17 @@ fn strip_inline_comment(v: &str) -> String {
 
 /// Hyprland's colon form of a dotted key: `decoration.blur.size` →
 /// `decoration:blur:size` (what `hyprctl keyword` expects).
+/// The Lua literal for an override, typed by the setting's declared [`Kind`]
+/// so numbers and bools emit bare and everything else quotes.
+fn lua_value(key: &str, raw: &str) -> lua::Value {
+    match lookup(key).map(|s| s.kind) {
+        Some(Kind::Int { .. }) => lua::Value::int_or_str(raw),
+        Some(Kind::Float { .. }) => lua::Value::float_or_str(raw),
+        Some(Kind::Bool) => lua::Value::bool_or_str(raw),
+        _ => lua::Value::Str(raw.to_string()),
+    }
+}
+
 pub fn colon_key(dotted: &str) -> String {
     dotted.replace('.', ":")
 }
@@ -1071,6 +1168,7 @@ fn render_nested(entries: &[(Vec<String>, String)], depth: usize, out: &mut Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::StubRunner;
 
     #[test]
     fn schema_is_coherent() {
@@ -1143,12 +1241,12 @@ mod tests {
         .unwrap();
         // user's own file bumps border_size; no Studio block yet
         std::fs::write(
-            user_path(&paths, Target::Looknfeel),
+            user_path(&paths, Target::Looknfeel, Dialect::Hyprlang),
             "general {\n    border_size = 4\n}\n",
         )
         .unwrap();
 
-        let mut lf = LookFeel::load(&paths);
+        let mut lf = LookFeel::load_with(&paths, &StubRunner::default());
         assert_eq!(lf.value("general.gaps_in"), "5"); // from default
         assert_eq!(lf.value("general.border_size"), "4"); // user overrides default
         assert_eq!(lf.value("decoration.rounding"), "0"); // schema default (absent)
@@ -1159,19 +1257,23 @@ mod tests {
         assert!(lf.set("general.gaps_in", "999").is_err()); // out of range, unchanged
         lf.save(&paths).unwrap();
 
-        let reloaded = LookFeel::load(&paths);
+        let reloaded = LookFeel::load_with(&paths, &StubRunner::default());
         assert_eq!(reloaded.value("general.gaps_in"), "12");
         assert!(reloaded.is_overridden("general.gaps_in"));
         assert_eq!(reloaded.value("general.border_size"), "4"); // user's own preserved
-        let on_disk = std::fs::read_to_string(user_path(&paths, Target::Looknfeel)).unwrap();
+        let on_disk =
+            std::fs::read_to_string(user_path(&paths, Target::Looknfeel, Dialect::Hyprlang))
+                .unwrap();
         assert!(on_disk.contains("border_size = 4")); // untouched
         assert!(on_disk.contains("omarchy-studio:looknfeel"));
 
         // clearing all overrides removes the block, restoring the user's file
-        let mut r2 = LookFeel::load(&paths);
+        let mut r2 = LookFeel::load_with(&paths, &StubRunner::default());
         r2.clear("general.gaps_in");
         r2.save(&paths).unwrap();
-        let after = std::fs::read_to_string(user_path(&paths, Target::Looknfeel)).unwrap();
+        let after =
+            std::fs::read_to_string(user_path(&paths, Target::Looknfeel, Dialect::Hyprlang))
+                .unwrap();
         assert!(!after.contains("omarchy-studio:looknfeel"));
         assert!(after.contains("border_size = 4"));
     }
@@ -1191,7 +1293,7 @@ mod tests {
             "input {\n    sensitivity = 0 # -1.0 - 1.0, 0 means no modification.\n}\n",
         )
         .unwrap();
-        let lf = LookFeel::load(&paths);
+        let lf = LookFeel::load_with(&paths, &StubRunner::default());
         assert_eq!(lf.value("input.sensitivity"), "0");
     }
 
@@ -1199,15 +1301,18 @@ mod tests {
     fn input_settings_write_to_input_conf() {
         let paths = fake_paths("targets");
         // an input override and a looknfeel override
-        let mut lf = LookFeel::load(&paths);
+        let mut lf = LookFeel::load_with(&paths, &StubRunner::default());
         lf.set("input.repeat_rate", "35").unwrap();
         lf.set("input.touchpad.tap-to-click", "false").unwrap();
         lf.set("general.gaps_in", "9").unwrap();
         let written = lf.save(&paths).unwrap();
         assert_eq!(written.len(), 2); // both files touched
 
-        let input_conf = std::fs::read_to_string(user_path(&paths, Target::Input)).unwrap();
-        let lnf_conf = std::fs::read_to_string(user_path(&paths, Target::Looknfeel)).unwrap();
+        let input_conf =
+            std::fs::read_to_string(user_path(&paths, Target::Input, Dialect::Hyprlang)).unwrap();
+        let lnf_conf =
+            std::fs::read_to_string(user_path(&paths, Target::Looknfeel, Dialect::Hyprlang))
+                .unwrap();
         // input keys land in input.conf, not looknfeel.conf
         assert!(input_conf.contains("omarchy-studio:input"));
         assert!(input_conf.contains("repeat_rate = 35"));
@@ -1218,7 +1323,7 @@ mod tests {
         assert!(!lnf_conf.contains("repeat_rate"));
 
         // round-trips back from the split files, including the hyphenated key
-        let reloaded = LookFeel::load(&paths);
+        let reloaded = LookFeel::load_with(&paths, &StubRunner::default());
         assert_eq!(reloaded.value("input.repeat_rate"), "35");
         assert_eq!(reloaded.value("input.touchpad.tap-to-click"), "false");
         assert_eq!(reloaded.value("general.gaps_in"), "9");
@@ -1229,9 +1334,12 @@ mod tests {
         r.clear("input.repeat_rate");
         r.clear("input.touchpad.tap-to-click");
         r.save(&paths).unwrap();
-        let input_after = std::fs::read_to_string(user_path(&paths, Target::Input)).unwrap();
+        let input_after =
+            std::fs::read_to_string(user_path(&paths, Target::Input, Dialect::Hyprlang)).unwrap();
         assert!(!input_after.contains("omarchy-studio:input"));
-        let lnf_after = std::fs::read_to_string(user_path(&paths, Target::Looknfeel)).unwrap();
+        let lnf_after =
+            std::fs::read_to_string(user_path(&paths, Target::Looknfeel, Dialect::Hyprlang))
+                .unwrap();
         assert!(lnf_after.contains("gaps_in = 9"));
     }
 
@@ -1250,8 +1358,8 @@ mod tests {
         }
         // applying replaces overrides wholesale
         let paths = fake_paths("preset");
-        std::fs::write(user_path(&paths, Target::Looknfeel), "").unwrap();
-        let mut lf = LookFeel::load(&paths);
+        std::fs::write(user_path(&paths, Target::Looknfeel, Dialect::Hyprlang), "").unwrap();
+        let mut lf = LookFeel::load_with(&paths, &StubRunner::default());
         lf.set("general.gaps_in", "40").unwrap();
         lf.apply_preset(preset("Minimal").unwrap());
         assert_eq!(lf.value("general.gaps_in"), "0"); // preset wins, old override gone
@@ -1300,5 +1408,159 @@ mod tests {
         let doc = HyprDoc::parse(&out);
         assert_eq!(doc.get("decoration.blur.size").as_deref(), Some("4"));
         assert_eq!(doc.get("general.gaps_in").as_deref(), Some("8"));
+    }
+}
+
+/// Omarchy 4: the same model, writing Lua instead of hyprlang.
+#[cfg(test)]
+mod lua_tests {
+    use super::*;
+    use crate::cmd::StubRunner;
+
+    fn fake_paths(tag: &str) -> OmarchyPaths {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "omarchy-studio-lnf-lua-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join(".config/hypr")).unwrap();
+        std::fs::create_dir_all(root.join("share/omarchy/default/hypr")).unwrap();
+        OmarchyPaths {
+            system: root.join("share/omarchy"),
+            config: root.join(".config/omarchy"),
+            state: root.join(".local/state/omarchy"),
+        }
+    }
+
+    /// A compositor reporting Lua, with effective values for the few keys the
+    /// tests below read.
+    fn quattro_runner() -> StubRunner {
+        // The module asks for every schema key in one batch; script that exact
+        // command so the stub stays honest if the schema grows.
+        let names: Vec<String> = SETTINGS.iter().map(|s| colon_key(s.key)).collect();
+        let batch = crate::omarchy::cmds::hypr_getoptions(&names).display();
+        StubRunner::default()
+            .with_ok(
+                "hyprctl systeminfo",
+                "Hyprland 0.56.2\nconfigProvider: lua\n",
+            )
+            .with_ok(
+                batch,
+                concat!(
+                    "{\"option\": \"general:gaps_in\", \"css\": \"5 5 5 5\", \"set\": true }\n\n",
+                    "{\"option\": \"general:border_size\", \"int\": 2, \"set\": true }\n\n",
+                    "{\"option\": \"decoration:rounding\", \"int\": 0, \"set\": true }\n"
+                ),
+            )
+    }
+
+    #[test]
+    fn writes_a_lua_block_to_the_lua_file() {
+        let paths = fake_paths("write");
+        let mut lf = LookFeel::load_with(&paths, &quattro_runner());
+        assert!(lf.dialect().is_lua());
+
+        lf.set("general.gaps_in", "8").unwrap();
+        lf.set("general.layout", "scrolling").unwrap();
+        lf.set("decoration.rounding", "6").unwrap();
+        let written = lf.save(&paths).unwrap();
+
+        let lua_file = paths.hypr_config().join("looknfeel.lua");
+        assert!(written.contains(&lua_file), "must write looknfeel.lua");
+        assert!(
+            !paths.hypr_config().join("looknfeel.conf").exists(),
+            "must not write the dead .conf file"
+        );
+
+        let text = std::fs::read_to_string(&lua_file).unwrap();
+        assert!(
+            text.contains("-- >>> omarchy-studio:looknfeel"),
+            "lua comment markers"
+        );
+        assert!(text.contains("hl.config({"));
+        assert!(text.contains("gaps_in = 8"));
+        assert!(text.contains("rounding = 6"));
+        // Strings quote, numbers don't.
+        assert!(text.contains("layout = \"scrolling\""));
+    }
+
+    #[test]
+    fn reloads_its_own_overrides_from_the_lua_block() {
+        let paths = fake_paths("reload");
+        let mut lf = LookFeel::load_with(&paths, &quattro_runner());
+        lf.set("general.gaps_in", "8").unwrap();
+        lf.set("general.layout", "scrolling").unwrap();
+        lf.set("general.resize_on_border", "true").unwrap();
+        lf.save(&paths).unwrap();
+
+        let again = LookFeel::load_with(&paths, &quattro_runner());
+        assert_eq!(again.value("general.gaps_in"), "8");
+        assert_eq!(again.value("general.layout"), "scrolling");
+        assert_eq!(again.value("general.resize_on_border"), "true");
+        assert!(again.is_overridden("general.gaps_in"));
+        // Untouched keys fall back to the compositor's effective value.
+        assert_eq!(again.value("general.border_size"), "2");
+        assert!(!again.is_overridden("general.border_size"));
+    }
+
+    #[test]
+    fn clearing_an_override_removes_the_block_and_leaves_the_users_lua() {
+        let paths = fake_paths("clear");
+        let lua_file = paths.hypr_config().join("looknfeel.lua");
+        let users_own =
+            "-- my own tweaks\nhl.config({\n  general = {\n    gaps_out = 12,\n  },\n})\n";
+        std::fs::write(&lua_file, users_own).unwrap();
+
+        let mut lf = LookFeel::load_with(&paths, &quattro_runner());
+        lf.set("general.gaps_in", "8").unwrap();
+        lf.save(&paths).unwrap();
+        assert!(std::fs::read_to_string(&lua_file)
+            .unwrap()
+            .contains("gaps_in = 8"));
+
+        let mut lf = LookFeel::load_with(&paths, &quattro_runner());
+        lf.clear_all();
+        lf.save(&paths).unwrap();
+
+        let back = std::fs::read_to_string(&lua_file).unwrap();
+        assert_eq!(back, users_own, "the user's own Lua survives byte-for-byte");
+    }
+
+    #[test]
+    fn rewriting_an_unchanged_block_is_a_no_op() {
+        let paths = fake_paths("stable");
+        let mut lf = LookFeel::load_with(&paths, &quattro_runner());
+        lf.set("general.gaps_in", "8").unwrap();
+        lf.set("decoration.rounding", "6").unwrap();
+        lf.save(&paths).unwrap();
+        let first = std::fs::read_to_string(paths.hypr_config().join("looknfeel.lua")).unwrap();
+
+        let again = LookFeel::load_with(&paths, &quattro_runner());
+        assert!(again.save(&paths).unwrap().is_empty(), "nothing to rewrite");
+        let second = std::fs::read_to_string(paths.hypr_config().join("looknfeel.lua")).unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn input_settings_go_to_input_lua_not_looknfeel_lua() {
+        let paths = fake_paths("split");
+        let mut lf = LookFeel::load_with(&paths, &quattro_runner());
+        let input_key = SETTINGS
+            .iter()
+            .find(|s| s.target == Target::Input)
+            .expect("schema has an input setting")
+            .key;
+        lf.set("general.gaps_in", "8").unwrap();
+        lf.set(input_key, lf.value(input_key).as_str()).unwrap();
+        lf.save(&paths).unwrap();
+
+        let lnf = std::fs::read_to_string(paths.hypr_config().join("looknfeel.lua")).unwrap();
+        let input = std::fs::read_to_string(paths.hypr_config().join("input.lua")).unwrap();
+        assert!(lnf.contains("gaps_in = 8"));
+        assert!(!lnf.contains("omarchy-studio:input"));
+        assert!(input.contains("-- >>> omarchy-studio:input"));
     }
 }

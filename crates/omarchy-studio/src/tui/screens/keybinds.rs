@@ -41,6 +41,9 @@ pub struct KeybindsScreen {
     error: Option<String>,
     /// True while waiting for the user to press a new chord.
     capturing: bool,
+    /// Kept so a rebind can look up what the old chord actually does — on
+    /// Omarchy 4 that only lives in the Lua sources, not in `hyprctl binds`.
+    paths: OmarchyPaths,
 }
 
 impl KeybindsScreen {
@@ -63,6 +66,7 @@ impl KeybindsScreen {
             scroll: 0,
             error,
             capturing: false,
+            paths: paths.clone(),
         }
     }
 
@@ -126,16 +130,31 @@ impl KeybindsScreen {
         // Rebind = move this action to the new chord: cancel the old chord and
         // bind the new one to the same action.
         let (old_mask, old_key) = (b.runtime.modmask, b.runtime.key.clone());
-        let new = ConfigBind {
-            flags: "bind".into(),
-            modmask: mask,
-            key: new_key.clone(),
-            description: b.source.as_ref().and_then(|s| s.config.description.clone()),
-            dispatcher: b.runtime.dispatcher.clone(),
-            arg: b.runtime.arg.clone(),
+        // On Omarchy 4 the runtime tells us nothing about what a key does (every
+        // dispatcher reads `__lua`), so recover the action from the Lua source
+        // that declared this chord and carry it over verbatim.
+        let sourced = (b.runtime.dispatcher
+            == studio_core::modules::keybinds::LUA_OPAQUE_DISPATCHER)
+            .then(|| {
+                studio_core::modules::keybinds::resolve_lua_action(&self.paths, old_mask, &old_key)
+            })
+            .flatten();
+        let new = match &sourced {
+            Some(found) => studio_core::modules::keybinds::rebind_sourced(found, mask, &new_key),
+            None => ConfigBind {
+                flags: "bind".into(),
+                modmask: mask,
+                key: new_key.clone(),
+                description: b.source.as_ref().and_then(|s| s.config.description.clone()),
+                dispatcher: b.runtime.dispatcher.clone(),
+                arg: b.runtime.arg.clone(),
+            },
         };
         let new_chord = studio_core::modules::keybinds::render_chord(mask, &new_key);
-        let action = label_for(&b.runtime.dispatcher).to_string();
+        let action = match &sourced {
+            Some(found) => found.description.clone(),
+            None => label_for(&b.runtime.dispatcher).to_string(),
+        };
         self.push_disable(old_mask, &old_key);
         self.overrides.push(Override::Set(new));
         KeybindAction::Commit(format!("{action} → {new_chord}"))
@@ -218,14 +237,35 @@ impl KeybindsScreen {
         }
     }
 
+    /// What a bind *does*, in human terms.
+    ///
+    /// Omarchy 4 reports every dispatcher as `__lua`, so the dispatcher name is
+    /// useless there — but Hyprland still carries the description Omarchy gave
+    /// the bind, which reads better than a dispatcher name anyway. Order:
+    /// the parsed source's description, the runtime's, then the dispatcher.
+    fn action_label(b: &AttributedBind) -> String {
+        b.source
+            .as_ref()
+            .and_then(|s| s.config.description.clone())
+            .or_else(|| {
+                let d = b.runtime.description.trim();
+                (!d.is_empty()).then(|| d.to_string())
+            })
+            .unwrap_or_else(|| {
+                // A Lua bind with no description of its own: `__lua` is an
+                // internal token, not something to show a user.
+                if b.runtime.dispatcher == studio_core::modules::keybinds::LUA_OPAQUE_DISPATCHER {
+                    "(defined in Lua)".to_string()
+                } else {
+                    label_for(&b.runtime.dispatcher).to_string()
+                }
+            })
+    }
+
     fn row<'a>(&self, i: usize, b: &'a AttributedBind, skin: &Skin) -> ListItem<'a> {
         let selected = i == self.selected;
         let chord = b.runtime.chord();
-        let action = b
-            .source
-            .as_ref()
-            .and_then(|s| s.config.description.clone())
-            .unwrap_or_else(|| label_for(&b.runtime.dispatcher).to_string());
+        let action = Self::action_label(b);
         let tag = source_tag(b);
         let base = if selected {
             skin.selection()
@@ -242,15 +282,29 @@ impl KeybindsScreen {
 
     fn render_footer(&self, f: &mut Frame, area: Rect, skin: &Skin) {
         let detail = if let Some(b) = self.selected_bind() {
-            let cat = lookup(&b.runtime.dispatcher)
-                .map(|d| d.category.label())
-                .unwrap_or("Other");
-            let arg = if b.runtime.arg.is_empty() {
-                String::new()
+            // On Omarchy 4 the dispatcher and its arg are an internal callback
+            // id, so showing them would be noise; name where the bind came from
+            // instead, which is the useful half.
+            if b.runtime.dispatcher == studio_core::modules::keybinds::LUA_OPAQUE_DISPATCHER {
+                match studio_core::modules::keybinds::resolve_lua_action(
+                    &self.paths,
+                    b.runtime.modmask,
+                    &b.runtime.key,
+                ) {
+                    Some(found) => format!("{} · {}", Self::action_label(b), found.action),
+                    None => Self::action_label(b),
+                }
             } else {
-                format!("  ({})", b.runtime.arg)
-            };
-            format!("{cat} · {}{arg}", b.runtime.dispatcher)
+                let cat = lookup(&b.runtime.dispatcher)
+                    .map(|d| d.category.label())
+                    .unwrap_or("Other");
+                let arg = if b.runtime.arg.is_empty() {
+                    String::new()
+                } else {
+                    format!("  ({})", b.runtime.arg)
+                };
+                format!("{cat} · {}{arg}", b.runtime.dispatcher)
+            }
         } else {
             "No binds loaded".into()
         };
@@ -267,7 +321,7 @@ impl KeybindsScreen {
         f.render_widget(ratatui::widgets::Clear, rect);
         let action = self
             .selected_bind()
-            .map(|b| label_for(&b.runtime.dispatcher).to_string())
+            .map(Self::action_label)
             .unwrap_or_default();
         let block = Block::default()
             .borders(Borders::ALL)
@@ -302,5 +356,53 @@ fn friendly(e: &studio_core::StudioError) -> String {
             format!("{detail}\n\nOpen this screen from inside a running Hyprland session and make sure hyprctl is on your PATH.")
         }
         other => format!("{other:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use studio_core::modules::keybinds::{RuntimeBind, LUA_OPAQUE_DISPATCHER};
+
+    fn bind(dispatcher: &str, description: &str) -> AttributedBind {
+        AttributedBind {
+            runtime: RuntimeBind {
+                modmask: 64,
+                key: "W".into(),
+                keycode: 0,
+                dispatcher: dispatcher.into(),
+                arg: String::new(),
+                submap: String::new(),
+                description: description.into(),
+                locked: false,
+                release: false,
+                repeat: false,
+            },
+            source: None,
+        }
+    }
+
+    /// On Omarchy 4 every dispatcher reads `__lua`, so the row has to fall back
+    /// to the description Hyprland still carries — showing the raw token was
+    /// the bug.
+    #[test]
+    fn a_lua_bind_shows_its_description_not_the_internal_token() {
+        let b = bind(LUA_OPAQUE_DISPATCHER, "Close window");
+        assert_eq!(KeybindsScreen::action_label(&b), "Close window");
+    }
+
+    #[test]
+    fn a_lua_bind_without_a_description_still_never_shows_the_token() {
+        let b = bind(LUA_OPAQUE_DISPATCHER, "");
+        let label = KeybindsScreen::action_label(&b);
+        assert!(!label.contains("__lua"), "leaked the token: {label}");
+        assert_eq!(label, "(defined in Lua)");
+    }
+
+    /// On hyprlang the dispatcher is meaningful and still names the action.
+    #[test]
+    fn a_hyprlang_bind_still_uses_its_dispatcher_label() {
+        let b = bind("killactive", "");
+        assert_eq!(KeybindsScreen::action_label(&b), label_for("killactive"));
     }
 }

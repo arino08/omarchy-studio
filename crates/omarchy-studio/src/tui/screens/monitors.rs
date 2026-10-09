@@ -3,9 +3,9 @@
 //! Lists the displays Hyprland reports, lets you nudge scale, flip a monitor
 //! on/off, arrange them relative to one another, and identify which physical
 //! panel is which. A proportional map above the list shows where each screen
-//! actually sits. Save persists the layout to `monitors.conf` (managed block +
-//! hotplug fallback) through the snapshot pipeline, so a bad layout is one
-//! `snapshot undo` away.
+//! actually sits. Save persists the layout to the user's monitors file
+//! (managed block + hotplug fallback) through the snapshot pipeline, so a bad
+//! layout is one `snapshot undo` away.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Direction, Layout as LLayout, Rect};
@@ -84,7 +84,7 @@ impl MonitorsScreen {
         if self.placing.is_some() {
             "←→↑↓ side · Tab anchor · a align · ⏎ keep · Esc cancel"
         } else {
-            "↑↓ move · p place · r rate · m resolution · +/- scale · d disable · i identify · s save"
+            "↑↓ move · ←→ reorder · p place · r rate · m resolution · +/- scale · d disable · i identify · s save"
         }
     }
 
@@ -178,6 +178,27 @@ impl MonitorsScreen {
         let next = (current + delta).clamp(0.5, 3.0);
         s.scale = mon::fmt_scale((next * 100.0).round() / 100.0);
         self.dirty = true;
+    }
+
+    /// Reorder the selected display one step left/right in the row, keeping
+    /// it touching its new neighbor. `notice` explains a refusal (already at
+    /// that edge) the same way a rate/resolution refusal does.
+    fn move_horizontal(&mut self, dir: i64) {
+        let Some(name) = self
+            .layout
+            .monitors
+            .get(self.cursor)
+            .map(|s| s.name.clone())
+        else {
+            return;
+        };
+        if self.layout.move_horizontal(&self.live, &name, dir) {
+            self.dirty = true;
+            self.notice = None;
+        } else {
+            let edge = if dir < 0 { "leftmost" } else { "rightmost" };
+            self.notice = Some(format!("{name} is already the {edge} display"));
+        }
     }
 
     // ----------------------------------------------------------- placement
@@ -334,6 +355,8 @@ impl MonitorsScreen {
             KeyCode::Char('m') => self.cycle_resolution(),
             KeyCode::Char('+') | KeyCode::Char('=') => self.nudge_scale(0.25),
             KeyCode::Char('-') | KeyCode::Char('_') => self.nudge_scale(-0.25),
+            KeyCode::Left => self.move_horizontal(-1),
+            KeyCode::Right => self.move_horizontal(1),
             KeyCode::Char('d') => {
                 if let Some(s) = self.layout.monitors.get_mut(self.cursor) {
                     s.disabled = !s.disabled;
@@ -632,15 +655,20 @@ fn friendly(e: &studio_core::StudioError) -> String {
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::KeyModifiers;
     use ratatui::Terminal;
 
-    /// The ultrawide-plus-laptop desk: a 3440x1440 screen at the origin and a
-    /// 1920x1080 panel at scale 1.5 (1280x720 effective) sitting to its right.
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// A laptop panel (eDP-1) beside an ultrawide (HDMI-A-1), the same desk
+    /// used to exercise arrangement math in `studio_core::modules::monitors`.
     const DESK: &str = r#"[
-      {"id":0,"name":"eDP-1","description":"Lenovo","make":"Lenovo","model":"0x9059",
+      {"id":0,"name":"eDP-1","description":"Lenovo 0x9059","make":"Lenovo","model":"0x9059",
        "width":1920,"height":1080,"refreshRate":120.213,"x":3440,"y":0,"scale":1.5,"transform":0,
        "focused":false,"disabled":false,"dpmsStatus":true},
-      {"id":1,"name":"HDMI-A-1","description":"Acer","make":"Acer","model":"ED340CUR",
+      {"id":1,"name":"HDMI-A-1","description":"Acer ED340CUR","make":"Acer","model":"ED340CUR",
        "width":3440,"height":1440,"refreshRate":100.0,"x":0,"y":0,"scale":1.0,"transform":0,
        "focused":true,"disabled":false,"dpmsStatus":true}
     ]"#;
@@ -657,10 +685,6 @@ mod tests {
             notice: None,
             placing: None,
         }
-    }
-
-    fn press(s: &mut MonitorsScreen, code: KeyCode) {
-        s.handle(KeyEvent::from(code));
     }
 
     /// Render at a fixed size and return the screen as text rows.
@@ -709,60 +733,91 @@ mod tests {
     }
 
     #[test]
-    fn placing_moves_the_laptop_below_and_centers_it() {
+    fn p_enters_placement_and_previews_against_the_other_display() {
         let mut s = screen();
-        assert_eq!(s.layout.monitors[0].name, "eDP-1");
-        press(&mut s, KeyCode::Char('p'));
-        assert!(s.placing.is_some(), "should have entered placement");
-        press(&mut s, KeyCode::Down);
+        s.cursor = 0; // eDP-1, the laptop
+        s.handle(key(KeyCode::Char('p')));
+        assert!(s.placing.is_some(), "p should open placement mode");
+        // eDP-1 started right of the ultrawide (x 3440), so the preview keeps
+        // that side and the position is unchanged.
+        assert_eq!(s.layout.monitors[0].x, 3440);
+        assert_eq!(s.layout.monitors[0].y, 0);
+    }
+
+    #[test]
+    fn arrow_keys_move_the_subject_to_the_chosen_side() {
+        let mut s = screen();
+        s.cursor = 0;
+        s.handle(key(KeyCode::Char('p')));
+        s.handle(key(KeyCode::Down)); // below the ultrawide
         assert_eq!((s.layout.monitors[0].x, s.layout.monitors[0].y), (0, 1440));
-        // Align cycles Start → Center: (3440-1280)/2 = 1080.
-        press(&mut s, KeyCode::Char('a'));
-        assert_eq!(
-            (s.layout.monitors[0].x, s.layout.monitors[0].y),
-            (1080, 1440)
-        );
-        press(&mut s, KeyCode::Enter);
-        assert!(s.placing.is_none());
-        assert!(s.dirty, "a confirmed placement is unsaved work");
+        s.handle(key(KeyCode::Up)); // above it
+                                    // place_relative re-origins: raw (0,-720) slides to (0,0), taking
+                                    // the ultrawide down to (0,720) with it.
+        assert_eq!((s.layout.monitors[0].x, s.layout.monitors[0].y), (0, 0));
+        assert_eq!((s.layout.monitors[1].x, s.layout.monitors[1].y), (0, 720));
+        // Placement always keeps the arrangement normalized to the origin.
         assert!(s.layout.check(&s.live).is_empty());
     }
 
     #[test]
-    fn escape_restores_the_arrangement_exactly() {
+    fn align_cycles_through_start_center_end() {
+        let mut s = screen();
+        s.cursor = 0;
+        s.handle(key(KeyCode::Char('p')));
+        s.handle(key(KeyCode::Down));
+        assert_eq!(s.layout.monitors[0].x, 0); // Start: flush left
+        s.handle(key(KeyCode::Char('a')));
+        assert_eq!(s.layout.monitors[0].x, 1080); // Center under the ultrawide
+        s.handle(key(KeyCode::Char('a')));
+        assert_eq!(s.layout.monitors[0].x, 2160); // End: flush right
+    }
+
+    #[test]
+    fn escape_restores_the_pre_placement_layout_exactly() {
         let mut s = screen();
         let before = s.layout.clone();
-        press(&mut s, KeyCode::Char('p'));
-        press(&mut s, KeyCode::Left);
-        press(&mut s, KeyCode::Char('a'));
+        s.cursor = 0;
+        s.handle(key(KeyCode::Char('p')));
+        s.handle(key(KeyCode::Down));
         assert_ne!(s.layout, before);
-        press(&mut s, KeyCode::Esc);
+        s.handle(key(KeyCode::Esc));
+        assert!(s.placing.is_none());
         assert_eq!(s.layout, before);
-        assert!(!s.dirty, "a cancelled placement is not an edit");
+        assert!(
+            !s.dirty,
+            "a cancelled placement doesn't mark the layout dirty"
+        );
     }
 
     #[test]
-    fn placement_opens_on_the_side_the_display_already_sits() {
+    fn enter_keeps_the_placement_and_marks_the_layout_dirty() {
         let mut s = screen();
-        // The laptop starts to the right of the ultrawide, so entering
-        // placement must not shove it somewhere else.
-        let before = s.layout.clone();
-        press(&mut s, KeyCode::Char('p'));
-        assert_eq!(s.placing.as_ref().unwrap().side, Side::RightOf);
-        assert_eq!(s.layout, before);
+        s.cursor = 0;
+        s.handle(key(KeyCode::Char('p')));
+        s.handle(key(KeyCode::Down));
+        s.handle(key(KeyCode::Enter));
+        assert!(s.placing.is_none());
+        assert!(s.dirty);
+        assert_eq!((s.layout.monitors[0].x, s.layout.monitors[0].y), (0, 1440));
     }
 
     #[test]
-    fn placing_refuses_a_disabled_or_lonely_display() {
+    fn placement_refuses_a_disabled_subject() {
         let mut s = screen();
         s.layout.monitors[0].disabled = true;
-        press(&mut s, KeyCode::Char('p'));
+        s.cursor = 0;
+        s.handle(key(KeyCode::Char('p')));
         assert!(s.placing.is_none());
         assert!(s.notice.as_ref().unwrap().contains("press d to enable"));
+    }
 
-        // Only the ultrawide is on: nothing to anchor against.
-        s.cursor = 1;
-        press(&mut s, KeyCode::Char('p'));
+    #[test]
+    fn placement_refuses_with_only_one_display_on() {
+        let mut s = screen();
+        s.layout.monitors[1].disabled = true;
+        s.cursor = 0;
+        s.handle(key(KeyCode::Char('p')));
         assert!(s.placing.is_none());
         assert!(s.notice.as_ref().unwrap().contains("only one display"));
     }
@@ -770,8 +825,8 @@ mod tests {
     #[test]
     fn arrows_do_not_move_the_list_cursor_while_placing() {
         let mut s = screen();
-        press(&mut s, KeyCode::Char('p'));
-        press(&mut s, KeyCode::Down);
+        s.handle(key(KeyCode::Char('p')));
+        s.handle(key(KeyCode::Down));
         assert_eq!(s.cursor, 0, "Down picks a side, not a row");
     }
 
@@ -782,5 +837,15 @@ mod tests {
         let rows = draw(&s);
         let footer = rows[22..].join(" ");
         assert!(footer.contains("cursor can't reach"), "{footer}");
+    }
+
+    #[test]
+    fn map_renders_without_panicking_at_typical_and_tight_widths() {
+        let s = screen();
+        let skin = Skin::default();
+        for (w, h) in [(80, 24), (40, 12), (10, 4)] {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| s.render(f, f.area(), &skin)).unwrap();
+        }
     }
 }

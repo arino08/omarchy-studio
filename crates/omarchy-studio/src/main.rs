@@ -16,7 +16,7 @@ use clap::{Arg, Command};
 use studio_core::cmd::{CommandRunner, RealRunner};
 use studio_core::deps::{probe_all, DepStatus, Registry};
 use studio_core::modules::themes::{slugify, ThemeOrigin, ThemeStore};
-use studio_core::omarchy::{cmds, Capabilities, OmarchyPaths};
+use studio_core::omarchy::{cmds, Capabilities, Component, OmarchyPaths};
 use studio_core::snapshot::{SnapshotKind, SnapshotStore};
 
 /// One verb group: a one-line summary for the group list, and its real usage
@@ -45,7 +45,7 @@ fn cli() -> Command {
             format!(
                 "{} (tested against omarchy {})",
                 studio_core::VERSION,
-                studio_core::TESTED_OMARCHY
+                studio_core::tested_omarchy()
             )
             .into_boxed_str(),
         ))
@@ -59,6 +59,8 @@ fn cli() -> Command {
         .subcommand_required(false)
         .arg_required_else_help(false)
         .subcommand(group("doctor", "Check the install, capabilities and update survival", "usage: omarchy-studio doctor [--deps] [--quiet]"))
+        .subcommand(group("migrate", "Clean up Studio's blocks in the pre-Omarchy-4 config files",
+            "usage: omarchy-studio migrate [--dry-run]"))
         .subcommand(group("theme", "List, apply, fork, extract and install themes",
             "usage:\n  \
              theme list | current | coverage [name] | apply <name> | fork <src> <new>\n  \
@@ -106,6 +108,13 @@ fn cli() -> Command {
             "usage:\n  \
              osd show | test\n  \
              osd set show-percentage <on|off> | max-volume <n> | top-margin <f>"))
+        .subcommand(group("shell", "Omarchy 4 shell: bar layout, plugins, idle timers",
+            "usage:\n  \
+             shell idle show | set <screensaver|lock> <seconds>\n  \
+             shell bar list | catalog | position <top|bottom|left|right> | transparent <true|false|toggle>\n  \
+             shell bar move <id> [placement] | put <id> [placement] | set <id> <key> <value> [--json] [placement] | defaults\n  \
+             shell plugin list | enable <id> [placement] | disable <id>\n  \
+             placement: --section <left|center|right> --index <n> --before <id> --after <id> --from-section <s> --from-index <n>"))
         .subcommand(group("idle", "Idle timeline (screensaver, lock, screen-off, suspend)",
             "usage:\n  \
              idle timeline\n  \
@@ -116,7 +125,7 @@ fn cli() -> Command {
              monitor list | identify | check | modes <name>\n  \
              monitor mode <name> <WxH[@Hz]|Hz|preferred> [--dry-run]\n  \
              monitor scale <name> <factor> [--dry-run]\n  \
-             monitor position <name> <XxY> [--dry-run]\n  \
+             monitor position <name> <XxY|left|right> [--dry-run]\n  \
              monitor place <name> <left-of|right-of|above|below> <anchor> \
              [--align start|center|end] [--dry-run]\n  \
              monitor arrange <row|column> [<name>…] [--align …] [--dry-run]\n  \
@@ -210,6 +219,7 @@ fn print_group_help(name: &str) {
 fn dispatch(argv: &[&str]) -> i32 {
     match argv {
         ["doctor", rest @ ..] => doctor(rest.contains(&"--deps"), rest.contains(&"--quiet")),
+        ["migrate", rest @ ..] => migrate(rest.contains(&"--dry-run")),
         ["hooks", rest @ ..] => hooks_cmd(rest),
         ["hook", rest @ ..] => hook_event(rest),
         ["theme", rest @ ..] => theme(rest),
@@ -218,14 +228,17 @@ fn dispatch(argv: &[&str]) -> i32 {
         ["preset", rest @ ..] => preset(rest),
         ["toggle", rest @ ..] => toggle(rest),
         ["animations", rest @ ..] => animations(rest),
-        ["waybar", rest @ ..] => waybar(rest),
-        ["notif", rest @ ..] => notif(rest),
-        ["osd", rest @ ..] => osd(rest),
+        // Omarchy 4 replaced these with the Quickshell shell; editing their old
+        // config files there would write something nothing reads.
+        ["waybar", rest @ ..] => gate(Component::Waybar).unwrap_or_else(|| waybar(rest)),
+        ["notif", rest @ ..] => gate(Component::Mako).unwrap_or_else(|| notif(rest)),
+        ["osd", rest @ ..] => gate(Component::Swayosd).unwrap_or_else(|| osd(rest)),
+        ["shell", rest @ ..] => shell(rest),
         ["niri", rest @ ..] => niri(rest),
         ["nova", rest @ ..] => nova(rest),
         ["keybind", rest @ ..] => keybind_cli(rest),
-        ["idle", rest @ ..] => idle(rest),
-        ["lock", rest @ ..] => lock(rest),
+        ["idle", rest @ ..] => gate(Component::Hypridle).unwrap_or_else(|| idle(rest)),
+        ["lock", rest @ ..] => gate(Component::Hypridle).unwrap_or_else(|| lock(rest)),
         ["wallpaper", rest @ ..] => wallpaper(rest),
         ["battery", rest @ ..] => battery(rest),
         ["update", rest @ ..] => update(rest),
@@ -345,6 +358,20 @@ fn doctor(with_deps: bool, quiet: bool) -> i32 {
             &caps.hyprland_version
         }
     );
+    println!(
+        "  hypr config     {}",
+        match caps.config_provider.as_str() {
+            "" => "unknown".to_string(),
+            other => format!(
+                "{other}{}",
+                if caps.hypr_lua_mode() {
+                    "  (Omarchy 4 — ~/.config/hypr/*.lua)"
+                } else {
+                    "  (~/.config/hypr/*.conf)"
+                }
+            ),
+        }
+    );
     println!("  current theme   {theme}");
     println!("  capabilities");
     println!(
@@ -367,6 +394,45 @@ fn doctor(with_deps: bool, quiet: bool) -> i32 {
         "    video wallpapers (mpvpaper)                  {}",
         mark(caps.video_wallpapers)
     );
+
+    // Screens that drive software Omarchy 4 replaced with the Quickshell shell.
+    let replaced: Vec<&str> = [
+        (Component::Waybar, "bar"),
+        (Component::Mako, "notifications"),
+        (Component::Swayosd, "osd"),
+        (Component::Hypridle, "idle/lock"),
+    ]
+    .iter()
+    .filter(|(c, _)| !c.present())
+    .map(|(_, label)| *label)
+    .collect();
+    if !replaced.is_empty() {
+        println!();
+        println!("  these screens are unavailable on this machine:");
+        println!("    {}", replaced.join(", "));
+        println!("    their software isn't installed — the Omarchy shell took over.");
+    }
+
+    // Blocks left behind by the Omarchy 3 → 4 config move. Inert, but they read
+    // as if Studio were still managing those values.
+    let stale = studio_core::modules::migrate::stale(
+        &paths,
+        if caps.hypr_lua_mode() {
+            studio_core::omarchy::Dialect::Lua
+        } else {
+            studio_core::omarchy::Dialect::Hyprlang
+        },
+    );
+    if !stale.is_empty() {
+        let blocks: usize = stale.iter().map(|s| s.sections.len()).sum();
+        println!();
+        println!(
+            "  ⚠ {blocks} Studio block(s) still sit in {} pre-Omarchy-4 .conf file(s),",
+            stale.len()
+        );
+        println!("    which this Hyprland no longer reads. Clean up with:");
+        println!("      omarchy-studio migrate");
+    }
 
     // An untested Omarchy is a warning, never a refusal — see `version_fit`.
     if let Some(w) = fit.warning() {
@@ -1566,6 +1632,466 @@ fn osd(args: &[&str]) -> i32 {
     }
 }
 
+// ── shell (Omarchy 4: bar, plugins, idle) ──────────────────────────────────
+
+fn shell(args: &[&str]) -> i32 {
+    use studio_core::cmd::find_in_path;
+    if find_in_path("omarchy-shell").is_none() {
+        eprintln!(
+            "omarchy-shell isn't installed — this machine isn't running the Omarchy 4 shell. \
+             The bar/notifications/idle are Waybar/Mako/hypridle here; use `waybar`/`notif`/`idle` instead."
+        );
+        return 3;
+    }
+    let Some(paths) = omarchy() else { return 4 };
+    match args {
+        ["idle", rest @ ..] => shell_idle(&paths, rest),
+        ["bar", rest @ ..] => shell_bar(&paths, rest),
+        ["plugin", rest @ ..] => shell_plugin(&paths, rest),
+        ["appearance", rest @ ..] => shell_appearance(&paths, rest),
+        _ => {
+            eprintln!(
+                "usage: shell idle show|set <screensaver|lock> <seconds> | \
+                 shell bar list|catalog|position|transparent|move|put|set|defaults | \
+                 shell plugin list|enable|disable | \
+                 shell appearance show|set <font-size|bar-size-horizontal|bar-size-vertical|\
+                 bar-scale-with-font|spacing-scale|spacing-scale-with-font> <value>"
+            );
+            2
+        }
+    }
+}
+
+fn shell_appearance(paths: &OmarchyPaths, args: &[&str]) -> i32 {
+    use studio_core::modules::shell::Appearance;
+    let mut a = Appearance::load(paths);
+    let summary = match args {
+        ["show"] | [] => {
+            println!("font-size                {}px", a.font_base_size);
+            println!("bar-size-horizontal       {}px", a.bar_size_horizontal);
+            println!("bar-size-vertical         {}px", a.bar_size_vertical);
+            println!(
+                "bar-scale-with-font       {}",
+                if a.bar_scale_with_font { "on" } else { "off" }
+            );
+            println!("spacing-scale             {}", a.spacing_scale);
+            println!(
+                "spacing-scale-with-font   {}",
+                if a.spacing_scale_with_font {
+                    "on"
+                } else {
+                    "off"
+                }
+            );
+            return 0;
+        }
+        ["set", "font-size", v] => match v.parse::<i64>() {
+            Ok(n) if n >= 1 => {
+                a.font_base_size = n;
+                format!("shell.toml: font-size = {n}px")
+            }
+            _ => {
+                eprintln!("font-size must be a positive integer (px)");
+                return 2;
+            }
+        },
+        ["set", "bar-size-horizontal", v] => match v.parse::<i64>() {
+            Ok(n) if n >= 1 => {
+                a.bar_size_horizontal = n;
+                format!("shell.toml: bar-size-horizontal = {n}px")
+            }
+            _ => {
+                eprintln!("bar-size-horizontal must be a positive integer (px)");
+                return 2;
+            }
+        },
+        ["set", "bar-size-vertical", v] => match v.parse::<i64>() {
+            Ok(n) if n >= 1 => {
+                a.bar_size_vertical = n;
+                format!("shell.toml: bar-size-vertical = {n}px")
+            }
+            _ => {
+                eprintln!("bar-size-vertical must be a positive integer (px)");
+                return 2;
+            }
+        },
+        ["set", "bar-scale-with-font", v] => match parse_bool(v) {
+            Some(b) => {
+                a.bar_scale_with_font = b;
+                format!("shell.toml: bar-scale-with-font = {b}")
+            }
+            None => {
+                eprintln!("bar-scale-with-font is on or off");
+                return 2;
+            }
+        },
+        ["set", "spacing-scale", v] => match v.parse::<f64>() {
+            Ok(n) if n > 0.0 => {
+                a.spacing_scale = n;
+                format!("shell.toml: spacing-scale = {n}")
+            }
+            _ => {
+                eprintln!("spacing-scale must be a positive number");
+                return 2;
+            }
+        },
+        ["set", "spacing-scale-with-font", v] => match parse_bool(v) {
+            Some(b) => {
+                a.spacing_scale_with_font = b;
+                format!("shell.toml: spacing-scale-with-font = {b}")
+            }
+            None => {
+                eprintln!("spacing-scale-with-font is on or off");
+                return 2;
+            }
+        },
+        _ => {
+            eprintln!(
+                "usage: shell appearance show | set <font-size|bar-size-horizontal|\
+                 bar-size-vertical|bar-scale-with-font|spacing-scale|spacing-scale-with-font> <value>"
+            );
+            return 2;
+        }
+    };
+
+    let path = studio_core::modules::shell::shell_toml_path(paths);
+    let store = history().ok();
+    if let Some(s) = &store {
+        let _ = s.record(
+            SnapshotKind::Pre,
+            &format!("before {summary}"),
+            std::slice::from_ref(&path),
+            "shell",
+            &[],
+        );
+    }
+    match a.save(paths) {
+        Ok(()) => {
+            if let Some(s) = &store {
+                let _ = s.record(
+                    SnapshotKind::Post,
+                    &summary,
+                    std::slice::from_ref(&path),
+                    "shell",
+                    &[],
+                );
+            }
+            println!("{summary} · undo with `omarchy-studio snapshot undo`");
+            0
+        }
+        Err(e) => {
+            eprintln!("apply failed: {}", brief(e));
+            1
+        }
+    }
+}
+
+fn shell_idle(paths: &OmarchyPaths, args: &[&str]) -> i32 {
+    use studio_core::modules::shell::{self as shell_mod, Shell};
+    let shell = Shell::load(paths);
+    match args {
+        ["show"] | [] => {
+            println!("screensaver  {}s", shell.cfg.idle.screensaver);
+            println!("lock         {}s", shell.cfg.idle.lock);
+            0
+        }
+        ["set", field @ ("screensaver" | "lock"), v] => {
+            let Ok(seconds) = v.parse::<i64>() else {
+                eprintln!("seconds must be a non-negative integer");
+                return 2;
+            };
+            if seconds < 0 {
+                eprintln!("seconds must be a non-negative integer");
+                return 2;
+            }
+            let (screensaver, lock) = if *field == "screensaver" {
+                (seconds, shell.cfg.idle.lock)
+            } else {
+                (shell.cfg.idle.screensaver, seconds)
+            };
+            let summary = format!("shell: idle.{field} = {seconds}s");
+            let path = shell_mod::config_path(paths);
+            let store = history().ok();
+            if let Some(s) = &store {
+                let _ = s.record(
+                    SnapshotKind::Pre,
+                    &format!("before {summary}"),
+                    std::slice::from_ref(&path),
+                    "shell",
+                    &[],
+                );
+            }
+            match shell_mod::apply_idle(paths, screensaver, lock, &RealRunner) {
+                Ok(_) => {
+                    if let Some(s) = &store {
+                        let _ = s.record(
+                            SnapshotKind::Post,
+                            &summary,
+                            std::slice::from_ref(&path),
+                            "shell",
+                            &[],
+                        );
+                    }
+                    println!("{summary} · undo with `omarchy-studio snapshot undo`");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("apply failed: {}", brief(e));
+                    1
+                }
+            }
+        }
+        _ => {
+            eprintln!("usage: shell idle show | set <screensaver|lock> <seconds>");
+            2
+        }
+    }
+}
+
+/// Parse `omarchy-bar`'s own placement flags: `--section`, `--index`,
+/// `--before`, `--after`, `--from-section`, `--from-index`.
+fn parse_placement(
+    args: &[&str],
+) -> std::result::Result<studio_core::modules::shell::Placement, String> {
+    use studio_core::modules::shell::{Placement, Section};
+    let mut p = Placement::default();
+    let mut i = 0;
+    while i < args.len() {
+        let need = |i: usize| -> std::result::Result<&str, String> {
+            args.get(i)
+                .copied()
+                .ok_or_else(|| format!("{} requires a value", args[i - 1]))
+        };
+        match args[i] {
+            "--section" => {
+                let v = need(i + 1)?;
+                p.section = Some(
+                    Section::parse(v)
+                        .ok_or_else(|| "section must be left, center, or right".to_string())?,
+                );
+                i += 2;
+            }
+            "--index" => {
+                let v = need(i + 1)?;
+                p.index = Some(
+                    v.parse()
+                        .map_err(|_| "index must be a non-negative integer".to_string())?,
+                );
+                i += 2;
+            }
+            "--before" => {
+                p.before = Some(need(i + 1)?.to_string());
+                i += 2;
+            }
+            "--after" => {
+                p.after = Some(need(i + 1)?.to_string());
+                i += 2;
+            }
+            "--from-section" => {
+                let v = need(i + 1)?;
+                p.from_section = Some(
+                    Section::parse(v)
+                        .ok_or_else(|| "section must be left, center, or right".to_string())?,
+                );
+                i += 2;
+            }
+            "--from-index" => {
+                let v = need(i + 1)?;
+                p.from_index = Some(
+                    v.parse()
+                        .map_err(|_| "index must be a non-negative integer".to_string())?,
+                );
+                i += 2;
+            }
+            other => return Err(format!("unknown option: {other}")),
+        }
+    }
+    if p.before.is_some() && p.after.is_some() {
+        return Err("use only one of --before or --after".into());
+    }
+    Ok(p)
+}
+
+/// Run a mutating `omarchy bar`/`omarchy plugin` command, snapshotting
+/// `shell.json` around it (the command writes and reloads it itself — Studio
+/// only needs before/after state for undo).
+fn run_shell_cmd(paths: &OmarchyPaths, summary: &str, cmd: &studio_core::cmd::Cmd) -> i32 {
+    use studio_core::modules::shell;
+    let path = shell::config_path(paths);
+    let full = format!("shell: {summary}");
+    let store = history().ok();
+    if let Some(s) = &store {
+        let _ = s.record(
+            SnapshotKind::Pre,
+            &format!("before {full}"),
+            std::slice::from_ref(&path),
+            "shell",
+            &[],
+        );
+    }
+    match RealRunner.run(cmd) {
+        Ok(out) if out.ok() => {
+            if let Some(s) = &store {
+                let _ = s.record(
+                    SnapshotKind::Post,
+                    &full,
+                    std::slice::from_ref(&path),
+                    "shell",
+                    &[],
+                );
+            }
+            println!("{full} · undo with `omarchy-studio snapshot undo`");
+            0
+        }
+        Ok(out) => {
+            eprintln!("{}", out.stderr.trim());
+            1
+        }
+        Err(e) => {
+            eprintln!("{}", brief(e));
+            1
+        }
+    }
+}
+
+fn shell_bar(paths: &OmarchyPaths, args: &[&str]) -> i32 {
+    use studio_core::modules::shell::{bar_widget_catalog, Section, Shell};
+    match args {
+        ["list"] | [] => {
+            let shell = Shell::load(paths);
+            for section in Section::ALL {
+                println!("{}", section.as_str());
+                for w in shell.cfg.bar.layout.section(section) {
+                    println!("  {}", w.id);
+                }
+            }
+            println!();
+            println!("position     {}", shell.cfg.bar.position);
+            println!("transparent  {}", shell.cfg.bar.transparent);
+            0
+        }
+        ["catalog"] => match bar_widget_catalog(&RealRunner) {
+            Ok(cat) => {
+                for p in cat {
+                    let mark = if p.enabled { "*" } else { " " };
+                    println!("{mark} {:<28} {}", p.id, p.name);
+                }
+                0
+            }
+            Err(e) => {
+                eprintln!("{}", brief(e));
+                1
+            }
+        },
+        ["position", pos] => run_shell_cmd(
+            paths,
+            &format!("bar position {pos}"),
+            &cmds::bar_position(pos),
+        ),
+        ["transparent", v] => run_shell_cmd(
+            paths,
+            &format!("bar transparent {v}"),
+            &cmds::bar_transparent(v),
+        ),
+        ["defaults"] => run_shell_cmd(paths, "bar defaults", &cmds::bar_defaults()),
+        ["move", id, rest @ ..] => match parse_placement(rest) {
+            Ok(p) => run_shell_cmd(
+                paths,
+                &format!("bar move {id}"),
+                &cmds::bar_move(id, &p.to_args()),
+            ),
+            Err(e) => {
+                eprintln!("{e}");
+                2
+            }
+        },
+        ["put", id, rest @ ..] => match parse_placement(rest) {
+            Ok(p) => run_shell_cmd(
+                paths,
+                &format!("bar put {id}"),
+                &cmds::bar_put(id, &p.to_args()),
+            ),
+            Err(e) => {
+                eprintln!("{e}");
+                2
+            }
+        },
+        ["set", id, key, value, rest @ ..] => {
+            let as_json = rest.contains(&"--json");
+            let placement_args: Vec<&str> =
+                rest.iter().filter(|a| **a != "--json").copied().collect();
+            match parse_placement(&placement_args) {
+                Ok(p) => run_shell_cmd(
+                    paths,
+                    &format!("bar set {id} {key} {value}"),
+                    &cmds::bar_set(id, key, value, as_json, &p.to_args()),
+                ),
+                Err(e) => {
+                    eprintln!("{e}");
+                    2
+                }
+            }
+        }
+        _ => {
+            eprintln!(
+                "usage: shell bar list | catalog | position <top|bottom|left|right> | \
+                 transparent <true|false|toggle> | move <id> [placement] | put <id> [placement] | \
+                 set <id> <key> <value> [--json] [placement] | defaults"
+            );
+            2
+        }
+    }
+}
+
+fn shell_plugin(paths: &OmarchyPaths, args: &[&str]) -> i32 {
+    use studio_core::modules::shell::parse_plugin_list;
+    match args {
+        ["list"] | [] => match RealRunner.run(&cmds::plugin_list_json()) {
+            Ok(out) if out.ok() => match parse_plugin_list(&out.stdout) {
+                Ok(all) => {
+                    for p in all {
+                        let mark = if p.enabled { "*" } else { " " };
+                        println!("{mark} {:<28} {:<24} {}", p.id, p.name, p.kinds.join(","));
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("{}", brief(e));
+                    1
+                }
+            },
+            Ok(out) => {
+                eprintln!("{}", out.stderr.trim());
+                1
+            }
+            Err(e) => {
+                eprintln!("{}", brief(e));
+                1
+            }
+        },
+        ["enable", id, rest @ ..] => match parse_placement(rest) {
+            Ok(p) => run_shell_cmd(
+                paths,
+                &format!("plugin enable {id}"),
+                &cmds::plugin_enable(id, &p.to_args()),
+            ),
+            Err(e) => {
+                eprintln!("{e}");
+                2
+            }
+        },
+        ["disable", id] => run_shell_cmd(
+            paths,
+            &format!("plugin disable {id}"),
+            &cmds::plugin_disable(id),
+        ),
+        _ => {
+            eprintln!("usage: shell plugin list | enable <id> [placement] | disable <id>");
+            2
+        }
+    }
+}
+
 // ── keybind ─────────────────────────────────────────────────────────────────
 
 fn keybind_cli(args: &[&str]) -> i32 {
@@ -1934,27 +2460,43 @@ fn keybind_reset(paths: &OmarchyPaths) -> i32 {
 /// official plugin manager, exactly as the plugin's README documents.
 fn niri(args: &[&str]) -> i32 {
     use studio_core::modules::scrolloverview as sco;
+    use studio_core::omarchy::Dialect;
     let Some(paths) = omarchy() else { return 4 };
+    let dialect = Dialect::probe(&RealRunner);
 
     match args {
         [] | ["status"] => {
             let state = sco::state(&RealRunner);
             println!("ScrollOverview  {}", state.label());
             println!("  by {} · {} · {}", sco::AUTHOR, sco::LICENSE, sco::REPO);
+            if state == sco::State::Enabled && !sco::is_loaded(&RealRunner) {
+                println!(
+                    "\nnote: enabled but not loaded this session — run `hyprpm reload -n`\n      \
+                     (or `hyprpm update` first if that reports outdated headers)"
+                );
+            }
             if state == sco::State::NoHyprpm {
                 println!("\nhyprpm is Hyprland's plugin manager and ships with Hyprland.");
                 return 1;
             }
-            let s = sco::Settings::load(&paths);
+            let s = sco::Settings::load_for(&paths, dialect);
             println!("\nsettings");
             println!("  scale             {:.2}", s.scale);
             println!("  layout            {}", s.layout);
             println!("  workspace_gap     {}", s.workspace_gap);
             println!("  blur              {}", s.blur);
             println!("  gesture_distance  {}", s.gesture_distance);
-            if !sco::is_sourced(&paths) && state != sco::State::NotAdded {
-                println!("\nnote: hyprland.conf doesn't source the settings file yet:");
-                println!("  {}", sco::source_line(&paths));
+            if !sco::is_sourced_for(&paths, dialect) && state != sco::State::NotAdded {
+                let verb = if dialect.is_lua() {
+                    "require"
+                } else {
+                    "source"
+                };
+                println!(
+                    "\nnote: hyprland.{} doesn't {verb} the settings file yet:",
+                    dialect.ext()
+                );
+                println!("  {}", sco::source_line_for(&paths, dialect));
             }
             0
         }
@@ -1981,7 +2523,15 @@ fn niri(args: &[&str]) -> i32 {
             };
             match sco::ensure_sourced(&paths, &store, &RealRunner) {
                 Ok(true) => {
-                    println!("hyprland.conf now sources the overview settings");
+                    let verb = if dialect.is_lua() {
+                        "requires"
+                    } else {
+                        "sources"
+                    };
+                    println!(
+                        "hyprland.{} now {verb} the overview settings",
+                        dialect.ext()
+                    );
                     0
                 }
                 Ok(false) => {
@@ -1996,7 +2546,7 @@ fn niri(args: &[&str]) -> i32 {
             match sco::set_enabled(&RealRunner, on) {
                 Ok(msg) => {
                     println!("{msg}");
-                    if on && !sco::is_sourced(&paths) {
+                    if on && !sco::is_sourced_for(&paths, dialect) {
                         println!("tip: run `omarchy-studio niri source` so your settings apply");
                     }
                     0
@@ -2008,7 +2558,7 @@ fn niri(args: &[&str]) -> i32 {
             }
         }
         ["set", key, value] => {
-            let mut s = sco::Settings::load(&paths);
+            let mut s = sco::Settings::load_for(&paths, dialect);
             let bad = |what: &str| -> i32 {
                 eprintln!("{what}");
                 2
@@ -2043,9 +2593,14 @@ fn niri(args: &[&str]) -> i32 {
             match s.apply(&paths, &store, &RealRunner) {
                 Ok(()) => {
                     println!("{key} = {value} · undo with `omarchy-studio snapshot undo`");
-                    if !sco::is_sourced(&paths) {
-                        println!("add this to hyprland.conf for it to take effect:");
-                        println!("  {}", sco::source_line(&paths));
+                    if !sco::is_sourced_for(&paths, dialect) {
+                        let verb = if dialect.is_lua() {
+                            "require"
+                        } else {
+                            "source"
+                        };
+                        println!("add this to hyprland.{} for it to {verb}:", dialect.ext());
+                        println!("  {}", sco::source_line_for(&paths, dialect));
                     }
                     0
                 }
@@ -3207,20 +3762,38 @@ fn monitor(args: &[&str]) -> i32 {
         }
         ["position", name, spec, rest @ ..] => {
             let dry_run = rest.contains(&"--dry-run");
-            let Some((x, y)) = parse_point(spec) else {
-                eprintln!("can't read `{spec}` — try 1080x1440 or 1080,1440");
-                return 2;
-            };
             let mut layout = mon::Layout::from_monitors(&live);
-            if !layout.set_position(name, x, y) {
-                eprintln!("no monitor named `{name}` — see `monitor list`");
-                return 2;
+            // `left`/`right` swaps the display with its row neighbour; anything
+            // else is an absolute `XxY` coordinate.
+            let delta = match *spec {
+                "left" => Some(-1i64),
+                "right" => Some(1i64),
+                _ => None,
+            };
+            if let Some(delta) = delta {
+                if !live.iter().any(|m| &m.name == name) {
+                    eprintln!("no monitor named `{name}` — see `monitor list`");
+                    return 2;
+                }
+                if !layout.move_horizontal(&live, name, delta) {
+                    eprintln!("{name} is already the {spec}most display");
+                    return 2;
+                }
+            } else {
+                let Some((x, y)) = parse_point(spec) else {
+                    eprintln!("can't read `{spec}` — try 1080x1440, 1080,1440, left, or right");
+                    return 2;
+                };
+                if !layout.set_position(name, x, y) {
+                    eprintln!("no monitor named `{name}` — see `monitor list`");
+                    return 2;
+                }
             }
             monitor_write(
                 &paths,
                 &layout,
                 &live,
-                &format!("monitor position {name} {x}x{y}"),
+                &format!("monitor position {name} {spec}"),
                 dry_run,
             )
         }
@@ -3318,7 +3891,7 @@ fn monitor(args: &[&str]) -> i32 {
                 "usage: monitor list | identify | check | modes <name>\n       \
                  monitor mode <name> <WxH[@Hz]|Hz|preferred> [--dry-run]\n       \
                  monitor scale <name> <f> [--dry-run]\n       \
-                 monitor position <name> <XxY> [--dry-run]\n       \
+                 monitor position <name> <XxY|left|right> [--dry-run]\n       \
                  monitor place <name> <left-of|right-of|above|below> <anchor> \
                  [--align start|center|end] [--dry-run]\n       \
                  monitor arrange <row|column> [<name>…] [--align …] [--dry-run]\n       \
@@ -3367,8 +3940,8 @@ fn parse_layout_args(
     Ok((names, align, dry_run))
 }
 
-/// Render the layout into monitors.conf and (unless dry-run) snapshot, write,
-/// and reload Hyprland.
+/// Render the layout into the user's monitors file (`.lua` on Omarchy 4,
+/// `.conf` before it) and, unless dry-run, snapshot, write and reload Hyprland.
 ///
 /// Overlaps and unreachable screens are reported but never block the write —
 /// they're legal Hyprland configs, and a deliberate overlap is someone's mirror
@@ -3382,13 +3955,14 @@ fn monitor_write(
     dry_run: bool,
 ) -> i32 {
     use studio_core::modules::monitors as mon;
-    let path = mon::conf_path(paths);
+    let dialect = studio_core::omarchy::Dialect::probe(&RealRunner);
+    let path = mon::user_path(paths, dialect);
     for issue in layout.check(live) {
         eprintln!("warning: {}", issue.message());
     }
     if dry_run {
         println!("would write {}:\n", path.display());
-        println!("{}", layout.render_body());
+        println!("{}", layout.body_for(dialect));
         return 0;
     }
     // The pipeline snapshots and rolls back; don't also record here.
@@ -4248,17 +4822,83 @@ fn hook_event(args: &[&str]) -> i32 {
     }
 }
 
+/// Refuse a module whose component isn't installed, explaining why. `None` when
+/// the component is present and the module should run normally.
+fn gate(c: Component) -> Option<i32> {
+    let reason = c.unavailable_reason()?;
+    eprintln!("{reason}");
+    Some(3)
+}
+
+// ── Omarchy 3 → 4 cleanup ────────────────────────────────────────────────────
+
+/// Remove Studio's managed blocks from the `.conf` files Omarchy 4 no longer
+/// reads. Inert on Omarchy 3, where those files are the live config.
+fn migrate(dry_run: bool) -> i32 {
+    use studio_core::modules::migrate;
+    let Some(paths) = omarchy() else { return 4 };
+    let dialect = studio_core::omarchy::Dialect::probe(&RealRunner);
+
+    if !dialect.is_lua() {
+        println!("Nothing to do — this machine's Hyprland reads .conf files,");
+        println!("which is where Studio writes. (Omarchy 4 moved to .lua.)");
+        return 0;
+    }
+
+    let stale = migrate::stale(&paths, dialect);
+    if stale.is_empty() {
+        println!("Nothing to clean up — no Studio blocks left in the old .conf files.");
+        return 0;
+    }
+
+    println!("Studio blocks still sitting in files Omarchy 4 no longer reads:");
+    for item in &stale {
+        println!("  {}", item.file.display());
+        for s in &item.sections {
+            println!("      {s}");
+        }
+    }
+    println!();
+
+    if dry_run {
+        println!("--dry-run: nothing written.");
+        return 0;
+    }
+
+    let store = match history() {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    match migrate::apply(&paths, &store, &RealRunner) {
+        Ok(files) if files.is_empty() => {
+            println!("Nothing changed.");
+            0
+        }
+        Ok(files) => {
+            println!(
+                "Cleaned {} file(s). Your own lines were left alone.",
+                files.len()
+            );
+            println!("undo with: omarchy-studio snapshot undo");
+            0
+        }
+        Err(e) => report_apply_error(e, "the old config files were"),
+    }
+}
+
 // ── menu integration ─────────────────────────────────────────────────────────
 
 fn install_integration() -> i32 {
     let Some(paths) = omarchy() else { return 4 };
     let store = history().ok();
-    let file = studio_core::integration::managed_file(&paths);
+    // Includes the dead pre-Quattro menu.sh when it's still on disk, so its
+    // cleanup is captured by the snapshot and stays undoable.
+    let files = studio_core::integration::managed_files(&paths);
     if let Some(s) = &store {
         let _ = s.record(
             SnapshotKind::Pre,
             "before install-integration",
-            std::slice::from_ref(&file),
+            &files,
             "integration",
             &[],
         );
@@ -4330,12 +4970,12 @@ fn uninstall() -> i32 {
     }
 
     if studio_core::integration::is_installed(&paths) {
-        let file = studio_core::integration::managed_file(&paths);
+        let files = studio_core::integration::managed_files(&paths);
         if let Ok(s) = history() {
             let _ = s.record(
                 SnapshotKind::Pre,
                 "before uninstall",
-                std::slice::from_ref(&file),
+                &files,
                 "integration",
                 &[],
             );

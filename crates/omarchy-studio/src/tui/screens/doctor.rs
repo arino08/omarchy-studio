@@ -237,7 +237,7 @@ impl DoctorScreen {
 ///
 /// Only needed where a wrapped line has to keep an indent (see the version
 /// warning): everywhere else `Paragraph`'s own wrap is the right tool.
-fn wrap_words(text: &str, width: usize) -> Vec<String> {
+pub(crate) fn wrap_words(text: &str, width: usize) -> Vec<String> {
     let mut out = Vec::new();
     let mut line = String::new();
     for word in text.split_whitespace() {
@@ -284,7 +284,8 @@ mod tests {
     fn every_version_fit_warning_survives_wrapping_intact() {
         // The warning is the whole point of the row — wrapping must not lose
         // or reorder any of it.
-        for v in ["4.0.0", "banana", ""] {
+        // 3.8 and 4.0 are supported; 5.x is the untested-major case.
+        for v in ["5.0.0", "banana", ""] {
             let warning = studio_core::version_fit(v)
                 .warning()
                 .expect("untested version must warn");

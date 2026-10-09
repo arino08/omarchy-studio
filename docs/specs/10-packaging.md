@@ -8,7 +8,7 @@
 
 ## 2. Versioning & compatibility
 
-- SemVer; `omarchy-studio --version` prints its own version + tested-against Omarchy range (e.g. `tested: omarchy 3.8–3.9`).
+- SemVer; `omarchy-studio --version` prints its own version + the tested-against Omarchy versions from `studio_core::TESTED_OMARCHY` (currently `3.8 or 4.0` — both config dialects).
 - Capability probe (spec 02 §5) handles skew at runtime; releases bump the tested range only after the corpus job passes against that Omarchy tag.
 - CHANGELOG.md, keep-a-changelog format; every entry states user-visible behavior, files touched, and migration notes if managed-block formats changed (blocks carry a `v=` in the marker; Studio migrates its own blocks forward automatically).
 

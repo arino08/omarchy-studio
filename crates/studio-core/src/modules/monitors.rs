@@ -1,7 +1,8 @@
 //! Monitors (roadmap 0.8.4).
 //!
 //! Detect displays from `hyprctl monitors -j`, arrange them, and persist the
-//! layout to `~/.config/hypr/monitors.conf` as `monitor=` lines inside a
+//! layout to the user's monitors file — `monitors.lua` as `hl.monitor{}`
+//! calls on Omarchy 4, `monitors.conf` as `monitor=` lines before it — inside a
 //! Studio-owned managed block — always with a `monitor=,preferred,auto,1`
 //! hotplug fallback so an unplugged/added display still comes up. Writes go
 //! through the snapshot pipeline (pre-snapshot → write → `hyprctl reload` →
@@ -19,9 +20,10 @@
 //! quite happily, and a deliberate overlap is somebody's mirror setup.
 
 use crate::cmd::{Cmd, CommandRunner};
-use crate::configfs::{CommentStyle, ManagedBlock};
+use crate::configfs::lua;
+use crate::configfs::ManagedBlock;
 use crate::error::{Result, StudioError};
-use crate::omarchy::OmarchyPaths;
+use crate::omarchy::{Dialect, OmarchyPaths};
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -248,7 +250,7 @@ impl Monitor {
         if modes.is_empty() {
             return Err(format!(
                 "{} reports no modes — this Hyprland may be too old to list them; \
-                 set the mode by hand in monitors.conf",
+                 set the mode by hand in your monitors config",
                 self.name
             ));
         }
@@ -626,6 +628,36 @@ impl MonitorSetting {
             self.name, self.mode, self.x, self.y, self.scale, self.transform
         )
     }
+
+    /// The Omarchy 4 form: `hl.monitor({ output = …, mode = …, … })`.
+    ///
+    /// Field names are the ones Hyprland 0.56 actually accepts — it validates
+    /// the table and rejects unknown keys, and `disabled` (not `disable`, not
+    /// `enabled`) is what turns a display off.
+    pub fn lua_line(&self) -> String {
+        if self.disabled {
+            return lua::table_call(
+                "hl.monitor",
+                &[
+                    ("output", lua::Value::Str(self.name.clone())),
+                    ("disabled", lua::Value::Bool(true)),
+                ],
+            );
+        }
+        lua::table_call(
+            "hl.monitor",
+            &[
+                ("output", lua::Value::Str(self.name.clone())),
+                ("mode", lua::Value::Str(self.mode.clone())),
+                (
+                    "position",
+                    lua::Value::Str(format!("{}x{}", self.x, self.y)),
+                ),
+                ("scale", lua::Value::float_or_str(&self.scale)),
+                ("transform", lua::Value::Int(self.transform as i64)),
+            ],
+        )
+    }
 }
 
 /// Trim a scale float to the shortest exact-looking form (`1`, `1.5`).
@@ -646,6 +678,52 @@ impl Layout {
         Self {
             monitors: mons.iter().map(MonitorSetting::from_monitor).collect(),
         }
+    }
+
+    /// Move `name` one step left/right among the monitors, keeping the row
+    /// touching left-to-right on effective width (each display keeps its own
+    /// `y` — this reorders the row, it doesn't touch vertical offsets, so a
+    /// stacked/staggered layout isn't flattened by a horizontal move).
+    ///
+    /// `live` supplies the physical width/height the move needs (a pending
+    /// mode change in this layout hasn't necessarily hit `hyprctl` yet).
+    /// Returns `false` when `name` is already at that edge, or unknown.
+    pub fn move_horizontal(&mut self, live: &[Monitor], name: &str, dir: i64) -> bool {
+        // Left-to-right order by current x, ties broken by name so the order
+        // is deterministic when two displays start at the same position.
+        let mut order: Vec<usize> = (0..self.monitors.len()).collect();
+        order.sort_by(|&a, &b| {
+            self.monitors[a]
+                .x
+                .cmp(&self.monitors[b].x)
+                .then_with(|| self.monitors[a].name.cmp(&self.monitors[b].name))
+        });
+        let Some(pos) = order.iter().position(|&i| self.monitors[i].name == name) else {
+            return false;
+        };
+        let target = pos as i64 + dir;
+        if target < 0 || target as usize >= order.len() {
+            return false;
+        }
+        order.swap(pos, target as usize);
+
+        // Re-pack x left-to-right in the new order, at each display's own
+        // (possibly just-edited) scale and transform.
+        let mut x = 0i32;
+        for &i in &order {
+            let s = &mut self.monitors[i];
+            let w = live
+                .iter()
+                .find(|m| m.name == s.name)
+                .map(|m| {
+                    let scale = s.scale.parse().unwrap_or(m.scale);
+                    effective_size(m.width, m.height, scale, s.transform).0
+                })
+                .unwrap_or(0);
+            s.x = x;
+            x += w as i32;
+        }
+        true
     }
 
     /// Point one display at a mode (`None` = `preferred`). False when no
@@ -762,7 +840,7 @@ impl Layout {
 
     /// Shift every display by the same offset so the top-left-most edge sits at
     /// the origin. Hyprland accepts negative coordinates, but keeping the
-    /// arrangement in positive space makes `monitors.conf` readable and keeps
+    /// arrangement in positive space makes the monitors file readable and keeps
     /// relative moves from drifting away from 0,0 over successive edits.
     pub fn normalize(&mut self, live: &[Monitor]) {
         let rects = self.rects(live);
@@ -865,22 +943,65 @@ impl Layout {
         lines.push("monitor = , preferred, auto, 1".to_string());
         lines.join("\n")
     }
+
+    /// The Lua managed-block body, with the same hotplug catch-all: an empty
+    /// `output` matches any display Hyprland doesn't have a rule for.
+    pub fn render_lua_body(&self) -> String {
+        let mut lines: Vec<String> = self.monitors.iter().map(MonitorSetting::lua_line).collect();
+        lines.push(lua::table_call(
+            "hl.monitor",
+            &[
+                ("output", lua::Value::Str(String::new())),
+                ("mode", lua::Value::Str("preferred".into())),
+                ("position", lua::Value::Str("auto".into())),
+                ("scale", lua::Value::Int(1)),
+            ],
+        ));
+        lines.join("\n")
+    }
+
+    /// The body for whichever dialect this machine reads.
+    pub fn body_for(&self, dialect: Dialect) -> String {
+        if dialect.is_lua() {
+            self.render_lua_body()
+        } else {
+            self.render_body()
+        }
+    }
 }
 
-/// `~/.config/hypr/monitors.conf` — Omarchy sources it; our managed block wins.
+/// `~/.config/hypr/monitors.conf` — Omarchy ≤ 3 sources it; our block wins.
 pub fn conf_path(paths: &OmarchyPaths) -> PathBuf {
     paths.hypr_config().join("monitors.conf")
 }
 
-fn block() -> ManagedBlock {
-    ManagedBlock::new("monitors", CommentStyle::Hash)
+/// The user monitors file for this dialect: `monitors.lua` on Omarchy 4,
+/// `monitors.conf` before it. Writing the wrong one is silently inert — the
+/// compositor simply never reads it — so this is always dialect-driven.
+pub fn user_path(paths: &OmarchyPaths, dialect: Dialect) -> PathBuf {
+    paths
+        .hypr_config()
+        .join(format!("monitors.{}", dialect.ext()))
 }
 
-/// Upsert the layout's managed block into `monitors.conf` (leaving the user's
+fn block_for(dialect: Dialect) -> ManagedBlock {
+    ManagedBlock::new("monitors", dialect.comment_style())
+}
+
+fn block() -> ManagedBlock {
+    block_for(Dialect::Hyprlang)
+}
+
+/// Upsert the layout's hyprlang managed block (leaving the user's
 /// own lines outside it untouched) and return the written text. Does not touch
 /// disk — the frontend snapshots then writes.
 pub fn render_conf(existing: &str, layout: &Layout) -> String {
     block().upsert(existing, &layout.render_body())
+}
+
+/// Upsert the layout's managed block for a given dialect.
+pub fn render_for(existing: &str, layout: &Layout, dialect: Dialect) -> String {
+    block_for(dialect).upsert(existing, &layout.body_for(dialect))
 }
 
 /// Read the current on-disk conf (empty string if absent).
@@ -891,12 +1012,22 @@ pub fn read_conf(paths: &OmarchyPaths) -> String {
 /// Plan the managed block as a pipeline edit, writing nothing. `None` when the
 /// conf already describes exactly this layout.
 pub fn plan(paths: &OmarchyPaths, layout: &Layout) -> Option<crate::engine::FileEdit> {
-    let path = conf_path(paths);
+    plan_for(paths, layout, Dialect::Hyprlang)
+}
+
+/// Plan the managed block as a pipeline edit for a dialect, writing nothing.
+/// `None` when the file already describes exactly this layout.
+pub fn plan_for(
+    paths: &OmarchyPaths,
+    layout: &Layout,
+    dialect: Dialect,
+) -> Option<crate::engine::FileEdit> {
+    let path = user_path(paths, dialect);
     // `None` for a file that doesn't exist yet — the pipeline's hash guard
     // reads it the same way, and treating absent as empty makes it reject.
     let on_disk = std::fs::read_to_string(&path).ok();
     let existing = on_disk.clone().unwrap_or_default();
-    let updated = render_conf(&existing, layout);
+    let updated = render_for(&existing, layout, dialect);
     (updated != existing).then(|| crate::engine::FileEdit::new(path, on_disk.as_deref(), updated))
 }
 
@@ -914,7 +1045,10 @@ pub fn apply(
     runner: &dyn CommandRunner,
     summary: &str,
 ) -> Result<bool> {
-    let Some(edit) = plan(paths, layout) else {
+    // Probe the dialect from the same runner that will do the applying, so the
+    // layout lands in the file this machine's Hyprland actually reads.
+    let dialect = Dialect::probe(runner);
+    let Some(edit) = plan_for(paths, layout, dialect) else {
         return Ok(false); // already this layout
     };
     // One probe decides both: no usable hyprctl means nothing to reload and
@@ -1184,8 +1318,71 @@ mod tests {
         assert!(body.trim_end().ends_with("monitor = , preferred, auto, 1"));
     }
 
-    // A 3440x1440 ultrawide plus a 1920x1080 laptop panel at scale 1.5, which
-    // is 1280x720 effective — the mismatch that makes alignment matter.
+    #[test]
+    fn render_conf_preserves_user_lines() {
+        let mons = parse(TWO).unwrap();
+        let layout = Layout::from_monitors(&mons);
+        let existing = "# my own note\nmonitor = DP-9, disable\n";
+        let out = render_conf(existing, &layout);
+        assert!(out.contains("# my own note"));
+        assert!(out.contains("monitor = DP-9, disable"));
+        assert!(out.contains("omarchy-studio:monitors"));
+        assert!(out.contains("monitor = eDP-1,"));
+        // Re-rendering is idempotent (managed block replaced, not duplicated).
+        let again = render_conf(&out, &layout);
+        assert_eq!(again.matches("omarchy-studio:monitors").count(), 2); // open+close
+    }
+
+    #[test]
+    fn move_horizontal_swaps_two_touching_displays() {
+        let mons = parse(TWO).unwrap();
+        let mut layout = Layout::from_monitors(&mons);
+        assert!(layout.move_horizontal(&mons, "eDP-1", 1));
+        assert_eq!(layout.monitors[0].name, "eDP-1");
+        assert_eq!(layout.monitors[0].x, 1920, "eDP-1 moved to the right slot");
+        assert_eq!(layout.monitors[1].x, 0, "HDMI-A-1 took the left slot");
+        // y is untouched — a horizontal move never flattens vertical offsets.
+        assert_eq!(layout.monitors[0].y, 0);
+    }
+
+    #[test]
+    fn move_horizontal_refuses_past_the_edge() {
+        let mons = parse(TWO).unwrap();
+        let mut layout = Layout::from_monitors(&mons);
+        // eDP-1 is already leftmost.
+        assert!(!layout.move_horizontal(&mons, "eDP-1", -1));
+        assert_eq!(layout.monitors[0].x, 0, "unchanged");
+        // HDMI-A-1 is already rightmost.
+        assert!(!layout.move_horizontal(&mons, "HDMI-A-1", 1));
+        assert_eq!(layout.monitors[1].x, 1920, "unchanged");
+    }
+
+    #[test]
+    fn move_horizontal_unknown_name_is_a_no_op() {
+        let mons = parse(TWO).unwrap();
+        let mut layout = Layout::from_monitors(&mons);
+        assert!(!layout.move_horizontal(&mons, "DP-99", 1));
+    }
+
+    #[test]
+    fn move_horizontal_repacks_a_three_monitor_row() {
+        let mut mons = parse(TWO).unwrap();
+        let mut third = mons[1].clone();
+        third.name = "DP-3".into();
+        third.x = 3840;
+        mons.push(third);
+        let mut layout = Layout::from_monitors(&mons);
+        // Row is eDP-1(0) · HDMI-A-1(1920) · DP-3(3840), each 1920 wide.
+        // Move DP-3 (rightmost) one step left, past HDMI-A-1.
+        assert!(layout.move_horizontal(&mons, "DP-3", -1));
+        let by_name = |n: &str| layout.monitors.iter().find(|m| m.name == n).unwrap().x;
+        assert_eq!(by_name("eDP-1"), 0);
+        assert_eq!(by_name("DP-3"), 1920);
+        assert_eq!(by_name("HDMI-A-1"), 3840);
+    }
+
+    /// A laptop panel and an ultrawide side by side — the desk this crate's
+    /// author actually has, used to exercise placement and arrangement.
     const DESK: &str = r#"[
       {"id":0,"name":"eDP-1","description":"Lenovo 0x9059","make":"Lenovo","model":"0x9059",
        "width":1920,"height":1080,"refreshRate":120.213,"x":3440,"y":0,"scale":1.5,"transform":0,
@@ -1446,19 +1643,135 @@ mod tests {
         assert_eq!(Align::Start.label(false), "left");
         assert_eq!(Align::Start.next().next(), Align::End);
     }
+}
+
+/// Omarchy 4: the same layouts, rendered as `hl.monitor{}` calls.
+#[cfg(test)]
+mod lua_tests {
+    use super::*;
+
+    fn setting(name: &str) -> MonitorSetting {
+        MonitorSetting {
+            name: name.to_string(),
+            mode: "1920x1080@120.21".into(),
+            x: 0,
+            y: 0,
+            scale: "1.5".into(),
+            transform: 0,
+            disabled: false,
+        }
+    }
 
     #[test]
-    fn render_conf_preserves_user_lines() {
-        let mons = parse(TWO).unwrap();
-        let layout = Layout::from_monitors(&mons);
-        let existing = "# my own note\nmonitor = DP-9, disable\n";
-        let out = render_conf(existing, &layout);
-        assert!(out.contains("# my own note"));
-        assert!(out.contains("monitor = DP-9, disable"));
-        assert!(out.contains("omarchy-studio:monitors"));
-        assert!(out.contains("monitor = eDP-1,"));
-        // Re-rendering is idempotent (managed block replaced, not duplicated).
-        let again = render_conf(&out, &layout);
-        assert_eq!(again.matches("omarchy-studio:monitors").count(), 2); // open+close
+    fn renders_the_field_names_hyprland_accepts() {
+        let s = setting("eDP-1");
+        assert_eq!(
+            s.lua_line(),
+            "hl.monitor({ output = \"eDP-1\", mode = \"1920x1080@120.21\", \
+             position = \"0x0\", scale = 1.5, transform = 0 })"
+        );
+    }
+
+    /// Hyprland 0.56 validates the table and rejects unknown keys; it accepts
+    /// `disabled`, not `disable` (hyprlang's spelling) and not `enabled`.
+    #[test]
+    fn a_disabled_display_uses_the_disabled_field() {
+        let mut s = setting("HDMI-A-1");
+        s.disabled = true;
+        assert_eq!(
+            s.lua_line(),
+            "hl.monitor({ output = \"HDMI-A-1\", disabled = true })"
+        );
+    }
+
+    #[test]
+    fn body_keeps_the_hotplug_catch_all() {
+        let layout = Layout {
+            monitors: vec![setting("eDP-1")],
+        };
+        let body = layout.render_lua_body();
+        assert_eq!(body.lines().count(), 2);
+        assert!(body.lines().next().unwrap().contains("eDP-1"));
+        assert!(body.lines().last().unwrap().contains("output = \"\""));
+        assert_eq!(body, layout.body_for(Dialect::Lua));
+        assert_eq!(layout.render_body(), layout.body_for(Dialect::Hyprlang));
+    }
+
+    #[test]
+    fn writes_lua_markers_and_leaves_the_users_own_lines() {
+        let layout = Layout {
+            monitors: vec![setting("eDP-1")],
+        };
+        let users = "-- my own\nhl.monitor({ output = \"DP-9\", mode = \"preferred\", position = \"auto\", scale = 1 })\n";
+        let out = render_for(users, &layout, Dialect::Lua);
+        assert!(out.starts_with(users), "user's lines stay at the top");
+        assert!(out.contains("-- >>> omarchy-studio:monitors"));
+        assert!(out.contains("hl.monitor({ output = \"eDP-1\""));
+        assert!(!out.contains("monitor = eDP-1"), "no hyprlang syntax");
+    }
+
+    #[test]
+    fn plan_targets_the_lua_file_on_quattro() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "omarchy-studio-mon-lua-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join(".config/hypr")).unwrap();
+        let paths = OmarchyPaths {
+            system: root.join("share/omarchy"),
+            config: root.join(".config/omarchy"),
+            state: root.join(".local/state/omarchy"),
+        };
+        let layout = Layout {
+            monitors: vec![setting("eDP-1")],
+        };
+        let edit = plan_for(&paths, &layout, Dialect::Lua).expect("an edit");
+        assert_eq!(edit.file, paths.hypr_config().join("monitors.lua"));
+        assert_eq!(
+            user_path(&paths, Dialect::Hyprlang),
+            paths.hypr_config().join("monitors.conf")
+        );
+    }
+
+    /// The emitted block must compile — the same guarantee the golden suite
+    /// gives the look & feel blocks.
+    #[test]
+    fn emitted_block_is_valid_lua() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let mut disabled = setting("HDMI-A-1");
+        disabled.disabled = true;
+        let layout = Layout {
+            monitors: vec![setting("eDP-1"), disabled],
+        };
+        let source = layout.render_lua_body();
+
+        let Ok(mut child) = Command::new("luac")
+            .args(["-p", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        else {
+            eprintln!("skipping: no luac on PATH");
+            return;
+        };
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(source.as_bytes())
+            .expect("write");
+        let out = child.wait_with_output().expect("luac");
+        assert!(
+            out.status.success(),
+            "emitted invalid Lua:\n{source}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }

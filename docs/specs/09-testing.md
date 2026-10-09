@@ -10,7 +10,9 @@ The product's entire value proposition rests on *trust* (edits never lose user c
 
 ## 2. Golden-file corpus (the big one)
 
-`tests/fixtures/omarchy-3.8.2/` — a **vendored snapshot** of the reference machine's relevant files (sanitized): all `default/hypr/*.conf`, stock user hypr confs, `waybar/config.jsonc` + `style.css`, built-in `themed/*.tpl`, three theme dirs (dark, light, overlay). Tests:
+`tests/fixtures/omarchy-3.8.2/` — a **vendored snapshot** of the reference machine's relevant files (sanitized): all `default/hypr/*.conf`, stock user hypr confs, `waybar/config.jsonc` + `style.css`, built-in `themed/*.tpl`, three theme dirs (dark, light, overlay).
+
+Lua emission (Omarchy 4) is covered differently: rather than vendoring a fixture, every emitted block is compiled by the real `luac -p` in the golden suite, and the reader is asserted to be the emitter's exact inverse. Call forms and field names (`hl.monitor`'s `disabled`, `hl.dsp.layout`, `require` in place of `source =`) were established by probing the running compositor, which validates its tables and names the offending field. Tests:
 
 - Every parser round-trips every fixture byte-identically.
 - Every write operation on fixtures produces snapshot-reviewed output (`insta` crate): "add bind", "set blur.size", "reorder waybar lane", "materialize mako tpl" each have expected-output files a human reviewed once.
