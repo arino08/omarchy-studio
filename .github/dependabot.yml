@@ -1,0 +1,22 @@
+# Dependency update PRs. Every one runs the full CI (fmt, clippy, tests, the
+# pty journeys and cargo-deny), so a bump that breaks anything shows red.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # Patch/minor bumps land together; majors (ratatui, ureq) get their own
+      # PR because they usually need code changes.
+      minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
