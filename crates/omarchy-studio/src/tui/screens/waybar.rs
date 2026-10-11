@@ -277,17 +277,17 @@ impl WaybarScreen {
 
     /// Move the selected module up/down within its own lane.
     fn move_within(&mut self, dir: i64) {
-        let Some((li, mi)) = self.selected() else {
+        let (Some((li, mi)), Some(cfg)) = (self.selected(), self.cfg.as_mut()) else {
             return;
         };
         let lane = LANES[li];
-        let mut ids = self.cfg.as_ref().unwrap().lane(lane);
+        let mut ids = cfg.lane(lane);
         let target = mi as i64 + dir;
         if target < 0 || target as usize >= ids.len() {
             return;
         }
         ids.swap(mi, target as usize);
-        if self.cfg.as_mut().unwrap().reorder(lane, &ids).is_ok() {
+        if cfg.reorder(lane, &ids).is_ok() {
             self.dirty = true;
             // follow the moved item
             self.cursor = (self.cursor as i64 + dir).max(0) as usize;
@@ -297,7 +297,7 @@ impl WaybarScreen {
 
     /// Move the selected module to the adjacent lane (append there).
     fn move_lane(&mut self, dir: i64) {
-        let Some((li, mi)) = self.selected() else {
+        let (Some((li, mi)), Some(cfg)) = (self.selected(), self.cfg.as_mut()) else {
             return;
         };
         let target_lane = li as i64 + dir;
@@ -306,8 +306,9 @@ impl WaybarScreen {
         }
         let from = LANES[li];
         let to = LANES[target_lane as usize];
-        let id = self.cfg.as_ref().unwrap().lane(from)[mi].clone();
-        let cfg = self.cfg.as_mut().unwrap();
+        let Some(id) = cfg.lane(from).get(mi).cloned() else {
+            return;
+        };
         if cfg.remove(from, &id).is_ok() && cfg.add(to, &id).is_ok() {
             self.dirty = true;
         }
@@ -315,12 +316,14 @@ impl WaybarScreen {
     }
 
     fn remove_selected(&mut self) {
-        let Some((li, mi)) = self.selected() else {
+        let (Some((li, mi)), Some(cfg)) = (self.selected(), self.cfg.as_mut()) else {
             return;
         };
         let lane = LANES[li];
-        let id = self.cfg.as_ref().unwrap().lane(lane)[mi].clone();
-        if self.cfg.as_mut().unwrap().remove(lane, &id).is_ok() {
+        let Some(id) = cfg.lane(lane).get(mi).cloned() else {
+            return;
+        };
+        if cfg.remove(lane, &id).is_ok() {
             self.dirty = true;
             self.clamp_cursor();
         }
@@ -343,8 +346,10 @@ impl WaybarScreen {
                 // dropping a placeholder; a concrete module is added directly.
                 if module.id.ends_with("/*") {
                     self.wizard = Some(Wizard::new(li));
-                } else if self.cfg.as_mut().unwrap().add(LANES[li], module.id).is_ok() {
-                    self.dirty = true;
+                } else if let Some(cfg) = self.cfg.as_mut() {
+                    if cfg.add(LANES[li], module.id).is_ok() {
+                        self.dirty = true;
+                    }
                 }
             }
             _ => {}
@@ -376,12 +381,16 @@ impl WaybarScreen {
                     wiz.focus = 1;
                 } else {
                     let lane = LANES[wiz.lane];
-                    match self.cfg.as_mut().unwrap().add_custom_module(&spec, lane) {
+                    let Some(cfg) = self.cfg.as_mut() else {
+                        wiz.error = Some("no Waybar config loaded".into());
+                        return WaybarAction::None;
+                    };
+                    match cfg.add_custom_module(&spec, lane) {
                         Ok(_) => {
                             self.dirty = true;
                             self.wizard = None;
                         }
-                        Err(e) => self.wizard.as_mut().unwrap().error = Some(friendly(&e)),
+                        Err(e) => wiz.error = Some(friendly(&e)),
                     }
                 }
             }
@@ -635,5 +644,143 @@ fn friendly(e: &studio_core::StudioError) -> String {
     match e {
         studio_core::StudioError::External { detail, .. } => detail.clone(),
         other => format!("{other:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CONFIG: &str = r#"{
+  // the bar
+  "modules-left": ["clock", "cpu"],
+  "modules-center": ["hyprland/workspaces"],
+  "modules-right": ["battery"]
+}"#;
+
+    fn screen(cfg: Option<WaybarConfig>) -> WaybarScreen {
+        WaybarScreen {
+            cfg,
+            error: None,
+            cursor: 0,
+            dirty: false,
+            picker: None,
+            wizard: None,
+            target_source: Source::Default,
+            candidates: Vec::new(),
+            target_picker: None,
+        }
+    }
+
+    fn loaded() -> WaybarScreen {
+        screen(Some(
+            WaybarConfig::parse(PathBuf::from("/nonexistent/config.jsonc"), CONFIG).unwrap(),
+        ))
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn lanes(s: &WaybarScreen) -> Vec<Vec<String>> {
+        let cfg = s.cfg.as_ref().unwrap();
+        LANES.iter().map(|l| cfg.lane(l)).collect()
+    }
+
+    #[test]
+    fn shift_down_reorders_within_the_lane_and_follows_the_module() {
+        let mut s = loaded();
+        s.handle(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+        assert_eq!(lanes(&s)[0], ["cpu", "clock"]);
+        assert_eq!(s.cursor, 1, "cursor follows the moved module");
+        assert!(s.dirty);
+        // already last in its lane: a further move is a no-op, not a panic
+        s.handle(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+        assert_eq!(lanes(&s)[0], ["cpu", "clock"]);
+    }
+
+    #[test]
+    fn arrows_move_a_module_across_lanes() {
+        let mut s = loaded();
+        s.handle(key(KeyCode::Right));
+        assert_eq!(lanes(&s)[0], ["cpu"]);
+        assert!(lanes(&s)[1].contains(&"clock".to_string()));
+        // the left edge stops at the left lane
+        let mut s = loaded();
+        s.handle(key(KeyCode::Left));
+        assert_eq!(lanes(&s)[0], ["clock", "cpu"]);
+        assert!(!s.dirty);
+    }
+
+    #[test]
+    fn removing_the_last_module_clamps_the_cursor() {
+        let mut s = loaded();
+        s.handle(key(KeyCode::End));
+        assert_eq!(s.cursor, 3);
+        s.handle(key(KeyCode::Char('d')));
+        assert!(lanes(&s)[2].is_empty());
+        assert_eq!(s.cursor, 2, "cursor stays on a real module");
+        assert!(matches!(
+            s.handle(key(KeyCode::Char('s'))),
+            WaybarAction::Apply
+        ));
+    }
+
+    #[test]
+    fn picker_adds_a_catalog_module_to_the_cursor_lane() {
+        let mut s = loaded();
+        let idx = MODULES
+            .iter()
+            .position(|m| !m.id.ends_with("/*") && m.id != "clock" && m.id != "cpu")
+            .unwrap();
+        s.handle(key(KeyCode::Char('a')));
+        assert!(s.is_modal());
+        for _ in 0..idx {
+            s.handle(key(KeyCode::Down));
+        }
+        s.handle(key(KeyCode::Enter));
+        assert!(!s.is_modal());
+        assert!(lanes(&s)[0].contains(&MODULES[idx].id.to_string()));
+    }
+
+    #[test]
+    fn the_custom_module_wizard_validates_before_adding() {
+        let mut s = loaded();
+        s.wizard = Some(Wizard::new(2));
+        s.handle(key(KeyCode::Enter));
+        assert_eq!(
+            s.wizard.as_ref().unwrap().error.as_deref(),
+            Some("give the module a name")
+        );
+        for c in "weather".chars() {
+            s.handle(key(KeyCode::Char(c)));
+        }
+        s.handle(key(KeyCode::Enter));
+        assert_eq!(
+            s.wizard.as_ref().unwrap().error.as_deref(),
+            Some("what command should it run?")
+        );
+        for c in "curl wttr.in".chars() {
+            s.handle(key(KeyCode::Char(c)));
+        }
+        s.handle(key(KeyCode::Enter));
+        assert!(s.wizard.is_none(), "a valid spec closes the wizard");
+        assert!(lanes(&s)[2].iter().any(|id| id.starts_with("custom/")));
+        assert!(s.dirty);
+    }
+
+    #[test]
+    fn without_a_config_every_key_is_harmless() {
+        let mut s = screen(None);
+        for code in [
+            KeyCode::Down,
+            KeyCode::Right,
+            KeyCode::Char('d'),
+            KeyCode::Char('a'),
+            KeyCode::Char('s'),
+        ] {
+            assert!(matches!(s.handle(key(code)), WaybarAction::None));
+        }
+        assert!(!s.dirty);
     }
 }
