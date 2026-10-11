@@ -1142,7 +1142,8 @@ impl App {
         let out = RealRunner.run(&power::set_cmd(&name));
         match out {
             Ok(o) if o.ok() => {
-                let _ = power::set_persist(&self.paths, Some(&name));
+                let dialect = studio_core::omarchy::Dialect::probe(&RealRunner);
+                let _ = power::set_persist(&self.paths, dialect, Some(&name));
                 self.battery.reload();
                 self.toast = Some(Toast {
                     text: format!("Power profile → {name}"),

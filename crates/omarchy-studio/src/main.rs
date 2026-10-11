@@ -17,7 +17,7 @@ use clap::{Arg, Command};
 use studio_core::cmd::{CommandRunner, RealRunner};
 use studio_core::deps::{probe_all, DepStatus, Registry};
 use studio_core::modules::themes::{slugify, ThemeOrigin, ThemeStore};
-use studio_core::omarchy::{cmds, Capabilities, Component, OmarchyPaths};
+use studio_core::omarchy::{cmds, Capabilities, Component, Dialect, OmarchyPaths};
 use studio_core::snapshot::{SnapshotKind, SnapshotStore};
 
 /// One verb group: a one-line summary for the group list, and its real usage
@@ -3577,7 +3577,7 @@ fn power(args: &[&str]) -> i32 {
     match args {
         ["profile", "list"] | ["profile"] => match pw::list(&RealRunner) {
             Ok(profiles) => {
-                let persisted = pw::persisted(&paths);
+                let persisted = pw::persisted(&paths, Dialect::probe(&RealRunner));
                 for p in profiles {
                     let mark = if p.active { "●" } else { "○" };
                     let tag = if persisted.as_deref() == Some(&p.name) {
@@ -3619,8 +3619,9 @@ fn power(args: &[&str]) -> i32 {
                 }
             }
             if persist {
-                match pw::set_persist(&paths, Some(name)) {
-                    Ok(_) => println!("persisted at login (autostart.conf)"),
+                let dialect = Dialect::probe(&RealRunner);
+                match pw::set_persist(&paths, dialect, Some(name)) {
+                    Ok(_) => println!("persisted at login (autostart.{})", dialect.ext()),
                     Err(e) => eprintln!("couldn't persist: {}", brief(e)),
                 }
             }

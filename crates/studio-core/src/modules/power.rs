@@ -1,8 +1,9 @@
 //! Power profiles & AC/battery auto-switch (roadmap 0.8.6).
 //!
 //! Wraps `powerprofilesctl` (power-profiles-daemon) to read and switch the
-//! active profile, persist a choice across logins via an `exec-once` managed
-//! block in the user's `autostart.conf`, and render the udev rule that flips
+//! active profile, persist a choice across logins via a run-at-start managed
+//! block in the user's autostart file (`autostart.conf`'s `exec-once`, or
+//! `autostart.lua`'s `o.exec_on_start` on Omarchy 4), and render the udev rule that flips
 //! the profile automatically on AC plug/unplug. Root writes (the udev rule)
 //! are always rendered for preview first — the frontend shows the exact text
 //! and command before anything runs; this module never shells out to `sudo`.
@@ -10,9 +11,9 @@
 use std::path::PathBuf;
 
 use crate::cmd::{find_in_path, Cmd, CommandRunner};
-use crate::configfs::{CommentStyle, ManagedBlock};
+use crate::configfs::ManagedBlock;
 use crate::error::{Result, StudioError};
-use crate::omarchy::OmarchyPaths;
+use crate::omarchy::{Dialect, OmarchyPaths};
 
 /// A power profile as reported by `powerprofilesctl`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,25 +75,43 @@ pub fn set_cmd(name: &str) -> Cmd {
 
 const AUTOSTART_SECTION: &str = "power-profile";
 
-/// The user's `autostart.conf` — Hyprland sources it last, so an `exec-once`
-/// here runs on login.
-pub fn autostart_path(paths: &OmarchyPaths) -> PathBuf {
-    paths.hypr_config().join("autostart.conf")
+/// The user's autostart file for this dialect — Hyprland sources it last, so
+/// a run-at-start line here runs on login. Always dialect-driven: on Omarchy
+/// 4 `autostart.conf` still exists on an upgraded machine but nothing reads
+/// it, so writing there would "persist" a profile that never applies.
+pub fn autostart_path(paths: &OmarchyPaths, dialect: Dialect) -> PathBuf {
+    paths
+        .hypr_config()
+        .join(format!("autostart.{}", dialect.ext()))
 }
 
-fn autostart_block() -> ManagedBlock {
-    ManagedBlock::new(AUTOSTART_SECTION, CommentStyle::Hash)
+fn autostart_block(dialect: Dialect) -> ManagedBlock {
+    ManagedBlock::new(AUTOSTART_SECTION, dialect.comment_style())
 }
 
-/// Set (`Some(name)`) or clear (`None`) the login-persisted profile: an
-/// `exec-once = powerprofilesctl set <name>` in a managed block. Returns the
-/// file when it changed.
-pub fn set_persist(paths: &OmarchyPaths, name: Option<&str>) -> Result<Vec<PathBuf>> {
-    let path = autostart_path(paths);
+/// The block body that switches to `name` at login, in the dialect's syntax
+/// (Lua uses Omarchy's own run-once-at-start helper).
+fn persist_line(dialect: Dialect, name: &str) -> String {
+    if dialect.is_lua() {
+        format!("o.exec_on_start(\"powerprofilesctl set {name}\")")
+    } else {
+        format!("exec-once = powerprofilesctl set {name}")
+    }
+}
+
+/// Set (`Some(name)`) or clear (`None`) the login-persisted profile: a
+/// `powerprofilesctl set <name>` run at start, in a managed block. Returns
+/// the file when it changed.
+pub fn set_persist(
+    paths: &OmarchyPaths,
+    dialect: Dialect,
+    name: Option<&str>,
+) -> Result<Vec<PathBuf>> {
+    let path = autostart_path(paths, dialect);
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    let block = autostart_block();
+    let block = autostart_block(dialect);
     let updated = match name {
-        Some(n) => block.upsert(&existing, &format!("exec-once = powerprofilesctl set {n}")),
+        Some(n) => block.upsert(&existing, &persist_line(dialect, n)),
         None => block.remove(&existing),
     };
     if updated == existing {
@@ -106,10 +125,16 @@ pub fn set_persist(paths: &OmarchyPaths, name: Option<&str>) -> Result<Vec<PathB
 }
 
 /// The login-persisted profile name, if one is set.
-pub fn persisted(paths: &OmarchyPaths) -> Option<String> {
-    let text = std::fs::read_to_string(autostart_path(paths)).ok()?;
-    let body = autostart_block().extract(&text)?;
-    body.split_whitespace().last().map(str::to_string)
+pub fn persisted(paths: &OmarchyPaths, dialect: Dialect) -> Option<String> {
+    let text = std::fs::read_to_string(autostart_path(paths, dialect)).ok()?;
+    let body = autostart_block(dialect).extract(&text)?;
+    let (_, rest) = body.split_once("powerprofilesctl set ")?;
+    let name = rest
+        .trim()
+        .trim_end_matches(")")
+        .trim_end_matches('"')
+        .trim();
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 // ------------------------------------------------------------ AC/battery udev
@@ -184,33 +209,63 @@ mod tests {
         );
     }
 
+    const HL: Dialect = Dialect::Hyprlang;
+
     #[test]
     fn persist_round_trips() {
         let (paths, _root) = fake_paths("persist");
-        assert!(persisted(&paths).is_none());
-        let files = set_persist(&paths, Some("power-saver")).unwrap();
+        assert!(persisted(&paths, HL).is_none());
+        let files = set_persist(&paths, HL, Some("power-saver")).unwrap();
         assert_eq!(files.len(), 1);
-        assert_eq!(persisted(&paths).as_deref(), Some("power-saver"));
+        assert_eq!(persisted(&paths, HL).as_deref(), Some("power-saver"));
         let text = std::fs::read_to_string(&files[0]).unwrap();
         assert!(text.contains("exec-once = powerprofilesctl set power-saver"));
         // idempotent
-        assert!(set_persist(&paths, Some("power-saver")).unwrap().is_empty());
+        assert!(set_persist(&paths, HL, Some("power-saver"))
+            .unwrap()
+            .is_empty());
         // clear
-        set_persist(&paths, None).unwrap();
-        assert!(persisted(&paths).is_none());
+        set_persist(&paths, HL, None).unwrap();
+        assert!(persisted(&paths, HL).is_none());
+    }
+
+    #[test]
+    fn persist_targets_the_lua_autostart_on_quattro() {
+        let (paths, _root) = fake_paths("lua");
+        // An upgraded machine still has the old file; it must stay untouched.
+        let conf = autostart_path(&paths, HL);
+        std::fs::create_dir_all(conf.parent().unwrap()).unwrap();
+        std::fs::write(&conf, "exec-once = legacy\n").unwrap();
+
+        let files = set_persist(&paths, Dialect::Lua, Some("balanced")).unwrap();
+        assert_eq!(files, [paths.hypr_config().join("autostart.lua")]);
+        let text = std::fs::read_to_string(&files[0]).unwrap();
+        assert!(
+            text.contains("o.exec_on_start(\"powerprofilesctl set balanced\")"),
+            "{text}"
+        );
+        assert!(text.contains("-- "), "Lua comment markers, not #: {text}");
+        assert!(!text.contains("exec-once"));
+        assert_eq!(persisted(&paths, Dialect::Lua).as_deref(), Some("balanced"));
+        assert_eq!(
+            std::fs::read_to_string(&conf).unwrap(),
+            "exec-once = legacy\n"
+        );
+        set_persist(&paths, Dialect::Lua, None).unwrap();
+        assert!(persisted(&paths, Dialect::Lua).is_none());
     }
 
     #[test]
     fn persist_preserves_user_autostart_lines() {
         let (paths, _root) = fake_paths("coexist");
-        let path = autostart_path(&paths);
+        let path = autostart_path(&paths, HL);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "exec-once = my-own-thing\n").unwrap();
-        set_persist(&paths, Some("balanced")).unwrap();
+        set_persist(&paths, HL, Some("balanced")).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("exec-once = my-own-thing"));
         assert!(text.contains("powerprofilesctl set balanced"));
-        set_persist(&paths, None).unwrap();
+        set_persist(&paths, HL, None).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("exec-once = my-own-thing"));
         assert!(!text.contains("powerprofilesctl"));
