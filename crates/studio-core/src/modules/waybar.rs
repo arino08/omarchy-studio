@@ -163,7 +163,13 @@ impl WaybarConfig {
             cmd: format!("read {}", path.display()),
             detail: e.to_string(),
         })?;
-        let doc = JsoncDoc::parse(&src).map_err(|e| StudioError::ParseFailed {
+        Self::parse(path, &src)
+    }
+
+    /// A config from text already in hand, attributed to `path` (where a
+    /// save would write it). `load` without the target resolution.
+    pub fn parse(path: PathBuf, src: &str) -> Result<Self> {
+        let doc = JsoncDoc::parse(src).map_err(|e| StudioError::ParseFailed {
             file: path.clone(),
             line: None,
             hint: e,

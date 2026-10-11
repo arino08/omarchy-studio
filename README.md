@@ -26,7 +26,7 @@ curl -sL https://raw.githubusercontent.com/arino08/omarchy-studio/main/install.s
 omarchy-studio
 ```
 
-> **Status: alpha, and honest about it.** Everything below is built, tested (477 tests, plus the TUI itself driven in a pty on every CI run) and drives the real Omarchy config on disk. v0.9.3 is the current release; the Omarchy 4 support described here is newer than it. Tested against Omarchy 3.8 and 4.0 "Quattro" / Hyprland 0.55 and 0.56 — Studio warns, but never refuses to run, on versions it hasn't seen. On Quattro it writes Hyprland's new Lua config; the bar, notification and OSD screens are unavailable there, because Omarchy 4 replaced Waybar, Mako and SwayOSD with the Quickshell shell.
+> **Status: alpha, and honest about it.** Everything below is built, tested (495 tests, plus the TUI itself driven in a pty on every CI run) and drives the real Omarchy config on disk. v0.9.3 is the current release; the Omarchy 4 support described here is newer than it. Tested against Omarchy 3.8 and 4.0 "Quattro" / Hyprland 0.55 and 0.56 — Studio warns, but never refuses to run, on versions it hasn't seen. On Quattro it writes Hyprland's new Lua config; the bar, notification and OSD screens are unavailable there, because Omarchy 4 replaced Waybar, Mako and SwayOSD with the Quickshell shell.
 
 ## Why
 
@@ -88,7 +88,7 @@ This is the part that matters, so it's not buried at the bottom:
 | **Quick tweaks** | One-key reversible toggles (Caps→Escape, inactive-window transparency, screenshot/screencast folders…) — each a self-contained managed block, individually revertible, never touching Omarchy's vendored files | v0.8 |
 | **Nice Launcher** | Drive the Nice Launcher (Quickshell app-search overlay): visual mode (constellation / spotlight / orbital / grid), backdrop, animation toggles and providers written to `nova.json`, snapshot-backed; optional launch keybind through the managed keybinds block; launch or install it straight from the rail. CLI `nova show|mode|set|anim|providers|keybind|launch|install|uninstall` | — |
 | **Snapshots** | Browse every change Studio has ever made as a timeline with a live colored diff pane, and roll the whole tree back to any point — the restore is itself recorded, so it too can be undone. Only possible because the undo store is a real git repo. CLI `snapshot log`/`show <id>`/`restore <id>` | v0.9 |
-| **Rice bundle** | Move a whole setup to another machine: `rice export` archives every config file Studio wrote (grouped by module) plus your own themes, and `rice import` **replays each file through the apply pipeline** — pre-snapshot, drift check, reload, verification, automatic rollback — instead of untarring over a live desktop. Machine-specific files (`monitors.conf`) and themes you already have are left alone unless asked for; `--dry-run` shows the whole plan first | v0.9 |
+| **Rice bundle** | Move a whole setup to another machine: `rice export` archives every config file Studio wrote (grouped by module) plus your own themes, and `rice import` **replays each file through the apply pipeline** — pre-snapshot, drift check, reload, verification, automatic rollback — instead of untarring over a live desktop. Machine-specific files (`monitors.conf`) and themes you already have are left alone unless asked for; `--dry-run` shows the whole plan first. A bundle that would add anything able to run a command (`exec-once`, a Waybar `on-click`, shell in `~/.bashrc`, Lua `os.execute`) lists those lines and asks before importing (`--yes` to skip in scripts); bundles containing symlinks or special files are refused outright | v0.9 |
 | **Theme sync** | Opt-in tools that follow your Omarchy theme — fzf and lazygit re-tint from the active `colors.toml` on every theme switch (via the `theme-set` hook). Studio never rewrites the tool's own config: it generates standalone files wired in through a single `~/.bashrc` managed block. CLI `themesync list`/`enable <tool>`/`apply` | v0.7 |
 | **Self-update** | Daily release check; `U` in the TUI (or `omarchy-studio update`) downloads, swaps, and restarts — hands off to pacman for packaged installs | v0.7 |
 
@@ -103,7 +103,7 @@ Needs an Omarchy system (Arch + Hyprland). The installer downloads a release bin
 curl -sL https://raw.githubusercontent.com/arino08/omarchy-studio/main/install.sh | sh
 ```
 
-It installs over whatever `omarchy-studio` is already on your `PATH` (or `~/.local/bin`), checks that what it downloaded is really a binary before replacing anything, and prints the version it installed.
+It installs over whatever `omarchy-studio` is already on your `PATH` (or `~/.local/bin`), verifies the download against the release's published SHA-256 before replacing anything, and prints the version it installed. The self-updater (`U` in the TUI, `omarchy-studio update`) does the same check and refuses a binary it can't verify. Release binaries also carry a build-provenance attestation: `gh attestation verify omarchy-studio-linux-x86_64 -R arino08/omarchy-studio`.
 
 <details>
 <summary>Build from source instead (needs Rust 1.95+)</summary>
@@ -141,8 +141,8 @@ omarchy-studio          # launch the full-screen cockpit
 | <kbd>Ctrl</kbd>+<kbd>j</kbd>/<kbd>k</kbd>, <kbd>Ctrl</kbd>+<kbd>Up</kbd>/<kbd>Down</kbd> | globally cycle through modules |
 | **Mouse Click** | click rail tabs to instantly switch modules |
 | <kbd>1</kbd>–<kbd>9</kbd>, <kbd>0</kbd> | jump to one of the first ten modules (from the rail) |
-| <kbd>j</kbd> / <kbd>k</kbd>, arrows | move within a screen |
-| <kbd>h</kbd> / <kbd>l</kbd> | adjust the selected value |
+| <kbd>↑</kbd> / <kbd>↓</kbd> | move within a screen |
+| <kbd>←</kbd> / <kbd>→</kbd> | adjust the selected value (Look & Feel also takes <kbd>-</kbd> / <kbd>+</kbd>) |
 | <kbd>Enter</kbd> | open a picker (avatar, theme, …) |
 | <kbd>c</kbd> | (themes) browse the community directory — preview before installing |
 | <kbd>t</kbd> | (wallpapers) craft a theme from the selected image |
@@ -155,9 +155,23 @@ omarchy-studio          # launch the full-screen cockpit
 
 Studio themes itself from your active Omarchy theme — panels, highlights, and the wordmark all re-tint with every theme switch. Every rail entry is a real, working screen.
 
+## Learn more
+
+- **[Quickstart](docs/quickstart.md)**: install, first run, and one change you undo, in five minutes.
+- **[Tutorial](docs/tutorial.md)**: from a stock install to a finished rice, then carried to another machine.
+- **[What file did that touch?](docs/what-file.md)**: every file each screen writes, on Omarchy 3 and 4.
+
 ## CLI reference
 
-Everything the TUI does is scriptable. Each mutating command prints its undo hint.
+Everything the TUI does is scriptable. Each mutating command prints its undo hint. The read commands — `theme list|current`, `snapshot log`, `tweak list`, `toggle list`, `looknfeel list|get`, `themesync list`, `update --check` — take `--json` for scripts and bar widgets. `omarchy-studio <command> --help` shows a command's usage, and `omarchy-studio man | man -l -` the whole reference.
+
+Tab completion knows every verb plus live values — your theme names, the tweak catalog, Look & Feel keys. The AUR package installs it; otherwise:
+
+```bash
+omarchy-studio completions bash > ~/.local/share/bash-completion/completions/omarchy-studio
+omarchy-studio completions zsh  > "${fpath[1]}/_omarchy-studio"
+omarchy-studio completions fish > ~/.config/fish/completions/omarchy-studio.fish
+```
 
 <details>
 <summary><strong>View full CLI reference</strong></summary>
@@ -170,6 +184,7 @@ omarchy-studio theme extract <image> [normal|muted|material] [auto|dark|light]
 omarchy-studio theme community list | search <q> | install <name|owner/repo|url>   # install clones + applies
 omarchy-studio theme new [name] --from-current-wallpaper [--apply]   # instant theme from what's on screen
 omarchy-studio theme keybind install [MODS KEY] | remove | show      # opt-in SUPER+SHIFT+T for the above
+omarchy-studio theme export <name> [--out f.tar.gz]   # share one theme (merged view, no .git)
 
 # Wallpapers
 omarchy-studio wallpaper list | current | set <n|name|path> | next | add <file> | remove <name>
@@ -188,7 +203,7 @@ omarchy-studio snapshot list | undo
 # Theme sync (fzf, lazygit follow the active theme)
 omarchy-studio rice export [--out f.tar.gz]      # bundle Studio's config files + your themes
 omarchy-studio rice show <f.tar.gz>              # what's inside, by module
-omarchy-studio rice import <f.tar.gz> [--themes] [--only waybar,mako] [--with-monitors] [--dry-run]
+omarchy-studio rice import <f.tar.gz> [--themes] [--only waybar,mako] [--with-monitors] [--dry-run] [--yes]
 omarchy-studio themesync list                    # tools + on/off + installed state
 omarchy-studio themesync enable <tool>           # opt a tool in, regenerate now
 omarchy-studio themesync disable <tool>
@@ -321,11 +336,14 @@ The five rules every feature is held to. The first four are why [nothing here is
 | `docs/specs/` | Build specs — the *how* (start at `00-overview.md`) |
 | `ROADMAP.md` | Milestones broken into issue-sized tasks |
 | `docs/comparison.md` | How Studio compares to A La Carchy |
-| `docs/handoff-v0.8.md`, `docs/handoff-v0.9.md` | Architecture guides for the v0.8 / v0.9 milestones |
+| `docs/quickstart.md`, `docs/tutorial.md`, `docs/what-file.md` | User docs: first run, a full rice, and the file map |
+| `docs/handoff-v0.8.md`, `docs/handoff-v0.9.md` | Architecture guides for the v0.8 / v0.9 milestones (historical) |
 | `crates/studio-core/` | Engine library: config model, comment-preserving parsers, apply pipeline, snapshots, Omarchy adapter |
 | `crates/omarchy-studio/` | The binary: TUI + CLI frontends |
 | `tools/termshot/` | Renders tmux captures to the README media (screenshots + tour GIF) |
 | `tools/e2e.sh` | Drives the TUI in a tmux pty against a fixture Omarchy — the CI journey test |
+| `tools/rollback-e2e.sh` | Drives apply → snapshot → undo → rollback (and the `--json` output) with the real binary |
+| `deny.toml` | Supply-chain policy for `cargo deny` (advisories, licenses, sources), run in CI and weekly |
 | `packaging/aur/` | PKGBUILD, refreshed against a released tag by `tools/refresh-pkgbuild.sh` |
 | `data/animation-presets/` | Reference animation blocks (the shipped presets are compiled in) |
 

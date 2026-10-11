@@ -1,7 +1,7 @@
 # AUR packaging
 
 `PKGBUILD` builds `omarchy-studio` from the GitHub release tag and installs the
-binary, README, and LICENSE. Once on the AUR, users install with any helper:
+binary, README, LICENSE, the man page and bash/zsh/fish completions. Once on the AUR, users install with any helper:
 
 ```bash
 yay -S omarchy-studio      # or: paru -S omarchy-studio

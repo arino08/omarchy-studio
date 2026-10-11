@@ -17,9 +17,8 @@ This document tracks the work completed during the recent session and outlines e
 - **README Updates**: Added a ToC, ASCII branding, and updated the Quick Start shortcut table to reflect the new `Ctrl+J/K` and mouse navigation.
 - **Clippy Fixes**: Fixed `clippy::collapsible_if` warnings blocking the CI in `crates/omarchy-studio/src/tui/mod.rs` (`on_mouse`).
 
-### 🚨 Temporary Fixes Applied
-- **Updates (`omarchy-studio update`)**: Because GitHub Actions currently fails to attach a release binary to tags, `studio-core::modules::update::apply()` has been temporarily hacked to run `curl -sL https://raw.githubusercontent.com/arino08/omarchy-studio/main/install.sh | sh`. This is also logged at the top of `ROADMAP.md`. 
-  - *Action for future agent*: Revert this hack once the GitHub release workflow is correctly building and attaching the `omarchy-studio-linux-x86_64` binary to a release tag.
+### Temporary fixes (resolved)
+- **Updates (`omarchy-studio update`)**: this session briefly made `update::apply()` pipe `install.sh` to `sh` while the release workflow wasn't attaching binaries. That hack is **gone**. `release.yml` attaches `omarchy-studio-linux-x86_64` plus its `.sha256`, and `update::apply()` downloads the asset, refuses it unless it is an ELF whose SHA-256 matches the published one, then renames it over the running binary. Nothing here needs reverting.
 
 ## 2. Deferred / Postponed Work
 - The user specifically requested to **pause** work on the `fzf`-style fuzzy finder (for themes/wallpapers) and transition animations for now. Do not prioritize these until explicitly asked.

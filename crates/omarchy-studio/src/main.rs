@@ -10,13 +10,14 @@
 //! every group to document itself, which is what a user typing `--help`
 //! actually wants.
 
+mod complete;
 mod tui;
 
 use clap::{Arg, Command};
 use studio_core::cmd::{CommandRunner, RealRunner};
 use studio_core::deps::{probe_all, DepStatus, Registry};
 use studio_core::modules::themes::{slugify, ThemeOrigin, ThemeStore};
-use studio_core::omarchy::{cmds, Capabilities, Component, OmarchyPaths};
+use studio_core::omarchy::{cmds, Capabilities, Component, Dialect, OmarchyPaths};
 use studio_core::snapshot::{SnapshotKind, SnapshotStore};
 
 /// One verb group: a one-line summary for the group list, and its real usage
@@ -68,6 +69,7 @@ fn cli() -> Command {
              theme new [name] --from-current-wallpaper [--apply]\n  \
              theme extract <image> [normal|muted|material] [auto|dark|light]\n  \
              theme community list | search <q> | install <name|owner/repo|url>\n  \
+             theme export <name> [--out file.tar.gz]\n  \
              theme keybind install [MODS KEY] | remove | show"))
         .subcommand(group("wallpaper", "Set wallpapers and search wallhaven",
             "usage:\n  \
@@ -84,7 +86,7 @@ fn cli() -> Command {
             "usage:\n  \
              rice export [--out file.tar.gz]\n  \
              rice show <file.tar.gz>\n  \
-             rice import <file.tar.gz> [--only mods] [--themes] [--with-monitors] [--dry-run]"))
+             rice import <file.tar.gz> [--only mods] [--themes] [--with-monitors] [--dry-run] [--yes]"))
         .subcommand(group("themesync", "Keep other tools' colours following the active theme",
             "usage: omarchy-studio themesync list | enable <tool> | disable <tool> | apply"))
         .subcommand(group("looknfeel", "Hyprland window, layout, decoration and input settings",
@@ -114,6 +116,7 @@ fn cli() -> Command {
              shell bar list | catalog | position <top|bottom|left|right> | transparent <true|false|toggle>\n  \
              shell bar move <id> [placement] | put <id> [placement] | set <id> <key> <value> [--json] [placement] | defaults\n  \
              shell plugin list | enable <id> [placement] | disable <id>\n  \
+             shell appearance show | set <font-size|bar-size-horizontal|bar-size-vertical|bar-scale-with-font|spacing-scale|spacing-scale-with-font> <value>\n  \
              placement: --section <left|center|right> --index <n> --before <id> --after <id> --from-section <s> --from-index <n>"))
         .subcommand(group("idle", "Idle timeline (screensaver, lock, screen-off, suspend)",
             "usage:\n  \
@@ -149,6 +152,15 @@ fn cli() -> Command {
         .subcommand(group("update", "Update Studio itself", "usage: omarchy-studio update [--check]"))
         .subcommand(group("install-integration", "Add Studio to the Omarchy menu", "usage: omarchy-studio install-integration"))
         .subcommand(group("uninstall", "Remove Studio's hooks, menu entry and theme-sync wiring (your configs stay)", "usage: omarchy-studio uninstall"))
+        .subcommand(group("completions", "Print a shell completion script (bash, zsh, fish)",
+            "usage: omarchy-studio completions bash|zsh|fish\n  \
+             bash:  omarchy-studio completions bash > ~/.local/share/bash-completion/completions/omarchy-studio\n  \
+             zsh:   omarchy-studio completions zsh > \"${fpath[1]}/_omarchy-studio\"\n  \
+             fish:  omarchy-studio completions fish > ~/.config/fish/completions/omarchy-studio.fish"))
+        .subcommand(group("man", "Print the man page (read it with: omarchy-studio man | man -l -)",
+            "usage: omarchy-studio man"))
+        // Called by the completion scripts, not by people.
+        .subcommand(group("__complete", "Internal: completion candidates for a command line", "usage: omarchy-studio __complete <words…>").hide(true))
         // Dispatched by the Omarchy hook runner, not by people.
         .subcommand(group("hook", "Internal: run a Studio hook event", "usage: omarchy-studio hook <event>").hide(true))
 }
@@ -216,7 +228,25 @@ fn print_group_help(name: &str) {
     }
 }
 
+/// Groups whose read verbs can answer `--json` (see [`json_out`]). `shell`
+/// is deliberately absent: there `--json` means "this value is JSON".
+const JSON_GROUPS: &[&str] = &[
+    "theme",
+    "snapshot",
+    "tweak",
+    "toggle",
+    "looknfeel",
+    "themesync",
+    "update",
+];
+
 fn dispatch(argv: &[&str]) -> i32 {
+    if let [group, rest @ ..] = argv {
+        if rest.contains(&"--json") && JSON_GROUPS.contains(group) {
+            let rest: Vec<&str> = rest.iter().copied().filter(|a| *a != "--json").collect();
+            return json_out(group, &rest);
+        }
+    }
     match argv {
         ["doctor", rest @ ..] => doctor(rest.contains(&"--deps"), rest.contains(&"--quiet")),
         ["migrate", rest @ ..] => migrate(rest.contains(&"--dry-run")),
@@ -249,6 +279,12 @@ fn dispatch(argv: &[&str]) -> i32 {
         ["power", rest @ ..] => power(rest),
         ["themesync", rest @ ..] => themesync(rest),
         ["rice", rest @ ..] => rice(rest),
+        ["completions", rest @ ..] => complete::completions(rest),
+        ["man"] => {
+            print!("{}", complete::man_page(&cli()));
+            0
+        }
+        ["__complete", rest @ ..] => complete::complete(rest),
         ["install-integration"] => install_integration(),
         ["uninstall"] => uninstall(),
         // clap rejects unknown groups before we get here; a known group with
@@ -258,6 +294,158 @@ fn dispatch(argv: &[&str]) -> i32 {
             2
         }
         [] => 2,
+    }
+}
+
+/// Machine-readable answers for scripts, bar widgets and bug reports. Kept
+/// in one place, apart from the human output, so neither can bend the
+/// other: every shape here is a stable contract, every text line is not.
+/// Read-only by construction — `--json` never changes anything (`update
+/// --json` checks, it doesn't install).
+fn json_out(group: &str, args: &[&str]) -> i32 {
+    use serde_json::{json, Value};
+    let print = |v: Value| {
+        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        0
+    };
+    match (group, args) {
+        ("theme", ["list"] | ["current"]) => {
+            let Some(paths) = omarchy() else { return 4 };
+            let current = paths.current_theme_name().ok();
+            if args == ["current"] {
+                return print(json!({ "slug": current }));
+            }
+            let themes: Vec<Value> = ThemeStore::from_paths(&paths)
+                .list()
+                .into_iter()
+                .map(|t| {
+                    json!({
+                        "slug": t.slug,
+                        "name": t.pretty,
+                        "origin": match t.origin {
+                            ThemeOrigin::System => "system",
+                            ThemeOrigin::User => "user",
+                            ThemeOrigin::Overlay => "overlay",
+                        },
+                        "light": t.light(),
+                        "current": current.as_deref() == Some(t.slug.as_str()),
+                    })
+                })
+                .collect();
+            print(Value::Array(themes))
+        }
+        ("snapshot", ["log"] | ["list"]) => {
+            let store = match history() {
+                Ok(s) => s,
+                Err(code) => return code,
+            };
+            let entries: Vec<Value> = store
+                .list(30)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|e| {
+                    json!({
+                        "id": e.id,
+                        "kind": e.kind.map(|k| format!("{k:?}").to_lowercase()),
+                        "summary": e.summary,
+                        "timestamp": e.timestamp,
+                    })
+                })
+                .collect();
+            print(Value::Array(entries))
+        }
+        ("tweak", ["list"] | []) => {
+            use studio_core::modules::tweaks::{self, State};
+            let ctx = match tweaks::Ctx::discover() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("can't resolve paths: {}", brief(e));
+                    return 1;
+                }
+            };
+            let list: Vec<Value> = tweaks::catalog()
+                .iter()
+                .map(|t| {
+                    json!({
+                        "id": t.id(),
+                        "label": t.label(),
+                        "detail": t.detail(),
+                        "on": t.state(&ctx) == State::On,
+                    })
+                })
+                .collect();
+            print(Value::Array(list))
+        }
+        ("toggle", ["list"] | []) => {
+            use studio_core::modules::toggles::TOGGLES;
+            let list: Vec<Value> = TOGGLES
+                .iter()
+                .map(|t| json!({ "id": t.id, "label": t.label, "on": t.is_on(&RealRunner) }))
+                .collect();
+            print(Value::Array(list))
+        }
+        ("looknfeel", ["list"] | ["get", _]) => {
+            use studio_core::modules::looknfeel::{lookup, LookFeel, SETTINGS};
+            let Some(paths) = omarchy() else { return 4 };
+            let lf = LookFeel::load(&paths);
+            let entry = |s: &studio_core::modules::looknfeel::Setting| {
+                json!({
+                    "key": s.key,
+                    "label": s.label,
+                    "group": s.group,
+                    "value": lf.value(s.key),
+                    "overridden": lf.is_overridden(s.key),
+                })
+            };
+            if let ["get", key] = args {
+                let Some(s) = lookup(key) else {
+                    eprintln!("unknown setting `{key}` — see `looknfeel list`");
+                    return 2;
+                };
+                return print(entry(s));
+            }
+            print(Value::Array(SETTINGS.iter().map(entry).collect()))
+        }
+        ("themesync", ["list"] | []) => {
+            use studio_core::modules::themesync::{self, Enabled};
+            let enabled = Enabled::load(&studio_core::studio_config_dir().join("config.toml"));
+            let list: Vec<Value> = themesync::catalog()
+                .iter()
+                .map(|t| {
+                    json!({
+                        "id": t.id,
+                        "label": t.label,
+                        "on": enabled.is_on(t.id),
+                        "installed": t.available(),
+                    })
+                })
+                .collect();
+            print(Value::Array(list))
+        }
+        ("update", ["--check"] | []) => {
+            use studio_core::modules::update as upd;
+            match upd::check(&upd::HttpFetch::new(), upd::CURRENT) {
+                Ok(found) => print(json!({
+                    "current": upd::CURRENT,
+                    "latest": found.as_ref().map_or(upd::CURRENT, |r| r.version.as_str()),
+                    "update_available": found.is_some(),
+                    "notes": found.as_ref().map(|r| r.notes.as_str()),
+                })),
+                Err(e) => {
+                    eprintln!("update check failed: {}", brief(e));
+                    1
+                }
+            }
+        }
+        _ => {
+            eprintln!(
+                "--json isn't supported for `{group} {}` — it works with: theme list|current, \
+                 snapshot log, tweak list, toggle list, looknfeel list|get <key>, \
+                 themesync list, update --check",
+                args.join(" ")
+            );
+            2
+        }
     }
 }
 
@@ -558,6 +746,35 @@ fn theme(args: &[&str]) -> i32 {
             }
         },
         ["coverage", rest @ ..] => theme_coverage(&paths, rest.first().copied()),
+        ["export", name, rest @ ..] => {
+            let slug = slugify(name);
+            let Some(t) = store.get(&slug) else {
+                eprintln!("no theme named `{slug}` — see `omarchy-studio theme list`");
+                return 1;
+            };
+            let out = match rest {
+                [] => std::path::PathBuf::from(format!("{slug}.tar.gz")),
+                ["--out", path] => expand_user(path),
+                _ => {
+                    eprintln!("usage: omarchy-studio theme export <name> [--out file.tar.gz]");
+                    return 2;
+                }
+            };
+            match store.export(&t, &out, &RealRunner) {
+                Ok(()) => {
+                    println!("exported {slug} → {}", out.display());
+                    println!(
+                        "to install it: tar -xzf {} -C ~/.config/omarchy/themes/ && omarchy-theme-set {slug}",
+                        out.display()
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("{}", brief(e));
+                    1
+                }
+            }
+        }
         ["apply", name] => {
             let slug = slugify(name);
             if store.get(&slug).is_none() {
@@ -3360,7 +3577,7 @@ fn power(args: &[&str]) -> i32 {
     match args {
         ["profile", "list"] | ["profile"] => match pw::list(&RealRunner) {
             Ok(profiles) => {
-                let persisted = pw::persisted(&paths);
+                let persisted = pw::persisted(&paths, Dialect::probe(&RealRunner));
                 for p in profiles {
                     let mark = if p.active { "●" } else { "○" };
                     let tag = if persisted.as_deref() == Some(&p.name) {
@@ -3402,8 +3619,9 @@ fn power(args: &[&str]) -> i32 {
                 }
             }
             if persist {
-                match pw::set_persist(&paths, Some(name)) {
-                    Ok(_) => println!("persisted at login (autostart.conf)"),
+                let dialect = Dialect::probe(&RealRunner);
+                match pw::set_persist(&paths, dialect, Some(name)) {
+                    Ok(_) => println!("persisted at login (autostart.{})", dialect.ext()),
                     Err(e) => eprintln!("couldn't persist: {}", brief(e)),
                 }
             }
@@ -4350,10 +4568,12 @@ fn rice(args: &[&str]) -> i32 {
         ["import", file, flags @ ..] => {
             let mut filter = ImportFilter::default();
             let mut dry = false;
+            let mut yes = false;
             let mut i = 0;
             while i < flags.len() {
                 match flags[i] {
                     "--dry-run" => dry = true,
+                    "--yes" | "-y" => yes = true,
                     "--with-monitors" => filter.with_machine = true,
                     "--themes" => filter.themes = true,
                     "--only" => {
@@ -4386,6 +4606,7 @@ fn rice(args: &[&str]) -> i32 {
                 &store,
                 &filter,
                 dry,
+                yes,
             );
             let _ = std::fs::remove_dir_all(&tmp);
             code
@@ -4396,7 +4617,7 @@ fn rice(args: &[&str]) -> i32 {
             println!("  omarchy-studio rice show <file.tar.gz>");
             println!(
                 "  omarchy-studio rice import <file.tar.gz> [--only mods] [--themes] \
-                 [--with-monitors] [--dry-run]"
+                 [--with-monitors] [--dry-run] [--yes]"
             );
             println!();
             println!("a bundle carries every config file Studio wrote, plus your own themes;");
@@ -4419,7 +4640,9 @@ fn rice_import(
     store: &SnapshotStore,
     filter: &studio_core::modules::rice::ImportFilter,
     dry: bool,
+    yes: bool,
 ) -> i32 {
+    use std::io::{BufRead, IsTerminal, Write};
     use studio_core::modules::rice;
 
     let b = match rice::unpack(file, tmp, &RealRunner) {
@@ -4458,6 +4681,33 @@ fn rice_import(
     if plan.edits.is_empty() && plan.themes_new.is_empty() {
         println!("\nnothing to import — this machine already matches the bundle");
         return 0;
+    }
+
+    // A bundle is someone else's config. Anything in it that can launch a
+    // program gets read before it's trusted — the pipeline's rollback
+    // undoes a broken config, not a command that already ran.
+    if !plan.commands.is_empty() {
+        println!("\nthis bundle adds lines that can run commands on your machine:");
+        for (f, line) in &plan.commands {
+            println!("  {f}: {line}");
+        }
+        if !dry && !yes {
+            if !std::io::stdin().is_terminal() {
+                eprintln!(
+                    "\nrefusing to import commands without confirmation — \
+                     read them above, then re-run with --yes"
+                );
+                return 1;
+            }
+            print!("\nimport them? [y/N] ");
+            let _ = std::io::stdout().flush();
+            let mut answer = String::new();
+            let _ = std::io::stdin().lock().read_line(&mut answer);
+            if !matches!(answer.trim(), "y" | "Y" | "yes") {
+                println!("not imported — nothing was written");
+                return 1;
+            }
+        }
     }
 
     match rice::import(&plan, paths, tmp, store, &RealRunner, dry) {

@@ -173,6 +173,26 @@ else
     fail "the rollback lost the earlier tweak"
 fi
 
+echo "==> --json reports the same state, parseably"
+# Scripts and bar widgets read these; the shapes are a contract. Checked
+# against the state the journey above just left behind.
+json_get() { python3 -c "import json,sys; d=json.load(sys.stdin); print($1)"; }
+if [ "$("$BIN" looknfeel get general.gaps_in --json 2>/dev/null | json_get 'd["value"]')" = "7" ]; then
+    ok "looknfeel get --json carries the live value"
+else
+    fail "looknfeel get --json is wrong or unparseable"
+fi
+if [ "$("$BIN" tweak list --json 2>/dev/null | json_get '[t["on"] for t in d if t["id"]=="caps-escape"][0]')" = "True" ]; then
+    ok "tweak list --json shows caps-escape on"
+else
+    fail "tweak list --json is wrong or unparseable"
+fi
+if [ "$("$BIN" snapshot log --json 2>/dev/null | json_get 'len(d) > 0 and all("id" in e for e in d)')" = "True" ]; then
+    ok "snapshot log --json lists the history"
+else
+    fail "snapshot log --json is empty or unparseable"
+fi
+
 echo
 if [ "$fails" -gt 0 ]; then
     echo "rollback-e2e: $fails check(s) failed"

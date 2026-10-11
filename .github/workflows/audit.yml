@@ -1,0 +1,25 @@
+name: supply chain
+
+# cargo-deny against deny.toml: RustSec advisories, licenses, banned and
+# unknown sources. Runs on every change and weekly, because new advisories
+# land against the lockfile we already ship — the weekly run is how one
+# reaches us without anybody pushing.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features

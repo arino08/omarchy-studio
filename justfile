@@ -57,8 +57,22 @@ release-check:
     cargo clippy --all-targets --all-features -- -D warnings
     cargo test
 
+# Drive the real TUI in a pty against a fixture Omarchy, plus the
+# apply → snapshot → undo recovery journey (needs tmux)
+e2e: build
+    ./tools/e2e.sh ./target/debug/omarchy-studio
+    ./tools/rollback-e2e.sh ./target/debug/omarchy-studio
+
+# Walk every rail screen and tile them into screens.png (needs tmux)
+screens: build
+    ./tools/screenshot-grid.sh ./target/debug/omarchy-studio screens.png
+
+# Supply-chain gate: advisories, licenses, sources (needs cargo-deny)
+deny:
+    cargo deny check
+
 # Everything CI runs
-ci: release-check build
+ci: release-check deny e2e
 
 # Preview what a release would do without changing anything
 release-dry-run LEVEL:
