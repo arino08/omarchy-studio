@@ -27,6 +27,7 @@ ratatui-image = { version = "8", default-features = false, features = ["crosster
 ureq = "2"                  # wallhaven client, blocking on a worker thread — no async runtime (v0.6)
 clap = "4"                  # CLI dispatch, help & version (v1.0)
 libc = "0.2"                # restore default SIGPIPE so piping to `head` exits quietly (v1.0)
+sha2 = "0.10"               # verify release downloads against their published .sha256 (self-update)
 # Planned dependencies — added per milestone, see docs/specs/01-architecture.md §6:
 # serde / serde_json = "1"  # hyprctl -j, wallhaven API (v0.1)
 # thiserror = "2"           # error taxonomy (v0.1)

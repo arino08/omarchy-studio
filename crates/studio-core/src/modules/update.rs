@@ -7,7 +7,8 @@
 //! * **Packaged** (pacman owns the binary) — never touch it; report the
 //!   owning package so the user updates through their package manager.
 //! * **Self-managed** (user-writable, e.g. `~/.local/bin`) — download the
-//!   release asset, validate it, atomically rename it over the binary.
+//!   release asset, verify it against the release's published SHA-256,
+//!   atomically rename it over the binary.
 //! * **Unwritable** — report where it lives and stand down.
 //!
 //! The swap is deliberately temp-file + rename: writing a running executable
@@ -31,6 +32,8 @@ use crate::error::{Result, StudioError};
 pub const REPO: &str = "arino08/omarchy-studio";
 /// Release asset name the updater downloads (raw binary, no archive).
 pub const ASSET: &str = "omarchy-studio-linux-x86_64";
+/// The checksum asset published beside [`ASSET`] (`sha256sum` output).
+pub const CHECKSUM_ASSET: &str = "omarchy-studio-linux-x86_64.sha256";
 /// The version this build was compiled as (workspace-shared).
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 /// How long a check stamp stays fresh before the next network hit.
@@ -52,6 +55,8 @@ pub struct Release {
     pub notes: String,
     /// Download URL of the [`ASSET`] binary, when the release ships one.
     pub asset_url: Option<String>,
+    /// Download URL of the [`CHECKSUM_ASSET`], when the release ships one.
+    pub checksum_url: Option<String>,
 }
 
 fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
@@ -97,15 +102,18 @@ pub fn parse_latest(json: &[u8]) -> Result<Release> {
         line: None,
         hint: format!("unexpected GitHub API response: {e}"),
     })?;
-    let asset_url = api
-        .assets
-        .iter()
-        .find(|a| a.name == ASSET)
-        .map(|a| a.browser_download_url.clone());
+    let url_of = |name: &str| {
+        api.assets
+            .iter()
+            .find(|a| a.name == name)
+            .map(|a| a.browser_download_url.clone())
+    };
+    let (asset_url, checksum_url) = (url_of(ASSET), url_of(CHECKSUM_ASSET));
     Ok(Release {
         version: api.tag_name.trim().trim_start_matches('v').to_string(),
         notes: api.body,
         asset_url,
+        checksum_url,
     })
 }
 
@@ -193,8 +201,40 @@ fn dir_writable(exe: &Path) -> bool {
 
 // ------------------------------------------------------------------ apply
 
-/// Download the release binary and rename it over `exe`. The running process
-/// keeps executing its old inode; the next start runs the new build.
+/// The expected digest from a `sha256sum`-style line (`<hex>  <name>`):
+/// the first token, when it is exactly 64 hex digits.
+pub fn parse_checksum(text: &str) -> Option<String> {
+    let token = text.split_whitespace().next()?;
+    (token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| token.to_ascii_lowercase())
+}
+
+/// Lowercase hex SHA-256 of `bytes`.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn fetch_or_err(fetch: &dyn Fetch, url: &str) -> Result<Vec<u8>> {
+    fetch.get(url).map_err(|e| StudioError::External {
+        cmd: url.to_string(),
+        detail: match e {
+            FetchError::Status(code) => format!("HTTP {code}"),
+            FetchError::Network(msg) => msg,
+        },
+    })
+}
+
+/// Download the release binary, verify it against the release's published
+/// SHA-256, and rename it over `exe`. The running process keeps executing
+/// its old inode; the next start runs the new build.
+///
+/// A release without a checksum is refused rather than trusted: the updater
+/// only ever moves forward, and every release cut by `release.yml` since the
+/// checksum landed carries one — its absence means something went wrong.
 pub fn apply(fetch: &dyn Fetch, release: &Release, exe: &Path) -> Result<()> {
     let url = release
         .asset_url
@@ -206,17 +246,37 @@ pub fn apply(fetch: &dyn Fetch, release: &Release, exe: &Path) -> Result<()> {
             release.version
         ),
         })?;
-    let bytes = fetch.get(url).map_err(|e| StudioError::External {
-        cmd: url.to_string(),
-        detail: match e {
-            FetchError::Status(code) => format!("HTTP {code}"),
-            FetchError::Network(msg) => msg,
-        },
-    })?;
+    let sum_url = release
+        .checksum_url
+        .as_deref()
+        .ok_or_else(|| StudioError::External {
+            cmd: "release download".into(),
+            detail: format!(
+                "v{} ships no {CHECKSUM_ASSET} — refusing an unverifiable binary; \
+                 reinstall with install.sh or update from source",
+                release.version
+            ),
+        })?;
+    let expected = parse_checksum(&String::from_utf8_lossy(&fetch_or_err(fetch, sum_url)?))
+        .ok_or_else(|| StudioError::External {
+            cmd: sum_url.to_string(),
+            detail: "checksum file is not a sha256sum line — aborting".into(),
+        })?;
+    let bytes = fetch_or_err(fetch, url)?;
     if bytes.len() < MIN_BINARY_BYTES || !bytes.starts_with(ELF_MAGIC) {
         return Err(StudioError::External {
             cmd: url.to_string(),
             detail: "downloaded asset does not look like a Linux binary — aborting".into(),
+        });
+    }
+    let actual = sha256_hex(&bytes);
+    if actual != expected {
+        return Err(StudioError::External {
+            cmd: url.to_string(),
+            detail: format!(
+                "checksum mismatch (expected {expected}, got {actual}) — the download \
+                 is corrupt or was tampered with; nothing was replaced"
+            ),
         });
     }
     let dir = exe.parent().ok_or_else(|| StudioError::External {
@@ -356,12 +416,42 @@ mod tests {
         }
     }
 
+    /// Serves `sum` for checksum URLs and `bin` for everything else.
+    struct ReleaseFetch {
+        bin: Vec<u8>,
+        sum: Vec<u8>,
+    }
+    impl Fetch for ReleaseFetch {
+        fn get(&self, url: &str) -> std::result::Result<Vec<u8>, FetchError> {
+            Ok(if url.ends_with(".sha256") {
+                self.sum.clone()
+            } else {
+                self.bin.clone()
+            })
+        }
+    }
+
+    fn signed(bin: Vec<u8>) -> ReleaseFetch {
+        let sum = format!("{}  {ASSET}\n", sha256_hex(&bin)).into_bytes();
+        ReleaseFetch { bin, sum }
+    }
+
+    fn release() -> Release {
+        Release {
+            version: "9.9.9".into(),
+            notes: String::new(),
+            asset_url: Some("https://x/bin".into()),
+            checksum_url: Some("https://x/bin.sha256".into()),
+        }
+    }
+
     const LATEST_JSON: &str = r#"{
         "tag_name": "v0.7.0",
         "body": "battery + wallhaven fixes",
         "assets": [
             {"name": "checksums.txt", "browser_download_url": "https://x/checksums.txt"},
-            {"name": "omarchy-studio-linux-x86_64", "browser_download_url": "https://x/bin"}
+            {"name": "omarchy-studio-linux-x86_64", "browser_download_url": "https://x/bin"},
+            {"name": "omarchy-studio-linux-x86_64.sha256", "browser_download_url": "https://x/bin.sha256"}
         ]
     }"#;
 
@@ -383,6 +473,7 @@ mod tests {
         let r = parse_latest(LATEST_JSON.as_bytes()).unwrap();
         assert_eq!(r.version, "0.7.0");
         assert_eq!(r.asset_url.as_deref(), Some("https://x/bin"));
+        assert_eq!(r.checksum_url.as_deref(), Some("https://x/bin.sha256"));
         assert!(r.notes.contains("battery"));
     }
 
@@ -412,12 +503,7 @@ mod tests {
         let dir = tempdir();
         let exe = dir.join("omarchy-studio");
         std::fs::write(&exe, b"old build").unwrap();
-        let release = Release {
-            version: "9.9.9".into(),
-            notes: String::new(),
-            asset_url: Some("https://x/bin".into()),
-        };
-        apply(&FakeFetch(Ok(fake_elf())), &release, &exe).unwrap();
+        apply(&signed(fake_elf()), &release(), &exe).unwrap();
         let swapped = std::fs::read(&exe).unwrap();
         assert_eq!(&swapped[..4], ELF_MAGIC);
         #[cfg(unix)]
@@ -436,22 +522,60 @@ mod tests {
         let dir = tempdir();
         let exe = dir.join("omarchy-studio");
         std::fs::write(&exe, b"old build").unwrap();
-        let mut release = Release {
-            version: "9.9.9".into(),
-            notes: String::new(),
-            asset_url: Some("https://x/bin".into()),
-        };
-        // an HTML error page must not replace the binary
-        let err = apply(&FakeFetch(Ok(b"<html>404</html>".to_vec())), &release, &exe);
+        let mut release = release();
+        // an HTML error page must not replace the binary, even when the
+        // "checksum" matches it
+        let err = apply(&signed(b"<html>404</html>".to_vec()), &release, &exe);
         assert!(err.is_err());
         assert_eq!(std::fs::read(&exe).unwrap(), b"old build");
         // a release without our asset points at building from source
         release.asset_url = None;
-        match apply(&FakeFetch(Ok(fake_elf())), &release, &exe) {
+        match apply(&signed(fake_elf()), &release, &exe) {
             Err(StudioError::External { detail, .. }) => assert!(detail.contains("cargo build")),
             other => panic!("expected External, got {other:?}"),
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn apply_refuses_unverified_or_mismatched_binaries() {
+        let dir = tempdir();
+        let exe = dir.join("omarchy-studio");
+        std::fs::write(&exe, b"old build").unwrap();
+        // a valid ELF whose digest doesn't match the published one
+        let tampered = ReleaseFetch {
+            bin: fake_elf(),
+            sum: format!("{}  {ASSET}\n", "0".repeat(64)).into_bytes(),
+        };
+        match apply(&tampered, &release(), &exe) {
+            Err(StudioError::External { detail, .. }) => assert!(detail.contains("mismatch")),
+            other => panic!("expected a mismatch, got {other:?}"),
+        }
+        // a release with no checksum asset is refused, not trusted
+        let mut unsigned = release();
+        unsigned.checksum_url = None;
+        assert!(apply(&signed(fake_elf()), &unsigned, &exe).is_err());
+        // a checksum file that isn't a sha256sum line is refused
+        let garbled = ReleaseFetch {
+            bin: fake_elf(),
+            sum: b"<html>rate limited</html>".to_vec(),
+        };
+        assert!(apply(&garbled, &release(), &exe).is_err());
+        assert_eq!(std::fs::read(&exe).unwrap(), b"old build");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn checksum_lines_parse_and_digest_is_sha256() {
+        let hex = "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855";
+        assert_eq!(
+            parse_checksum(&format!("{hex}  {ASSET}\n")).as_deref(),
+            Some(hex.to_ascii_lowercase().as_str())
+        );
+        assert_eq!(parse_checksum("deadbeef  x"), None);
+        assert_eq!(parse_checksum(""), None);
+        // the well-known digest of the empty input
+        assert_eq!(sha256_hex(b""), hex.to_ascii_lowercase());
     }
 
     #[test]

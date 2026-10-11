@@ -1,6 +1,8 @@
 # Tag builds: push a `v*` tag and this publishes a GitHub release carrying
 # the binary the self-updater (modules/update.rs) looks for. The asset name
-# must stay `omarchy-studio-linux-x86_64` — update::ASSET matches on it.
+# must stay `omarchy-studio-linux-x86_64` — update::ASSET matches on it — and
+# its `.sha256` must ship beside it: the self-updater refuses a release
+# without one, and install.sh verifies against it.
 #
 # Manual backfill for an existing tag whose release has no asset:
 #   gh workflow run release.yml -f tag=v0.8.6
@@ -18,6 +20,9 @@ on:
 
 permissions:
   contents: write
+  # Build provenance attestation (`gh attestation verify`).
+  id-token: write
+  attestations: write
 
 jobs:
   build:
@@ -68,11 +73,23 @@ jobs:
         run: cargo build --release --locked
 
       - name: Stage asset
-        run: cp target/release/omarchy-studio omarchy-studio-linux-x86_64
+        run: |
+          cp target/release/omarchy-studio omarchy-studio-linux-x86_64
+          sha256sum omarchy-studio-linux-x86_64 > omarchy-studio-linux-x86_64.sha256
+          cat omarchy-studio-linux-x86_64.sha256
+
+      # Lets anyone check the binary was built here, from this tag:
+      #   gh attestation verify omarchy-studio-linux-x86_64 -R arino08/omarchy-studio
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: omarchy-studio-linux-x86_64
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
-          files: omarchy-studio-linux-x86_64
+          files: |
+            omarchy-studio-linux-x86_64
+            omarchy-studio-linux-x86_64.sha256
           generate_release_notes: true

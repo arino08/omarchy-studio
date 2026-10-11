@@ -21,8 +21,10 @@ fi
 
 echo "=> Fetching latest release of $BIN_NAME..."
 
-# Use GitHub API to get the latest release URL
-LATEST_URL=$(curl -s "https://api.github.com/repos/$REPO/releases/latest" | grep "browser_download_url.*$ASSET_NAME" | cut -d '"' -f 4 || true)
+# Use GitHub API to get the latest release URLs (the binary and its .sha256)
+RELEASE_JSON=$(curl -s "https://api.github.com/repos/$REPO/releases/latest" || true)
+LATEST_URL=$(printf '%s\n' "$RELEASE_JSON" | grep "browser_download_url.*/$ASSET_NAME\"" | cut -d '"' -f 4 || true)
+SUM_URL=$(printf '%s\n' "$RELEASE_JSON" | grep "browser_download_url.*/$ASSET_NAME\.sha256\"" | cut -d '"' -f 4 || true)
 
 if [ -n "$LATEST_URL" ]; then
     echo "=> Downloading pre-built binary from $LATEST_URL..."
@@ -37,6 +39,22 @@ if [ -n "$LATEST_URL" ]; then
         echo "Try again in a minute, or download it yourself from:" >&2
         echo "  $LATEST_URL" >&2
         exit 1
+    fi
+    # Verify against the release's published SHA-256. Releases before the
+    # checksum landed (<= v0.9.3) have none; everything after does, and a
+    # mismatch is never installed.
+    if [ -n "$SUM_URL" ]; then
+        EXPECTED=$(curl -fsSL "$SUM_URL" | cut -d ' ' -f 1)
+        ACTUAL=$(sha256sum "$TMP" | cut -d ' ' -f 1)
+        if [ -z "$EXPECTED" ] || [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "Error: checksum mismatch — the download is corrupt or was tampered with." >&2
+            echo "  expected: ${EXPECTED:-<unreadable>}" >&2
+            echo "  got:      $ACTUAL" >&2
+            exit 1
+        fi
+        echo "=> Checksum verified ($ACTUAL)"
+    else
+        echo "=> Warning: this release publishes no checksum; skipping verification." >&2
     fi
     chmod +x "$TMP"
     mv "$TMP" "$INSTALL_DIR/$BIN_NAME"

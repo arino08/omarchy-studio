@@ -103,7 +103,7 @@ Needs an Omarchy system (Arch + Hyprland). The installer downloads a release bin
 curl -sL https://raw.githubusercontent.com/arino08/omarchy-studio/main/install.sh | sh
 ```
 
-It installs over whatever `omarchy-studio` is already on your `PATH` (or `~/.local/bin`), checks that what it downloaded is really a binary before replacing anything, and prints the version it installed.
+It installs over whatever `omarchy-studio` is already on your `PATH` (or `~/.local/bin`), verifies the download against the release's published SHA-256 before replacing anything, and prints the version it installed. The self-updater (`U` in the TUI, `omarchy-studio update`) does the same check and refuses a binary it can't verify. Release binaries also carry a build-provenance attestation: `gh attestation verify omarchy-studio-linux-x86_64 -R arino08/omarchy-studio`.
 
 <details>
 <summary>Build from source instead (needs Rust 1.95+)</summary>
