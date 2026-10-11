@@ -36,4 +36,14 @@ package() {
     install -Dm0755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
     install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
     install -Dm0644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+
+    # The man page and completion scripts are printed by the binary itself
+    # (0.9.4+), so they always match the commands it actually has.
+    local bin="target/release/$pkgname"
+    if "$bin" man >/dev/null 2>&1; then
+        "$bin" man | install -Dm0644 /dev/stdin "$pkgdir/usr/share/man/man1/$pkgname.1"
+        "$bin" completions bash | install -Dm0644 /dev/stdin "$pkgdir/usr/share/bash-completion/completions/$pkgname"
+        "$bin" completions zsh | install -Dm0644 /dev/stdin "$pkgdir/usr/share/zsh/site-functions/_$pkgname"
+        "$bin" completions fish | install -Dm0644 /dev/stdin "$pkgdir/usr/share/fish/vendor_completions.d/$pkgname.fish"
+    fi
 }

@@ -227,6 +227,51 @@ impl ThemeStore {
         })
     }
 
+    /// Share one theme: `out` becomes a `.tar.gz` holding `<slug>/` with the
+    /// theme's *merged* view (system first, user overlay on top, like
+    /// [`fork`](Self::fork)), so an overlay theme travels complete. Dot
+    /// entries (a community theme's whole `.git`) stay behind and links are
+    /// followed, so the archive holds plain files only. Extract it into
+    /// `~/.config/omarchy/themes/` to install.
+    pub fn export(
+        &self,
+        theme: &Theme,
+        out: &Path,
+        runner: &dyn crate::cmd::CommandRunner,
+    ) -> Result<()> {
+        let parent = out
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let stage = parent.join(format!(".theme-export-{}-{nanos}", std::process::id()));
+        let result = (|| {
+            for dir in [&theme.system_dir, &theme.user_dir].into_iter().flatten() {
+                copy_plain(dir, &stage.join(&theme.slug))?;
+            }
+            let tar = crate::cmd::Cmd::new("tar")
+                .arg("-czf")
+                .arg(out.display().to_string())
+                .arg("-C")
+                .arg(stage.display().to_string())
+                .arg(&theme.slug);
+            let res = runner.run(&tar)?;
+            if !res.ok() {
+                return Err(StudioError::External {
+                    cmd: "tar -czf".into(),
+                    detail: res.stderr.trim().to_string(),
+                });
+            }
+            Ok(())
+        })();
+        let _ = std::fs::remove_dir_all(&stage);
+        result
+    }
+
     fn scratch_dir(&self) -> PathBuf {
         self.user_dir.join(SCRATCH_SLUG)
     }
@@ -289,6 +334,25 @@ fn pretty_name(slug: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Recursive copy for sharing: skips dot entries, follows links (so the
+/// copy holds plain files only), later sources overwrite earlier ones.
+fn copy_plain(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let (from, to) = (entry.path(), dst.join(entry.file_name()));
+        if from.is_dir() {
+            copy_plain(&from, &to)?;
+        } else if from.is_file() {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
 }
 
 fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -441,6 +505,58 @@ foreground = \"#c0caf5\"
             StudioError::External { detail, .. } => assert!(detail.contains("already exists")),
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn export_archives_the_merged_view_without_dotfiles() {
+        use crate::cmd::RealRunner;
+        let store = fake_store("export");
+        let tn = store.get("tokyo-night").unwrap();
+        std::fs::create_dir_all(tn.user_dir.as_ref().unwrap().join(".git")).unwrap();
+        std::fs::write(tn.user_dir.as_ref().unwrap().join(".git/HEAD"), "ref").unwrap();
+        let out = store
+            .user_dir
+            .parent()
+            .unwrap()
+            .join("out/tokyo-night.tar.gz");
+        store.export(&tn, &out, &RealRunner).unwrap();
+
+        let listing = RealRunner
+            .run(
+                &crate::cmd::Cmd::new("tar")
+                    .arg("-tzf")
+                    .arg(out.display().to_string()),
+            )
+            .unwrap()
+            .stdout;
+        assert!(listing.contains("tokyo-night/colors.toml"), "{listing}");
+        assert!(
+            listing.contains("tokyo-night/icons.theme"),
+            "system file came along"
+        );
+        assert!(!listing.contains(".git"), "dot entries stay behind");
+
+        // the overlay's colors won the merge
+        let x = out.parent().unwrap().join("x");
+        std::fs::create_dir_all(&x).unwrap();
+        RealRunner
+            .run(
+                &crate::cmd::Cmd::new("tar")
+                    .arg("-xzf")
+                    .arg(out.display().to_string())
+                    .arg("-C")
+                    .arg(x.display().to_string()),
+            )
+            .unwrap();
+        let colors = std::fs::read_to_string(x.join("tokyo-night/colors.toml")).unwrap();
+        assert!(colors.contains("#00ff99"), "{colors}");
+        // no staging litter beside the archive
+        let litter: Vec<_> = std::fs::read_dir(out.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".theme-export"))
+            .collect();
+        assert!(litter.is_empty());
     }
 
     #[test]

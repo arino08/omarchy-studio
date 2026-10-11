@@ -10,6 +10,7 @@
 //! every group to document itself, which is what a user typing `--help`
 //! actually wants.
 
+mod complete;
 mod tui;
 
 use clap::{Arg, Command};
@@ -68,6 +69,7 @@ fn cli() -> Command {
              theme new [name] --from-current-wallpaper [--apply]\n  \
              theme extract <image> [normal|muted|material] [auto|dark|light]\n  \
              theme community list | search <q> | install <name|owner/repo|url>\n  \
+             theme export <name> [--out file.tar.gz]\n  \
              theme keybind install [MODS KEY] | remove | show"))
         .subcommand(group("wallpaper", "Set wallpapers and search wallhaven",
             "usage:\n  \
@@ -114,6 +116,7 @@ fn cli() -> Command {
              shell bar list | catalog | position <top|bottom|left|right> | transparent <true|false|toggle>\n  \
              shell bar move <id> [placement] | put <id> [placement] | set <id> <key> <value> [--json] [placement] | defaults\n  \
              shell plugin list | enable <id> [placement] | disable <id>\n  \
+             shell appearance show | set <font-size|bar-size-horizontal|bar-size-vertical|bar-scale-with-font|spacing-scale|spacing-scale-with-font> <value>\n  \
              placement: --section <left|center|right> --index <n> --before <id> --after <id> --from-section <s> --from-index <n>"))
         .subcommand(group("idle", "Idle timeline (screensaver, lock, screen-off, suspend)",
             "usage:\n  \
@@ -149,6 +152,15 @@ fn cli() -> Command {
         .subcommand(group("update", "Update Studio itself", "usage: omarchy-studio update [--check]"))
         .subcommand(group("install-integration", "Add Studio to the Omarchy menu", "usage: omarchy-studio install-integration"))
         .subcommand(group("uninstall", "Remove Studio's hooks, menu entry and theme-sync wiring (your configs stay)", "usage: omarchy-studio uninstall"))
+        .subcommand(group("completions", "Print a shell completion script (bash, zsh, fish)",
+            "usage: omarchy-studio completions bash|zsh|fish\n  \
+             bash:  omarchy-studio completions bash > ~/.local/share/bash-completion/completions/omarchy-studio\n  \
+             zsh:   omarchy-studio completions zsh > \"${fpath[1]}/_omarchy-studio\"\n  \
+             fish:  omarchy-studio completions fish > ~/.config/fish/completions/omarchy-studio.fish"))
+        .subcommand(group("man", "Print the man page (read it with: omarchy-studio man | man -l -)",
+            "usage: omarchy-studio man"))
+        // Called by the completion scripts, not by people.
+        .subcommand(group("__complete", "Internal: completion candidates for a command line", "usage: omarchy-studio __complete <words…>").hide(true))
         // Dispatched by the Omarchy hook runner, not by people.
         .subcommand(group("hook", "Internal: run a Studio hook event", "usage: omarchy-studio hook <event>").hide(true))
 }
@@ -249,6 +261,12 @@ fn dispatch(argv: &[&str]) -> i32 {
         ["power", rest @ ..] => power(rest),
         ["themesync", rest @ ..] => themesync(rest),
         ["rice", rest @ ..] => rice(rest),
+        ["completions", rest @ ..] => complete::completions(rest),
+        ["man"] => {
+            print!("{}", complete::man_page(&cli()));
+            0
+        }
+        ["__complete", rest @ ..] => complete::complete(rest),
         ["install-integration"] => install_integration(),
         ["uninstall"] => uninstall(),
         // clap rejects unknown groups before we get here; a known group with
@@ -558,6 +576,35 @@ fn theme(args: &[&str]) -> i32 {
             }
         },
         ["coverage", rest @ ..] => theme_coverage(&paths, rest.first().copied()),
+        ["export", name, rest @ ..] => {
+            let slug = slugify(name);
+            let Some(t) = store.get(&slug) else {
+                eprintln!("no theme named `{slug}` — see `omarchy-studio theme list`");
+                return 1;
+            };
+            let out = match rest {
+                [] => std::path::PathBuf::from(format!("{slug}.tar.gz")),
+                ["--out", path] => expand_user(path),
+                _ => {
+                    eprintln!("usage: omarchy-studio theme export <name> [--out file.tar.gz]");
+                    return 2;
+                }
+            };
+            match store.export(&t, &out, &RealRunner) {
+                Ok(()) => {
+                    println!("exported {slug} → {}", out.display());
+                    println!(
+                        "to install it: tar -xzf {} -C ~/.config/omarchy/themes/ && omarchy-theme-set {slug}",
+                        out.display()
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("{}", brief(e));
+                    1
+                }
+            }
+        }
         ["apply", name] => {
             let slug = slugify(name);
             if store.get(&slug).is_none() {

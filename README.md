@@ -157,7 +157,15 @@ Studio themes itself from your active Omarchy theme — panels, highlights, and 
 
 ## CLI reference
 
-Everything the TUI does is scriptable. Each mutating command prints its undo hint.
+Everything the TUI does is scriptable. Each mutating command prints its undo hint. `omarchy-studio <command> --help` shows a command's usage, and `omarchy-studio man | man -l -` the whole reference.
+
+Tab completion knows every verb plus live values — your theme names, the tweak catalog, Look & Feel keys. The AUR package installs it; otherwise:
+
+```bash
+omarchy-studio completions bash > ~/.local/share/bash-completion/completions/omarchy-studio
+omarchy-studio completions zsh  > "${fpath[1]}/_omarchy-studio"
+omarchy-studio completions fish > ~/.config/fish/completions/omarchy-studio.fish
+```
 
 <details>
 <summary><strong>View full CLI reference</strong></summary>
@@ -170,6 +178,7 @@ omarchy-studio theme extract <image> [normal|muted|material] [auto|dark|light]
 omarchy-studio theme community list | search <q> | install <name|owner/repo|url>   # install clones + applies
 omarchy-studio theme new [name] --from-current-wallpaper [--apply]   # instant theme from what's on screen
 omarchy-studio theme keybind install [MODS KEY] | remove | show      # opt-in SUPER+SHIFT+T for the above
+omarchy-studio theme export <name> [--out f.tar.gz]   # share one theme (merged view, no .git)
 
 # Wallpapers
 omarchy-studio wallpaper list | current | set <n|name|path> | next | add <file> | remove <name>
