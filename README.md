@@ -157,7 +157,7 @@ Studio themes itself from your active Omarchy theme — panels, highlights, and 
 
 ## CLI reference
 
-Everything the TUI does is scriptable. Each mutating command prints its undo hint. `omarchy-studio <command> --help` shows a command's usage, and `omarchy-studio man | man -l -` the whole reference.
+Everything the TUI does is scriptable. Each mutating command prints its undo hint. The read commands — `theme list|current`, `snapshot log`, `tweak list`, `toggle list`, `looknfeel list|get`, `themesync list`, `update --check` — take `--json` for scripts and bar widgets. `omarchy-studio <command> --help` shows a command's usage, and `omarchy-studio man | man -l -` the whole reference.
 
 Tab completion knows every verb plus live values — your theme names, the tweak catalog, Look & Feel keys. The AUR package installs it; otherwise:
 

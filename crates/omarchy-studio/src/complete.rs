@@ -50,6 +50,11 @@ fn candidates(prev: &[&str]) -> Vec<String> {
             "export",
         ],
         ["theme", "apply" | "coverage" | "fork" | "export"] => return theme_slugs(),
+        // Read verbs that answer `--json` (main.rs `json_out`).
+        ["theme", "list" | "current"]
+        | ["snapshot", "log" | "list"]
+        | ["tweak" | "toggle" | "looknfeel" | "themesync", "list"]
+        | ["looknfeel", "get", _] => &["--json"],
         ["theme", "export", _] => &["--out"],
         ["theme", "community"] => &["list", "search", "install"],
         ["theme", "keybind"] => &["install", "remove", "show"],
@@ -226,7 +231,7 @@ fn candidates(prev: &[&str]) -> Vec<String> {
         ],
         ["nova"] => &["show", "set", "keybind", "install", "uninstall", "launch"],
         ["hooks"] => &["install", "remove", "status"],
-        ["update"] => &["--check"],
+        ["update"] => &["--check", "--json"],
         ["completions"] => &["bash", "zsh", "fish"],
         _ => &[],
     };

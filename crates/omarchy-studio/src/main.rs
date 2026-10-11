@@ -228,7 +228,25 @@ fn print_group_help(name: &str) {
     }
 }
 
+/// Groups whose read verbs can answer `--json` (see [`json_out`]). `shell`
+/// is deliberately absent: there `--json` means "this value is JSON".
+const JSON_GROUPS: &[&str] = &[
+    "theme",
+    "snapshot",
+    "tweak",
+    "toggle",
+    "looknfeel",
+    "themesync",
+    "update",
+];
+
 fn dispatch(argv: &[&str]) -> i32 {
+    if let [group, rest @ ..] = argv {
+        if rest.contains(&"--json") && JSON_GROUPS.contains(group) {
+            let rest: Vec<&str> = rest.iter().copied().filter(|a| *a != "--json").collect();
+            return json_out(group, &rest);
+        }
+    }
     match argv {
         ["doctor", rest @ ..] => doctor(rest.contains(&"--deps"), rest.contains(&"--quiet")),
         ["migrate", rest @ ..] => migrate(rest.contains(&"--dry-run")),
@@ -276,6 +294,158 @@ fn dispatch(argv: &[&str]) -> i32 {
             2
         }
         [] => 2,
+    }
+}
+
+/// Machine-readable answers for scripts, bar widgets and bug reports. Kept
+/// in one place, apart from the human output, so neither can bend the
+/// other: every shape here is a stable contract, every text line is not.
+/// Read-only by construction — `--json` never changes anything (`update
+/// --json` checks, it doesn't install).
+fn json_out(group: &str, args: &[&str]) -> i32 {
+    use serde_json::{json, Value};
+    let print = |v: Value| {
+        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        0
+    };
+    match (group, args) {
+        ("theme", ["list"] | ["current"]) => {
+            let Some(paths) = omarchy() else { return 4 };
+            let current = paths.current_theme_name().ok();
+            if args == ["current"] {
+                return print(json!({ "slug": current }));
+            }
+            let themes: Vec<Value> = ThemeStore::from_paths(&paths)
+                .list()
+                .into_iter()
+                .map(|t| {
+                    json!({
+                        "slug": t.slug,
+                        "name": t.pretty,
+                        "origin": match t.origin {
+                            ThemeOrigin::System => "system",
+                            ThemeOrigin::User => "user",
+                            ThemeOrigin::Overlay => "overlay",
+                        },
+                        "light": t.light(),
+                        "current": current.as_deref() == Some(t.slug.as_str()),
+                    })
+                })
+                .collect();
+            print(Value::Array(themes))
+        }
+        ("snapshot", ["log"] | ["list"]) => {
+            let store = match history() {
+                Ok(s) => s,
+                Err(code) => return code,
+            };
+            let entries: Vec<Value> = store
+                .list(30)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|e| {
+                    json!({
+                        "id": e.id,
+                        "kind": e.kind.map(|k| format!("{k:?}").to_lowercase()),
+                        "summary": e.summary,
+                        "timestamp": e.timestamp,
+                    })
+                })
+                .collect();
+            print(Value::Array(entries))
+        }
+        ("tweak", ["list"] | []) => {
+            use studio_core::modules::tweaks::{self, State};
+            let ctx = match tweaks::Ctx::discover() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("can't resolve paths: {}", brief(e));
+                    return 1;
+                }
+            };
+            let list: Vec<Value> = tweaks::catalog()
+                .iter()
+                .map(|t| {
+                    json!({
+                        "id": t.id(),
+                        "label": t.label(),
+                        "detail": t.detail(),
+                        "on": t.state(&ctx) == State::On,
+                    })
+                })
+                .collect();
+            print(Value::Array(list))
+        }
+        ("toggle", ["list"] | []) => {
+            use studio_core::modules::toggles::TOGGLES;
+            let list: Vec<Value> = TOGGLES
+                .iter()
+                .map(|t| json!({ "id": t.id, "label": t.label, "on": t.is_on(&RealRunner) }))
+                .collect();
+            print(Value::Array(list))
+        }
+        ("looknfeel", ["list"] | ["get", _]) => {
+            use studio_core::modules::looknfeel::{lookup, LookFeel, SETTINGS};
+            let Some(paths) = omarchy() else { return 4 };
+            let lf = LookFeel::load(&paths);
+            let entry = |s: &studio_core::modules::looknfeel::Setting| {
+                json!({
+                    "key": s.key,
+                    "label": s.label,
+                    "group": s.group,
+                    "value": lf.value(s.key),
+                    "overridden": lf.is_overridden(s.key),
+                })
+            };
+            if let ["get", key] = args {
+                let Some(s) = lookup(key) else {
+                    eprintln!("unknown setting `{key}` — see `looknfeel list`");
+                    return 2;
+                };
+                return print(entry(s));
+            }
+            print(Value::Array(SETTINGS.iter().map(entry).collect()))
+        }
+        ("themesync", ["list"] | []) => {
+            use studio_core::modules::themesync::{self, Enabled};
+            let enabled = Enabled::load(&studio_core::studio_config_dir().join("config.toml"));
+            let list: Vec<Value> = themesync::catalog()
+                .iter()
+                .map(|t| {
+                    json!({
+                        "id": t.id,
+                        "label": t.label,
+                        "on": enabled.is_on(t.id),
+                        "installed": t.available(),
+                    })
+                })
+                .collect();
+            print(Value::Array(list))
+        }
+        ("update", ["--check"] | []) => {
+            use studio_core::modules::update as upd;
+            match upd::check(&upd::HttpFetch::new(), upd::CURRENT) {
+                Ok(found) => print(json!({
+                    "current": upd::CURRENT,
+                    "latest": found.as_ref().map_or(upd::CURRENT, |r| r.version.as_str()),
+                    "update_available": found.is_some(),
+                    "notes": found.as_ref().map(|r| r.notes.as_str()),
+                })),
+                Err(e) => {
+                    eprintln!("update check failed: {}", brief(e));
+                    1
+                }
+            }
+        }
+        _ => {
+            eprintln!(
+                "--json isn't supported for `{group} {}` — it works with: theme list|current, \
+                 snapshot log, tweak list, toggle list, looknfeel list|get <key>, \
+                 themesync list, update --check",
+                args.join(" ")
+            );
+            2
+        }
     }
 }
 
