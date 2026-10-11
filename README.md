@@ -26,7 +26,7 @@ curl -sL https://raw.githubusercontent.com/arino08/omarchy-studio/main/install.s
 omarchy-studio
 ```
 
-> **Status: alpha, and honest about it.** Everything below is built, tested (477 tests, plus the TUI itself driven in a pty on every CI run) and drives the real Omarchy config on disk. v0.9.3 is the current release; the Omarchy 4 support described here is newer than it. Tested against Omarchy 3.8 and 4.0 "Quattro" / Hyprland 0.55 and 0.56 — Studio warns, but never refuses to run, on versions it hasn't seen. On Quattro it writes Hyprland's new Lua config; the bar, notification and OSD screens are unavailable there, because Omarchy 4 replaced Waybar, Mako and SwayOSD with the Quickshell shell.
+> **Status: alpha, and honest about it.** Everything below is built, tested (495 tests, plus the TUI itself driven in a pty on every CI run) and drives the real Omarchy config on disk. v0.9.3 is the current release; the Omarchy 4 support described here is newer than it. Tested against Omarchy 3.8 and 4.0 "Quattro" / Hyprland 0.55 and 0.56 — Studio warns, but never refuses to run, on versions it hasn't seen. On Quattro it writes Hyprland's new Lua config; the bar, notification and OSD screens are unavailable there, because Omarchy 4 replaced Waybar, Mako and SwayOSD with the Quickshell shell.
 
 ## Why
 
@@ -141,8 +141,8 @@ omarchy-studio          # launch the full-screen cockpit
 | <kbd>Ctrl</kbd>+<kbd>j</kbd>/<kbd>k</kbd>, <kbd>Ctrl</kbd>+<kbd>Up</kbd>/<kbd>Down</kbd> | globally cycle through modules |
 | **Mouse Click** | click rail tabs to instantly switch modules |
 | <kbd>1</kbd>–<kbd>9</kbd>, <kbd>0</kbd> | jump to one of the first ten modules (from the rail) |
-| <kbd>j</kbd> / <kbd>k</kbd>, arrows | move within a screen |
-| <kbd>h</kbd> / <kbd>l</kbd> | adjust the selected value |
+| <kbd>↑</kbd> / <kbd>↓</kbd> | move within a screen |
+| <kbd>←</kbd> / <kbd>→</kbd> | adjust the selected value (Look & Feel also takes <kbd>-</kbd> / <kbd>+</kbd>) |
 | <kbd>Enter</kbd> | open a picker (avatar, theme, …) |
 | <kbd>c</kbd> | (themes) browse the community directory — preview before installing |
 | <kbd>t</kbd> | (wallpapers) craft a theme from the selected image |
@@ -154,6 +154,12 @@ omarchy-studio          # launch the full-screen cockpit
 | <kbd>/</kbd> | search · <kbd>?</kbd> help · <kbd>q</kbd> quit |
 
 Studio themes itself from your active Omarchy theme — panels, highlights, and the wordmark all re-tint with every theme switch. Every rail entry is a real, working screen.
+
+## Learn more
+
+- **[Quickstart](docs/quickstart.md)**: install, first run, and one change you undo, in five minutes.
+- **[Tutorial](docs/tutorial.md)**: from a stock install to a finished rice, then carried to another machine.
+- **[What file did that touch?](docs/what-file.md)**: every file each screen writes, on Omarchy 3 and 4.
 
 ## CLI reference
 
@@ -330,11 +336,14 @@ The five rules every feature is held to. The first four are why [nothing here is
 | `docs/specs/` | Build specs — the *how* (start at `00-overview.md`) |
 | `ROADMAP.md` | Milestones broken into issue-sized tasks |
 | `docs/comparison.md` | How Studio compares to A La Carchy |
-| `docs/handoff-v0.8.md`, `docs/handoff-v0.9.md` | Architecture guides for the v0.8 / v0.9 milestones |
+| `docs/quickstart.md`, `docs/tutorial.md`, `docs/what-file.md` | User docs: first run, a full rice, and the file map |
+| `docs/handoff-v0.8.md`, `docs/handoff-v0.9.md` | Architecture guides for the v0.8 / v0.9 milestones (historical) |
 | `crates/studio-core/` | Engine library: config model, comment-preserving parsers, apply pipeline, snapshots, Omarchy adapter |
 | `crates/omarchy-studio/` | The binary: TUI + CLI frontends |
 | `tools/termshot/` | Renders tmux captures to the README media (screenshots + tour GIF) |
 | `tools/e2e.sh` | Drives the TUI in a tmux pty against a fixture Omarchy — the CI journey test |
+| `tools/rollback-e2e.sh` | Drives apply → snapshot → undo → rollback (and the `--json` output) with the real binary |
+| `deny.toml` | Supply-chain policy for `cargo deny` (advisories, licenses, sources), run in CI and weekly |
 | `packaging/aur/` | PKGBUILD, refreshed against a released tag by `tools/refresh-pkgbuild.sh` |
 | `data/animation-presets/` | Reference animation blocks (the shipped presets are compiled in) |
 

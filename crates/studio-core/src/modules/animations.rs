@@ -273,8 +273,11 @@ impl AnimPreset {
     }
 }
 
+/// Look a preset up by name, ignoring case and surrounding space — the CLI
+/// joins its words, so `preset apply frosted glass` should just work.
 pub fn preset(name: &str) -> Option<&'static AnimPreset> {
-    PRESETS.iter().find(|p| p.name == name)
+    let name = name.trim();
+    PRESETS.iter().find(|p| p.name.eq_ignore_ascii_case(name))
 }
 
 fn block(dialect: Dialect) -> ManagedBlock {
@@ -491,6 +494,17 @@ mod tests {
         assert_eq!(current_for(&paths, Dialect::Hyprlang), "Default");
         let after = std::fs::read_to_string(user_path(&paths, Dialect::Hyprlang)).unwrap();
         assert!(!after.contains("omarchy-studio:animations"));
+    }
+
+    #[test]
+    fn preset_lookup_ignores_case() {
+        let first = PRESETS[0].name;
+        assert!(std::ptr::eq(
+            preset(&first.to_uppercase()).unwrap(),
+            preset(first).unwrap()
+        ));
+        assert!(preset(&format!("  {} ", first.to_lowercase())).is_some());
+        assert!(preset("no such preset").is_none());
     }
 }
 

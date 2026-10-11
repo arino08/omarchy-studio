@@ -732,8 +732,11 @@ pub const PRESETS: &[Preset] = &[
     },
 ];
 
+/// Look a preset up by name, ignoring case and surrounding space — the CLI
+/// joins its words, so `preset apply frosted glass` should just work.
 pub fn preset(name: &str) -> Option<&'static Preset> {
-    PRESETS.iter().find(|p| p.name == name)
+    let name = name.trim();
+    PRESETS.iter().find(|p| p.name.eq_ignore_ascii_case(name))
 }
 
 /// Path of the preview-active marker. It exists while a live `hyprctl keyword`
@@ -1408,6 +1411,17 @@ mod tests {
         let doc = HyprDoc::parse(&out);
         assert_eq!(doc.get("decoration.blur.size").as_deref(), Some("4"));
         assert_eq!(doc.get("general.gaps_in").as_deref(), Some("8"));
+    }
+
+    #[test]
+    fn preset_lookup_ignores_case() {
+        let first = PRESETS[0].name;
+        assert!(std::ptr::eq(
+            preset(&first.to_uppercase()).unwrap(),
+            preset(first).unwrap()
+        ));
+        assert!(preset(&format!("  {} ", first.to_lowercase())).is_some());
+        assert!(preset("no such preset").is_none());
     }
 }
 
