@@ -88,7 +88,7 @@ This is the part that matters, so it's not buried at the bottom:
 | **Quick tweaks** | One-key reversible toggles (Caps→Escape, inactive-window transparency, screenshot/screencast folders…) — each a self-contained managed block, individually revertible, never touching Omarchy's vendored files | v0.8 |
 | **Nice Launcher** | Drive the Nice Launcher (Quickshell app-search overlay): visual mode (constellation / spotlight / orbital / grid), backdrop, animation toggles and providers written to `nova.json`, snapshot-backed; optional launch keybind through the managed keybinds block; launch or install it straight from the rail. CLI `nova show|mode|set|anim|providers|keybind|launch|install|uninstall` | — |
 | **Snapshots** | Browse every change Studio has ever made as a timeline with a live colored diff pane, and roll the whole tree back to any point — the restore is itself recorded, so it too can be undone. Only possible because the undo store is a real git repo. CLI `snapshot log`/`show <id>`/`restore <id>` | v0.9 |
-| **Rice bundle** | Move a whole setup to another machine: `rice export` archives every config file Studio wrote (grouped by module) plus your own themes, and `rice import` **replays each file through the apply pipeline** — pre-snapshot, drift check, reload, verification, automatic rollback — instead of untarring over a live desktop. Machine-specific files (`monitors.conf`) and themes you already have are left alone unless asked for; `--dry-run` shows the whole plan first | v0.9 |
+| **Rice bundle** | Move a whole setup to another machine: `rice export` archives every config file Studio wrote (grouped by module) plus your own themes, and `rice import` **replays each file through the apply pipeline** — pre-snapshot, drift check, reload, verification, automatic rollback — instead of untarring over a live desktop. Machine-specific files (`monitors.conf`) and themes you already have are left alone unless asked for; `--dry-run` shows the whole plan first. A bundle that would add anything able to run a command (`exec-once`, a Waybar `on-click`, shell in `~/.bashrc`, Lua `os.execute`) lists those lines and asks before importing (`--yes` to skip in scripts); bundles containing symlinks or special files are refused outright | v0.9 |
 | **Theme sync** | Opt-in tools that follow your Omarchy theme — fzf and lazygit re-tint from the active `colors.toml` on every theme switch (via the `theme-set` hook). Studio never rewrites the tool's own config: it generates standalone files wired in through a single `~/.bashrc` managed block. CLI `themesync list`/`enable <tool>`/`apply` | v0.7 |
 | **Self-update** | Daily release check; `U` in the TUI (or `omarchy-studio update`) downloads, swaps, and restarts — hands off to pacman for packaged installs | v0.7 |
 
@@ -188,7 +188,7 @@ omarchy-studio snapshot list | undo
 # Theme sync (fzf, lazygit follow the active theme)
 omarchy-studio rice export [--out f.tar.gz]      # bundle Studio's config files + your themes
 omarchy-studio rice show <f.tar.gz>              # what's inside, by module
-omarchy-studio rice import <f.tar.gz> [--themes] [--only waybar,mako] [--with-monitors] [--dry-run]
+omarchy-studio rice import <f.tar.gz> [--themes] [--only waybar,mako] [--with-monitors] [--dry-run] [--yes]
 omarchy-studio themesync list                    # tools + on/off + installed state
 omarchy-studio themesync enable <tool>           # opt a tool in, regenerate now
 omarchy-studio themesync disable <tool>

