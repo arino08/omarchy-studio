@@ -1,0 +1,56 @@
+<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="common.css"><style>.nodeLabel{font-family:"DejaVu Sans",Arial,sans-serif!important;}</style></head><body><div id="diagram" style="width:1600px">
+<div class="title">Omarchy Studio — Data Flow Diagram</div>
+<div class="subtitle">Level 0: Context Diagram</div>
+<pre class="mermaid">
+flowchart LR
+  U[Desktop User]:::ext -- "keystrokes, CLI verbs,<br/>chosen settings" --> P0((0<br/>Omarchy Studio)):::proc
+  P0 -- "previews, results,<br/>undo hints, diagnostics" --> U
+  P0 -- "hyprctl keyword / reload,<br/>omarchy-theme-set, restarts" --> OS[Omarchy + Hyprland<br/>Desktop]:::ext
+  OS -- "effective binds, monitors,<br/>config errors, versions" --> P0
+  P0 -- "search queries" --> EX[wallhaven.cc /<br/>GitHub]:::ext
+  EX -- "wallpapers, themes,<br/>release binaries" --> P0
+  classDef ext fill:#ffe9a8,stroke:#c99700,stroke-width:2px;
+  classDef proc fill:#3b6fd8,stroke:#1d4fb3,color:#fff,stroke-width:2px;
+</pre>
+<div class="subtitle" style="margin-top:22px">Level 1: Data Flow Diagram (processes drawn as rounded Gane–Sarson boxes)</div>
+<pre class="mermaid">
+flowchart LR
+  U[Desktop User]:::ext
+  D3[(D3 Omarchy Defaults<br/>read-only)]:::store
+  D1[(D1 User Config Files)]:::store
+  P1(["1 · Read &amp; Attribute<br/>Config"]):::proc
+  P2(["2 · Edit &amp;<br/>Live Preview"]):::proc
+  P5(["5 · Theme &amp;<br/>Palette Lab"]):::proc
+  P3(["3 · Apply<br/>Pipeline"]):::proc
+  P4(["4 · Snapshot<br/>&amp; Restore"]):::proc
+  P6(["6 · Doctor<br/>&amp; Hooks"]):::proc
+  D2[(D2 Snapshot Store<br/>git)]:::store
+  D4[(D4 Studio Config<br/>&amp; Cache)]:::store
+  OS[Omarchy + Hyprland]:::ext
+  EX[wallhaven / GitHub]:::ext
+  D3 -- defaults --> P1
+  D1 -- "user layer" --> P1
+  P1 -- "effective values<br/>+ sources" --> P2
+  U -- "edits, chords" --> P2
+  U -- "image, query" --> P5
+  EX -- "wallpapers, themes" --> P5
+  P5 -- thumbnails --> D4
+  P2 -- "live keywords" --> OS
+  P2 -- ApplyPlan --> P3
+  P5 -- "theme ApplyPlan" --> P3
+  P3 -- "atomic writes" --> D1
+  P3 -- "reload + verify" --> OS
+  OS -- "hyprctl -j data" --> P1
+  P3 -- "pre / post state" --> P4
+  U -- "undo, restore id" --> P4
+  P4 -- commits --> D2
+  D2 -- "past versions" --> P4
+  P4 -- "restored files" --> D1
+  D1 -- "drift, clobbers" --> P6
+  D2 -- "last known state" --> P6
+  P3 -- "result / rollback" --> U
+  P6 -- "health report" --> U
+  classDef ext fill:#ffe9a8,stroke:#c99700,stroke-width:2px;
+  classDef proc fill:#3b6fd8,stroke:#1d4fb3,color:#fff,stroke-width:2px;
+  classDef store fill:#e3f6ec,stroke:#2f9e44,stroke-width:2px;
+</pre></div></body></html>

@@ -1,0 +1,42 @@
+<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="common.css"></head><body><div id="diagram" style="width:1600px">
+<div class="title">Omarchy Studio — User Flow Diagram</div>
+<pre class="mermaid">
+flowchart TB
+  S([START]):::start --> L[Launch omarchy-studio<br/>Omarchy menu, keybind or terminal]:::screen
+  L --> F{First run?}:::dec
+  F -- Yes --> O[Onboarding card<br/>install menu entry + hooks]:::screen
+  F -- No --> R[Module rail]:::screen
+  O --> R
+  R --> T[Themes /<br/>Community]:::screen
+  R --> W[Wallpaper /<br/>wallhaven]:::screen
+  R --> K[Keybinds]:::screen
+  R --> LF[Look &amp; Feel /<br/>Animations]:::screen
+  R --> B[Bar, Notifs,<br/>Lock &amp; Idle]:::screen
+  R --> MO[Monitors, Power,<br/>Apps, Tweaks]:::screen
+  T --> T1[Live preview<br/>palette + wallpaper]:::act
+  W --> W1[Theme wizard<br/>palette extraction]:::act
+  K --> K1[Capture chord,<br/>conflict check]:::act
+  LF --> L1[Adjust value,<br/>live hyprctl keyword]:::act
+  B --> B1[Edit layout<br/>or rules]:::act
+  MO --> MO1[Preview plan,<br/>layout / cascade check]:::act
+  T1 --> SV[Save / Apply<br/>same path as the CLI verbs]:::act
+  W1 --> SV
+  K1 --> SV
+  L1 --> SV
+  B1 --> SV
+  MO1 --> SV
+  SV --> P[Apply pipeline<br/>snapshot → write → reload]:::act
+  P --> V{Verification<br/>passed?}:::dec
+  V -- Yes --> OK[Post snapshot recorded<br/>“Applied — u to undo”]:::screen
+  V -- No --> RB[Automatic rollback,<br/>error explained]:::err
+  OK --> U{Undo wanted?}:::dec
+  U -- Yes --> SN[Snapshots timeline<br/>diff + restore]:::screen
+  U -- No --> E([END]):::start
+  SN --> E
+  RB --> E2([Back to the module<br/>with the field highlighted]):::start
+  classDef start fill:#c9f2d0,stroke:#2f9e44,stroke-width:2px,color:#0b3d1a;
+  classDef screen fill:#ece2fb,stroke:#7c4ddb,stroke-width:2px;
+  classDef act fill:#dcebff,stroke:#3b6fd8,stroke-width:2px;
+  classDef dec fill:#fff3c4,stroke:#d4a106,stroke-width:2px;
+  classDef err fill:#ffd9d9,stroke:#d63b3b,stroke-width:2px;
+</pre></div></body></html>

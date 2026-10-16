@@ -1,0 +1,66 @@
+<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="common.css">
+<style>
+#diagram { width: 1500px; }
+.layer { border-radius: 14px; padding: 14px 16px 16px; margin-bottom: 16px; border: 2px solid; position: relative; }
+.layer h2 { font-size: 17px; letter-spacing: .5px; display: inline-block; padding: 4px 12px; border-radius: 8px; color: #fff; margin-bottom: 12px; }
+.row { display: flex; gap: 14px; }
+.box { flex: 1; background: #fff; border: 1.5px solid; border-radius: 10px; padding: 10px 12px; }
+.box b { display: block; font-size: 16px; margin-bottom: 4px; }
+.box span { font-size: 13.5px; color: #374151; line-height: 1.35; display: block; }
+.l1 { background: #eef4ff; border-color: #3b6fd8; } .l1 h2 { background: #3b6fd8; } .l1 .box { border-color: #9db8ee; }
+.l2 { background: #fff4e8; border-color: #e07b1f; } .l2 h2 { background: #e07b1f; } .l2 .box { border-color: #f1bb88; }
+.l3 { background: #f3eefe; border-color: #7c4ddb; } .l3 h2 { background: #7c4ddb; } .l3 .box { border-color: #c2aaf0; }
+.l4 { background: #e9f7f4; border-color: #1f9d84; } .l4 h2 { background: #1f9d84; } .l4 .box { border-color: #93d4c6; }
+.l5 { background: #edf8ea; border-color: #3f9b37; } .l5 h2 { background: #3f9b37; } .l5 .box { border-color: #a6d9a0; }
+.pipe { display:flex; align-items:center; gap:6px; margin-top:6px; flex-wrap: nowrap; }
+.pipe i { font-style: normal; font-size: 12.5px; background:#fde7d2; border:1px solid #f1bb88; border-radius: 6px; padding: 3px 7px; white-space: nowrap; }
+.pipe em { font-style: normal; color:#e07b1f; font-weight:700; }
+.arrow { text-align:center; font-size: 13px; color:#4b5563; margin: -8px 0 6px; }
+.arrow b { font-size: 20px; color:#6b7280; }
+</style></head><body><div id="diagram">
+<div class="title">Omarchy Studio — Proposed System Architecture</div>
+
+<div class="layer l1"><h2>1. PRESENTATION LAYER (FRONTENDS)</h2>
+<div class="row">
+ <div class="box"><b>TUI Cockpit (ratatui)</b><span>Keyboard-driven full-screen app: module rail, live previews, in-terminal images (kitty / sixel / half-blocks), help overlay, command palette, self-theming from the active Omarchy theme</span></div>
+ <div class="box"><b>CLI Twin (clap)</b><span>Every screen has a scriptable verb group — theme, keybind, looknfeel, waybar, monitor, snapshot, rice, doctor… — each mutating command prints its undo hint</span></div>
+ <div class="box"><b>Omarchy Integration</b><span>Menu entry (Style → Studio), floating-terminal launch, lifecycle hooks (theme-set, post-update) that survive omarchy-update</span></div>
+</div></div>
+<div class="arrow"><b>⇅</b> typed requests / typed results — the core never prints, draws or prompts</div>
+
+<div class="layer l2"><h2>2. CORE ENGINE (studio-core)</h2>
+<div class="row">
+ <div class="box" style="flex:1.5"><b>Apply Pipeline (every mutation)</b>
+  <div class="pipe"><i>plan</i><em>→</em><i>drift check</i><em>→</em><i>snapshot (pre)</i><em>→</em><i>atomic write</i><em>→</em><i>reload</i><em>→</em><i>verify</i><em>→</em><i>commit | rollback</i></div><span style="margin-top:10px">Risk levels: <b style="display:inline">Safe</b> (instant), <b style="display:inline">Restarty</b> (restarts a component), <b style="display:inline">Risky</b> (10-second confirm-or-revert). A failed verification restores the pre-snapshot, re-runs the reloads and deletes files the apply created.</span></div>
+ <div class="box"><b>Domain Modules (31)</b><span>themes, wallpapers, keybinds, looknfeel, animations, waybar, mako, swayosd, lock/idle, monitors, power, apps, tweaks, rice, shell…</span></div>
+ <div class="box"><b>Palette Lab</b><span>Median-cut extraction (Normal / Muted / Material), HSL + WCAG contrast guard, wallhaven client</span></div>
+</div></div>
+<div class="arrow"><b>⇅</b> file edits (FileEdit) &nbsp;·&nbsp; reload steps &nbsp;·&nbsp; verifications</div>
+
+<div class="layer l3"><h2>3. CONFIG ENGINE (configfs) — LOSSLESS PARSERS &amp; WRITERS</h2>
+<div class="row">
+ <div class="box"><b>hyprlang Line CST</b><span>Byte-identical round-trip of Hyprland .conf files (Omarchy 3)</span></div>
+ <div class="box"><b>Lua Emitter</b><span>Deterministic hl.config / hl.monitor / o.bind blocks for Omarchy 4</span></div>
+ <div class="box"><b>JSONC Span-Splice</b><span>Comment-preserving Waybar config edits</span></div>
+ <div class="box"><b>TOML (toml_edit)</b><span>colors.toml, swayosd, Studio config</span></div>
+ <div class="box"><b>Managed Blocks</b><span>Marked regions in CSS / INI / conf; hash-guarded atomic writes</span></div>
+</div></div>
+<div class="arrow"><b>⇅</b> paths · commands · capability probes</div>
+
+<div class="layer l4"><h2>4. OMARCHY ADAPTER &amp; SYSTEM INTERFACES</h2>
+<div class="row">
+ <div class="box"><b>Omarchy Adapter</b><span>The only code allowed to name Omarchy paths; version probe (3.8 / 4.0), component presence</span></div>
+ <div class="box"><b>Dialect Probe</b><span>hyprctl systeminfo → hyprlang or Lua config provider</span></div>
+ <div class="box"><b>Command Runner</b><span>Timeouts, captured output, dry-run; hyprctl, omarchy-theme-set, omarchy-restart-*</span></div>
+ <div class="box"><b>Desktop Components</b><span>Hyprland, Waybar / omarchy-shell, mako, SwayOSD, hypridle, pacman, power-profiles-daemon</span></div>
+ <div class="box"><b>External Services</b><span>GitHub releases &amp; community themes, wallhaven.cc JSON API</span></div>
+</div></div>
+<div class="arrow"><b>⇅</b> read / write</div>
+
+<div class="layer l5"><h2>5. PERSISTENCE LAYER</h2>
+<div class="row">
+ <div class="box" style="flex:1.3"><b>Snapshot Store (git repository)</b><span>~/.local/state/omarchy-studio/history — mirrored copies of every managed file, manifest.toml, genesis / pre / post / drift / restore commits</span></div>
+ <div class="box"><b>User Configuration Files</b><span>~/.config/hypr, waybar, mako template, swayosd, omarchy/themes — user-owned surfaces only</span></div>
+ <div class="box"><b>Studio Config &amp; Cache</b><span>~/.config/omarchy-studio/config.toml, thumbnail &amp; preview caches</span></div>
+</div></div>
+</div></body></html>

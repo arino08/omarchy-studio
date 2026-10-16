@@ -1,0 +1,23 @@
+<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="common.css"></head><body><div id="diagram" style="width:820px">
+<div class="title">Apply Pipeline — Activity Diagram</div>
+<pre class="mermaid">
+flowchart TB
+  A([Change requested<br/>TUI save / CLI verb]):::start --> B[Module builds<br/>ApplyPlan<br/>edits + reloads + checks]:::act
+  B --> C{Plan changes<br/>anything?}:::dec
+  C -- No --> Z([No-op:<br/>nothing written]):::start
+  C -- Yes --> D{On-disk file<br/>differs from last<br/>snapshot?}:::dec
+  D -- Yes --> E[Record drift snapshot<br/>hand-edit preserved]:::act --> F
+  D -- No --> F[Record pre snapshot]:::act
+  F --> G[Hash-guarded<br/>atomic write<br/>tmp → fsync → rename]:::act
+  G --> H[Reload steps<br/>hyprctl reload, theme refresh,<br/>restart component]:::act
+  H --> I{Verify:<br/>configerrors empty?<br/>process alive?<br/>command ok?}:::dec
+  I -- Pass --> J[Record post snapshot<br/>with module + summary]:::ok
+  J --> K([Applied — u to undo]):::start
+  I -- Fail --> L[Rollback: restore pre files,<br/>delete created files,<br/>re-run reloads]:::err
+  L --> M([Error shown as<br/>what · why · next step]):::start
+  classDef start fill:#c9f2d0,stroke:#2f9e44,stroke-width:2px;
+  classDef act fill:#dcebff,stroke:#3b6fd8,stroke-width:2px;
+  classDef dec fill:#fff3c4,stroke:#d4a106,stroke-width:2px;
+  classDef ok fill:#e3f6ec,stroke:#2f9e44,stroke-width:2px;
+  classDef err fill:#ffd9d9,stroke:#d63b3b,stroke-width:2px;
+</pre></div></body></html>

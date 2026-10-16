@@ -1,0 +1,45 @@
+<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="common.css">
+<style>
+#diagram{width:1500px}
+.wrap{border:2px solid #9ca3af;border-radius:12px;padding:16px 18px;background:#fafafa}
+.db{font-family:"DejaVu Sans Mono",monospace;font-size:17px;margin-bottom:12px;color:#374151}
+.card{border:1.5px solid #9ca3af;border-radius:10px;background:#fff;padding:12px 16px;margin-bottom:14px;font-family:"DejaVu Sans Mono",monospace;font-size:15px;line-height:1.55;white-space:pre}
+.card h3{font-family:"DejaVu Sans",sans-serif;font-size:18px;margin-bottom:6px;white-space:normal;display:flex;justify-content:space-between}
+.card h3 small{font-weight:400;color:#6b7280;font-size:14px}
+.k{color:#1d4fb3}.s{color:#b4441c}.c{color:#6b7280}.t{color:#2f7d32}
+.row{display:flex;gap:16px}.row>.card{flex:1}
+.rel{font-family:"DejaVu Sans",sans-serif;font-size:14px;color:#5b2fb8;margin:-6px 0 10px 8px}
+</style></head><body><div id="diagram">
+<div class="title">Snapshot Store — Data Modelling Diagram</div>
+<div class="wrap">
+<div class="db">🗄  ~/.local/state/omarchy-studio/history/   <span class="c">(plain git repository, local identity "omarchy-studio")</span></div>
+<div class="row">
+<div class="card"><h3>manifest.toml <small>which files are tracked, and by whom</small></h3><span class="c"># files tracked by omarchy-studio snapshots</span>
+<span class="k">[files]</span>
+<span class="s">"/home/ari/.config/hypr/bindings.conf"</span>  = <span class="s">"keybinds"</span>
+<span class="s">"/home/ari/.config/hypr/looknfeel.conf"</span> = <span class="s">"looknfeel"</span>
+<span class="s">"/home/ari/.config/waybar/config.jsonc"</span> = <span class="s">"waybar"</span>
+<span class="s">"/home/ari/.config/hypr/monitors.conf"</span>  = <span class="s">"monitors"</span></div>
+<div class="card"><h3>files/ <small>mirror of every managed file at its absolute path</small></h3>files/
+└── home/ari/.config/
+    ├── hypr/
+    │   ├── bindings.conf
+    │   ├── looknfeel.conf
+    │   └── monitors.conf
+    ├── waybar/config.jsonc
+    └── omarchy/themed/mako.ini.tpl
+<span class="c">LAST_PRE  → id of the latest pre-snapshot</span></div>
+</div>
+<div class="rel">▼ 1 : N — every apply records commits that reference the mirrored files</div>
+<div class="card"><h3>Commit history (append-only timeline) <small>subject = kind: summary · optional key: value trailers</small></h3><span class="k">a91c3e0</span>  <span class="t">genesis:</span> state of managed files before Studio's first change
+<span class="k">4b7f210</span>  <span class="t">pre:</span>     blur.size 8→12
+<span class="k">c02d9aa</span>  <span class="t">post:</span>    blur.size 8→12                     <span class="c">Module: looknfeel</span>
+<span class="k">7e55b13</span>  <span class="t">drift:</span>   hand-edit of bindings.conf preserved before the next apply
+<span class="k">91fe4c7</span>  <span class="t">post:</span>    rebind SUPER+B → browser            <span class="c">Module: keybinds</span>
+<span class="k">d3a8f02</span>  <span class="t">restore:</span> restored 1 file from 4b7f210        <span class="c">(an undo is itself a new commit)</span></div>
+<div class="row">
+<div class="card" style="white-space:normal;font-family:'DejaVu Sans',sans-serif;font-size:15px"><h3>Snapshot kinds</h3>
+<b>genesis</b> – baseline before any change &nbsp;·&nbsp; <b>pre</b> – state just before an apply &nbsp;·&nbsp; <b>post</b> – state after a verified apply &nbsp;·&nbsp; <b>drift</b> – a hand-edit detected and kept &nbsp;·&nbsp; <b>restore</b> – an undo or point-in-time restore</div>
+<div class="card" style="white-space:normal;font-family:'DejaVu Sans',sans-serif;font-size:15px"><h3>Operations</h3>
+record · detect_drift · list / log · show (changed files + coloured diff) · restore (whole tree) · restore_files (selected paths) · undo_last</div>
+</div></div></div></body></html>
