@@ -2315,14 +2315,28 @@ fn keybind_write(
     overrides: &[studio_core::modules::keybinds::Override],
     summary: &str,
 ) -> i32 {
-    use studio_core::modules::keybinds;
+    keybind_apply(summary, |store| {
+        studio_core::modules::keybinds::apply_overrides(
+            paths,
+            overrides,
+            store,
+            &RealRunner,
+            summary,
+        )
+    })
+}
+
+fn keybind_apply(
+    summary: &str,
+    apply: impl FnOnce(&SnapshotStore) -> studio_core::error::Result<std::path::PathBuf>,
+) -> i32 {
     // Without a store there is no rollback, so refuse rather than apply
     // unprotected. `history()` already explains why it failed.
     let store = match history() {
         Ok(s) => s,
         Err(code) => return code,
     };
-    match keybinds::apply_overrides(paths, overrides, &store, &RealRunner, summary) {
+    match apply(&store) {
         Ok(_) => {
             println!("{summary}");
             println!("undo with: omarchy-studio snapshot undo");
@@ -2429,9 +2443,18 @@ fn keybind_remove(paths: &OmarchyPaths, chord: &str) -> i32 {
     let count = before.len();
     let overrides = without_chord(before, mask, &key);
     let rendered = keybinds::render_chord(mask, &key);
+    let unreadable = keybinds::unreadable_overrides(paths);
     if overrides.len() == count {
-        println!("no Studio override on {rendered} — nothing to remove");
-        return 0;
+        if unreadable.is_empty() {
+            println!("no Studio override on {rendered} — nothing to remove");
+            return 0;
+        }
+        eprintln!(
+            "no Studio override on {rendered} that Studio can read. It can't read these \
+             lines of its keybinds block — if one is {rendered}, edit it by hand:\n{}",
+            unreadable.join("\n")
+        );
+        return 1;
     }
     keybind_write(
         paths,
@@ -2444,11 +2467,18 @@ fn keybind_remove(paths: &OmarchyPaths, chord: &str) -> i32 {
 fn keybind_reset(paths: &OmarchyPaths) -> i32 {
     use studio_core::modules::keybinds;
     let count = keybinds::read_overrides(paths).len();
-    if count == 0 {
+    let unreadable = keybinds::unreadable_overrides(paths);
+    if count == 0 && unreadable.is_empty() {
         println!("no Studio keybind overrides to reset");
         return 0;
     }
-    keybind_write(paths, &[], &format!("reset {count} keybind override(s)"))
+    for line in &unreadable {
+        eprintln!("also dropping a line Studio couldn't read: {line}");
+    }
+    let summary = format!("reset {count} keybind override(s)");
+    keybind_apply(&summary, |store| {
+        keybinds::reset_overrides(paths, store, &RealRunner, &summary)
+    })
 }
 
 // ── niri mode (ScrollOverview plugin by yayuuu, BSD-3) ───────────────────────
