@@ -30,8 +30,11 @@
 //! never refills. [`ImageCell::finish_frame`] spots the overlay going away and
 //! the event loop repaints the screen.
 //!
-//! Decoding happens on one long-lived worker thread so navigation never
-//! blocks; a screen renders its own text fallback until the image is ready.
+//! Decoding happens off the UI thread, on one long-lived worker, so navigation
+//! never blocks on it; a screen renders its own text fallback until the image
+//! is ready. Protocol encoding does not: it runs during render, whenever an
+//! image is first drawn at a size, and may be visibly slower for sixel on large
+//! panes.
 //!
 //! Decoded images are kept in a small path-keyed cache rather than a single
 //! "current" slot, because one frame legitimately draws more than one image:
@@ -49,7 +52,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::Frame;
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
@@ -93,8 +96,8 @@ pub struct ImageCell {
     decoder: Decoder,
     /// Where sixels landed in the frame being drawn.
     drawn: Vec<Rect>,
-    /// Something was drawn over a sixel in the last finished frame.
-    covered: bool,
+    /// Cells of on-screen sixels that the last finished frame drew over.
+    covered: Vec<Position>,
     /// An overlay has just left a hole in a sixel.
     exposed: bool,
 }
@@ -207,7 +210,7 @@ impl ImageCell {
             pending: Vec::new(),
             decoder: Decoder::spawn(),
             drawn: Vec::new(),
-            covered: false,
+            covered: Vec::new(),
             exposed: false,
         }
     }
@@ -261,16 +264,23 @@ impl ImageCell {
         Preview::Decoding
     }
 
-    /// Call with the finished frame, overlays included. Notes when something
-    /// that covered a sixel in the last frame is gone in this one.
+    /// Call with the finished frame, overlays included. Notes when a cell drawn
+    /// over a sixel in the last frame is skipped again in this one. A sixel that
+    /// lost its top-left cell is left out: the modal over it isn't a hole, and
+    /// the diff writes that cell, and so the whole image, when the modal goes.
     pub fn finish_frame(&mut self, buf: &Buffer) {
-        let covered = self.drawn.drain(..).any(|rect| {
-            rect.positions()
-                .skip(1)
-                .any(|pos| buf.cell(pos).is_some_and(|cell| !cell.skip))
-        });
-        self.exposed |= self.covered && !covered;
-        self.covered = covered;
+        let skipped = |pos: &Position| buf.cell(*pos).is_some_and(|cell| cell.skip);
+        self.exposed |= self.covered.iter().any(skipped);
+        self.covered = self
+            .drawn
+            .drain(..)
+            .filter(|rect| {
+                buf.cell(rect.as_position())
+                    .is_some_and(|cell| cell.symbol().starts_with('\x1b'))
+            })
+            .flat_map(|rect| rect.positions().skip(1))
+            .filter(|pos| !skipped(pos))
+            .collect();
     }
 
     /// True once after an overlay leaves a sixel: the screen needs a full
@@ -367,6 +377,17 @@ mod tests {
     fn png(dir: &Path, name: &str) -> PathBuf {
         let path = dir.join(name);
         image::RgbImage::new(4, 4).save(&path).unwrap();
+        path
+    }
+
+    /// A PNG large enough to span many cells at a 6×15 cell size.
+    fn gradient(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        image::RgbImage::from_fn(240, 300, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, 128])
+        })
+        .save(&path)
+        .unwrap();
         path
     }
 
@@ -496,12 +517,7 @@ mod tests {
         use ratatui::Terminal;
 
         let dir = scratch("overlay");
-        let path = dir.join("wall.png");
-        image::RgbImage::from_fn(240, 300, |x, y| {
-            image::Rgb([(x % 256) as u8, (y % 256) as u8, 128])
-        })
-        .save(&path)
-        .unwrap();
+        let path = gradient(&dir, "wall.png");
 
         let mut cell = ImageCell::probe();
         cell.picker = picker_for((6, 15), ProtocolType::Sixel);
@@ -541,6 +557,67 @@ mod tests {
 
         frame(&mut cell, false);
         assert!(!cell.take_exposed(), "a settled frame must not repaint");
+    }
+
+    /// The wizard over the wallhaven browser: the browser's `Clear` wipes the
+    /// Wallpapers preview every frame, and that must neither hide the wizard
+    /// leaving the thumbnail nor count as a hole when a thumbnail lands on it.
+    #[test]
+    fn a_sixel_under_a_modal_leaves_the_thumbnail_repaint_alone() {
+        use ratatui::backend::TestBackend;
+        use ratatui::widgets::Clear;
+        use ratatui::Terminal;
+
+        let dir = scratch("stacked");
+        let wallpaper = gradient(&dir, "wall.png");
+        let thumbnail = gradient(&dir, "thumb.png");
+
+        let mut cell = ImageCell::probe();
+        cell.picker = picker_for((6, 15), ProtocolType::Sixel);
+        let mut term = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        let pane = Rect::new(0, 0, 60, 24);
+        let modal = Rect::new(0, 0, 70, 26);
+        let thumb_pane = Rect::new(10, 2, 40, 20);
+        let wizard = Rect::new(20, 6, 10, 5);
+
+        let mut frame = |cell: &mut ImageCell, with_thumbnail: bool, with_wizard: bool| {
+            let mut state = Preview::Decoding;
+            term.draw(|f| {
+                state = cell.render(f, pane, &wallpaper);
+                f.render_widget(Clear, modal);
+                if with_thumbnail {
+                    state = cell.render(f, thumb_pane, &thumbnail);
+                }
+                if with_wizard {
+                    f.render_widget(Clear, wizard);
+                }
+                cell.finish_frame(f.buffer_mut());
+            })
+            .unwrap();
+            state
+        };
+
+        for with_thumbnail in [false, true] {
+            for _ in 0..200 {
+                if frame(&mut cell, with_thumbnail, false) == Preview::Drawn {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert_eq!(frame(&mut cell, with_thumbnail, false), Preview::Drawn);
+            assert!(!cell.take_exposed(), "nothing has left an image yet");
+        }
+
+        frame(&mut cell, true, true);
+        frame(&mut cell, true, true);
+        assert!(!cell.take_exposed(), "the wizard is still up");
+
+        frame(&mut cell, true, false);
+        assert!(
+            cell.take_exposed(),
+            "the wizard's hole would stay on screen"
+        );
+        assert!(!cell.take_exposed(), "one repaint is enough");
     }
 
     #[test]
