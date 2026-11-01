@@ -14,6 +14,22 @@
 //! sniffing + the `TIOCGWINSZ` pixel size cover the terminals Omarchy users
 //! actually run, with zero stdin reads.
 //!
+//! Foot is the exception to `TERM` sniffing: Omarchy's `foot.ini` sets
+//! `term=xterm-256color` and foot unsets `TERM_PROGRAM`, so nothing in the
+//! environment names it. It is recognised from `/proc` instead, as the process
+//! that started this tty's session, which reads nothing from the terminal.
+//!
+//! The cell size is re-measured on every draw rather than kept from startup.
+//! `foot -e` starts its child before the window is configured, so the first
+//! reading can be twice the real size (13×28 against a true 6×15), and sixel
+//! images sized from it overrun their pane and scroll the terminal. Half-blocks
+//! ignore the cell size, which is why a stale reading never showed there.
+//!
+//! A sixel is written once through its top-left cell and the rest of its cells
+//! are skipped, so an overlay drawn over it leaves a hole that the cell diff
+//! never refills. [`ImageCell::finish_frame`] spots the overlay going away and
+//! the event loop repaints the screen.
+//!
 //! Decoding happens on one long-lived worker thread so navigation never
 //! blocks; a screen renders its own text fallback until the image is ready.
 //!
@@ -32,6 +48,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 
+use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::Frame;
 use ratatui_image::picker::{Picker, ProtocolType};
@@ -74,6 +91,12 @@ pub struct ImageCell {
     /// Paths the worker still owes us an answer for.
     pending: Vec<PathBuf>,
     decoder: Decoder,
+    /// Where sixels landed in the frame being drawn.
+    drawn: Vec<Rect>,
+    /// Something was drawn over a sixel in the last finished frame.
+    covered: bool,
+    /// An overlay has just left a hole in a sixel.
+    exposed: bool,
 }
 
 /// Handle to the decode worker: paths out, decoded images back.
@@ -109,7 +132,15 @@ impl Decoder {
 /// Conservative: inside tmux always half-blocks (passthrough is off by
 /// default and detection would need the racy stdin query).
 fn detect_protocol() -> ProtocolType {
-    let var = |k: &str| std::env::var(k).unwrap_or_default();
+    protocol_for(
+        |k| std::env::var(k).unwrap_or_default(),
+        host_terminal(Path::new("/proc")).as_deref(),
+    )
+}
+
+/// The decision behind [`detect_protocol`]. `host` is the process name of the
+/// terminal that owns this tty, when it could be found.
+fn protocol_for(var: impl Fn(&str) -> String, host: Option<&str>) -> ProtocolType {
     let term = var("TERM");
     if var("TMUX").is_empty() {
         if !var("KITTY_WINDOW_ID").is_empty() || term.contains("kitty") || term.contains("ghostty")
@@ -119,32 +150,65 @@ fn detect_protocol() -> ProtocolType {
         if var("TERM_PROGRAM") == "WezTerm" {
             return ProtocolType::Iterm2;
         }
-        if term.contains("foot") {
+        if term.contains("foot") || host == Some("foot") {
             return ProtocolType::Sixel;
         }
     }
     ProtocolType::Halfblocks
 }
 
+/// Name of the process that started this tty's session: the terminal emulator
+/// when the session leader is its direct child. A multiplexer or an editor's
+/// embedded terminal starts its own sessions, so it reports itself rather than
+/// the foot window around it, and that foot can't receive our sixels anyway.
+fn host_terminal(proc_root: &Path) -> Option<String> {
+    let stat = |pid: &str| std::fs::read_to_string(proc_root.join(pid).join("stat")).ok();
+    let (_, session) = stat_fields(&stat("self")?)?;
+    let (terminal, _) = stat_fields(&stat(&session.to_string())?)?;
+    let comm = std::fs::read_to_string(proc_root.join(terminal.to_string()).join("comm")).ok()?;
+    Some(comm.trim_end().to_string())
+}
+
+/// `(ppid, session)` from a `/proc/<pid>/stat` line. Fields are counted from
+/// the last `)` because the command name may itself hold spaces and parens.
+fn stat_fields(stat: &str) -> Option<(u32, u32)> {
+    let (_, rest) = stat.rsplit_once(") ")?;
+    let mut fields = rest.split_whitespace();
+    let ppid = fields.nth(1)?.parse().ok()?;
+    let session = fields.nth(1)?.parse().ok()?;
+    Some((ppid, session))
+}
+
+/// Pixel size of one cell from the window-size ioctl, when the terminal reports it.
+fn cell_size() -> Option<(u16, u16)> {
+    match ratatui::crossterm::terminal::window_size() {
+        Ok(ws) if ws.width > 0 && ws.height > 0 && ws.columns > 0 && ws.rows > 0 => {
+            Some((ws.width / ws.columns, ws.height / ws.rows))
+        }
+        _ => None,
+    }
+}
+
+fn picker_for(font_size: (u16, u16), protocol: ProtocolType) -> Picker {
+    let mut picker = Picker::from_fontsize(font_size);
+    picker.set_protocol_type(protocol);
+    picker
+}
+
 impl ImageCell {
     /// Probe once at startup. Cell pixel size comes from the window-size
-    /// ioctl where the terminal reports it; otherwise a common 8×16 guess —
-    /// only aspect correction depends on it.
+    /// ioctl where the terminal reports it; otherwise a common 8×16 guess.
+    /// [`Self::render`] keeps it current.
     pub fn probe() -> Self {
-        let font_size = match ratatui::crossterm::terminal::window_size() {
-            Ok(ws) if ws.width > 0 && ws.height > 0 && ws.columns > 0 && ws.rows > 0 => {
-                (ws.width / ws.columns, ws.height / ws.rows)
-            }
-            _ => (8, 16),
-        };
-        let mut picker = Picker::from_fontsize(font_size);
-        picker.set_protocol_type(detect_protocol());
         Self {
-            picker,
+            picker: picker_for(cell_size().unwrap_or((8, 16)), detect_protocol()),
             cache: Vec::new(),
             failed: Vec::new(),
             pending: Vec::new(),
             decoder: Decoder::spawn(),
+            drawn: Vec::new(),
+            covered: false,
+            exposed: false,
         }
     }
 
@@ -164,6 +228,7 @@ impl ImageCell {
     /// path's image — two screens share this cell within one frame, so a stale
     /// draw would put one screen's wallpaper in the other's pane.
     pub fn render(&mut self, f: &mut Frame, area: Rect, path: &Path) -> Preview {
+        self.follow_cell_size(cell_size());
         self.poll();
 
         if let Some(i) = self.cache.iter().position(|(p, _)| p == path) {
@@ -171,7 +236,16 @@ impl ImageCell {
             // the modal underneath redraws every frame, so it stays resident.
             let entry = self.cache.remove(i);
             self.cache.push(entry);
+            let is_sixel = matches!(self.picker.protocol_type(), ProtocolType::Sixel);
             let (_, protocol) = self.cache.last_mut().expect("just pushed");
+            if is_sixel {
+                let size = protocol.size_for(Resize::Fit(None), area);
+                self.drawn.push(Rect {
+                    x: area.x,
+                    y: area.y,
+                    ..size
+                });
+            }
             f.render_stateful_widget(
                 StatefulImage::default().resize(Resize::Fit(None)),
                 area,
@@ -185,6 +259,36 @@ impl ImageCell {
         }
         self.request(path);
         Preview::Decoding
+    }
+
+    /// Call with the finished frame, overlays included. Notes when something
+    /// that covered a sixel in the last frame is gone in this one.
+    pub fn finish_frame(&mut self, buf: &Buffer) {
+        let covered = self.drawn.drain(..).any(|rect| {
+            rect.positions()
+                .skip(1)
+                .any(|pos| buf.cell(pos).is_some_and(|cell| !cell.skip))
+        });
+        self.exposed |= self.covered && !covered;
+        self.covered = covered;
+    }
+
+    /// True once after an overlay leaves a sixel: the screen needs a full
+    /// repaint, because no cell in the hole differs from the last frame.
+    pub fn take_exposed(&mut self) -> bool {
+        std::mem::take(&mut self.exposed)
+    }
+
+    /// Adopt a new cell size. Cached protocols are bound to the old one and
+    /// hand their source image to nobody, so they are dropped and re-decoded.
+    /// `None` means nothing was measured, which is no reason to change.
+    fn follow_cell_size(&mut self, measured: Option<(u16, u16)>) {
+        let Some(size) = measured else { return };
+        if size == self.picker.font_size() {
+            return;
+        }
+        self.picker = picker_for(size, self.picker.protocol_type());
+        self.cache.clear();
     }
 
     /// Queue a decode unless it's already queued or the backlog is full.
@@ -264,6 +368,179 @@ mod tests {
         let path = dir.join(name);
         image::RgbImage::new(4, 4).save(&path).unwrap();
         path
+    }
+
+    fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> String + 'a {
+        move |k| {
+            vars.iter()
+                .find(|(name, _)| *name == k)
+                .map(|(_, v)| v.to_string())
+                .unwrap_or_default()
+        }
+    }
+
+    /// Omarchy's stock foot: `TERM` says xterm, so only the tty's owner tells.
+    #[test]
+    fn foot_is_found_when_term_does_not_name_it() {
+        let stock = [("TERM", "xterm-256color")];
+        assert_eq!(protocol_for(env(&stock), Some("foot")), ProtocolType::Sixel);
+        assert_eq!(
+            protocol_for(env(&stock), Some("herdr")),
+            ProtocolType::Halfblocks
+        );
+        assert_eq!(protocol_for(env(&stock), None), ProtocolType::Halfblocks);
+        assert_eq!(
+            protocol_for(env(&[("TERM", "foot")]), None),
+            ProtocolType::Sixel
+        );
+    }
+
+    #[test]
+    fn tmux_stays_on_half_blocks_inside_foot() {
+        let tmux = [("TERM", "foot"), ("TMUX", "/tmp/tmux-1000/default,1,0")];
+        assert_eq!(
+            protocol_for(env(&tmux), Some("foot")),
+            ProtocolType::Halfblocks
+        );
+    }
+
+    #[test]
+    fn stat_fields_survive_awkward_command_names() {
+        let stat = "42 (a) b (c)) S 7 42 9 34816 42 4194304";
+        assert_eq!(stat_fields(stat), Some((7, 9)));
+        assert_eq!(stat_fields("garbage"), None);
+    }
+
+    fn proc_entry(root: &Path, pid: &str, stat: &str, comm: &str) {
+        let dir = root.join(pid);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("stat"), stat).unwrap();
+        std::fs::write(dir.join("comm"), comm).unwrap();
+    }
+
+    /// studio (300) in a shell's session (200), the shell started by foot (100).
+    #[test]
+    fn host_terminal_is_the_parent_of_the_session_leader() {
+        let root = scratch("proc");
+        proc_entry(&root, "self", "300 (studio) S 200 300 200 0", "studio\n");
+        proc_entry(&root, "200", "200 (bash) S 100 200 200 0", "bash\n");
+        proc_entry(&root, "100", "100 (foot) S 1 100 100 0", "foot\n");
+        assert_eq!(host_terminal(&root).as_deref(), Some("foot"));
+    }
+
+    /// A pane inside a multiplexer reports the multiplexer, never the foot
+    /// window its client happens to run in.
+    #[test]
+    fn host_terminal_stops_at_the_multiplexer() {
+        let root = scratch("proc-mux");
+        proc_entry(&root, "self", "300 (studio) S 200 300 200 0", "studio\n");
+        proc_entry(&root, "200", "200 (bash) S 150 200 200 0", "bash\n");
+        proc_entry(&root, "150", "150 (herdr) S 1 150 150 0", "herdr\n");
+        assert_eq!(host_terminal(&root).as_deref(), Some("herdr"));
+    }
+
+    #[test]
+    fn host_terminal_is_none_when_the_session_leader_is_gone() {
+        let root = scratch("proc-gone");
+        proc_entry(&root, "self", "300 (studio) S 200 300 200 0", "studio\n");
+        assert_eq!(host_terminal(&root), None);
+    }
+
+    /// `foot -e` hands the child a 13×28 reading before the window settles at
+    /// 6×15. Keeping the first one drew sixels twice too large, overrunning
+    /// the pane and scrolling the terminal.
+    #[test]
+    fn a_new_cell_size_replaces_the_startup_reading() {
+        let dir = scratch("cell");
+        let path = png(&dir, "wall.png");
+        let mut cell = ImageCell::probe();
+        cell.picker = picker_for((13, 28), ProtocolType::Sixel);
+        let image = image::open(&path).unwrap();
+        cell.cache
+            .push((path.clone(), cell.picker.new_resize_protocol(image)));
+
+        cell.follow_cell_size(Some((6, 15)));
+
+        assert_eq!(cell.picker.font_size(), (6, 15));
+        assert_eq!(cell.picker.protocol_type(), ProtocolType::Sixel);
+        assert!(
+            !self_cached(&cell, &path),
+            "a protocol sized for the old cell would still be drawn"
+        );
+    }
+
+    #[test]
+    fn no_measurement_keeps_the_size_and_the_cache() {
+        let dir = scratch("nomeasure");
+        let path = png(&dir, "wall.png");
+        let mut cell = ImageCell::probe();
+        cell.picker = picker_for((6, 15), ProtocolType::Sixel);
+        let image = image::open(&path).unwrap();
+        cell.cache
+            .push((path.clone(), cell.picker.new_resize_protocol(image)));
+
+        cell.follow_cell_size(None);
+        cell.follow_cell_size(Some((6, 15)));
+
+        assert_eq!(cell.picker.font_size(), (6, 15));
+        assert!(self_cached(&cell, &path));
+    }
+
+    /// Closing Help over a sixel left a torn piece of it in the image until
+    /// the user changed screens: the frame after an overlay must ask for a
+    /// repaint, once, and frames with nothing covering the image must not.
+    #[test]
+    fn an_overlay_leaving_a_sixel_asks_for_one_repaint() {
+        use ratatui::backend::TestBackend;
+        use ratatui::widgets::Clear;
+        use ratatui::Terminal;
+
+        let dir = scratch("overlay");
+        let path = dir.join("wall.png");
+        image::RgbImage::from_fn(240, 300, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, 128])
+        })
+        .save(&path)
+        .unwrap();
+
+        let mut cell = ImageCell::probe();
+        cell.picker = picker_for((6, 15), ProtocolType::Sixel);
+        let mut term = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        let pane = Rect::new(0, 0, 40, 20);
+        let overlay = Rect::new(10, 5, 10, 5);
+
+        let mut frame = |cell: &mut ImageCell, with_overlay: bool| {
+            let mut state = Preview::Decoding;
+            term.draw(|f| {
+                state = cell.render(f, pane, &path);
+                if with_overlay {
+                    f.render_widget(Clear, overlay);
+                }
+                cell.finish_frame(f.buffer_mut());
+            })
+            .unwrap();
+            state
+        };
+
+        for _ in 0..200 {
+            if frame(&mut cell, false) == Preview::Drawn {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(frame(&mut cell, false), Preview::Drawn);
+        assert!(!cell.take_exposed(), "nothing has covered the image yet");
+
+        frame(&mut cell, true);
+        frame(&mut cell, true);
+        assert!(!cell.take_exposed(), "the overlay is still up");
+
+        frame(&mut cell, false);
+        assert!(cell.take_exposed(), "the hole would stay on screen");
+        assert!(!cell.take_exposed(), "one repaint is enough");
+
+        frame(&mut cell, false);
+        assert!(!cell.take_exposed(), "a settled frame must not repaint");
     }
 
     #[test]
