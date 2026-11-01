@@ -2440,6 +2440,7 @@ impl App {
         if let Some(w) = &self.onboarding {
             w.render(f, cols[1], &self.skin);
         }
+        self.images.finish_frame(f.buffer_mut());
     }
 
     fn draw_rail(&mut self, f: &mut Frame, area: Rect) {
@@ -3033,6 +3034,14 @@ pub fn run() -> i32 {
     let result = loop {
         if let Err(e) = terminal.draw(|f| app.draw(f)) {
             break Err(e);
+        }
+        if app.images.take_exposed() {
+            if let Err(e) = terminal
+                .clear()
+                .and_then(|()| terminal.draw(|f| app.draw(f)).map(drop))
+            {
+                break Err(e);
+            }
         }
         // While background work is in flight (the launch update-check, or
         // wallhaven requests), poll so results can surface without a
